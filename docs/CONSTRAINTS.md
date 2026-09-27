@@ -10,13 +10,21 @@ CUDA 12.9 and PyTorch 2.9.1 are what his other repos use. vLLM already runs on t
 
 Check `nvidia-smi` before a launch. Project A, and Project B if it runs, share this card. Do not start a job that would push the card past 24 GB beside one that is already running. Sathvik sets the priority. Another process's residency shows up as an error or as inflated timings.
 
+Agent episodes are multi-turn with long prompts, so memory and GPU-hours are measured at the agent's real context length, not at a short-prompt benchmark. AppWorld itself runs on CPU.
+
 Time is not a constraint. Log GPU-hours per run anyway. They are part of the cost answer and of `RESUME_FACTS.md`.
 
 ## Stack
 
-Python. vLLM for serving. FastAPI for the gateway. Hugging Face Transformers for full-vocabulary scoring. Postgres or DuckDB over Parquet for logs (`DECISIONS.md` D10). Prometheus for metrics; vLLM exposes `/metrics`. Grafana is optional (`DECISIONS.md` D11). Docker Compose. GitHub Actions. pytest.
+Python 3.11+ (AppWorld's floor). vLLM for serving. smolagents for the agent loop. AppWorld for tasks, tools, state, and evaluation. FastAPI for the gateway. Hugging Face Transformers for full-vocabulary teacher-forced scoring. Postgres or DuckDB over Parquet for logs (`DECISIONS.md` D10). Prometheus for metrics; vLLM exposes `/metrics`. Grafana is optional (`DECISIONS.md` D11). Docker Compose. GitHub Actions. pytest.
 
-No custom CUDA or Triton kernels. No Kubernetes in the core.
+No custom CUDA or Triton kernels. No Kubernetes in the core. No custom simulated environment or tool set unless AppWorld integration requires it.
+
+## Code execution
+
+The agent's actions are model-generated code or API calls. They execute only through AppWorld (`DECISIONS.md` D18). smolagents documents its `LocalPythonExecutor` as not a security boundary; it never runs an action here. Where AppWorld executes, in process or in Docker via `appworld serve`, is `DECISIONS.md` D20 and is settled before the first episode.
+
+No CI job, hosted or self-hosted, prints AppWorld content, because job logs are public on a public repo (`DATA.md`). The gate reports task IDs and statistics only.
 
 No build command exists. The standard-library offline-gate test command is recorded in `AGENTS.md`; no GPU or full-suite command exists.
 
@@ -33,7 +41,7 @@ So:
 ## Ask first
 
 - Spending money: cloud GPUs, paid APIs, LLM judges, GitHub larger runners.
-- Accepting a dataset's license or gated-access terms (`DATA.md`).
+- Accepting a dataset's or environment's license or gated-access terms, AppWorld included (`DATA.md`).
 - Connecting alerts to any real account (Slack, email, phone). Alerts go only to channels Sathvik sets up.
 - Registering a self-hosted runner, or making the repo public.
 - Opening upstream PRs.
@@ -48,10 +56,9 @@ This is a new repo. No code carries over.
 
 Method that carries over, as priors rather than as results of this repo:
 
-- The evaluation-rig style of github.com/sathviknookala/llm_quantization_threshold: protocol committed first; 10,000-draw bootstrap; a replication floor from repeated baseline runs, reported beside every difference and never subtracted; a decision log. That study's teacher-forced KL (frozen trajectories, per-position token KL) is the model for the gate's KL metric. Its finding that NVFP4 diverges about 10× more than FP8 from BF16, on Llama 3.1 8B, is a prior on which quantization faults should matter. It is a prior for a different model. It is not a result for Qwen3-4B.
+- The evaluation-rig style of github.com/sathviknookala/llm_quantization_threshold: protocol committed first; 10,000-draw bootstrap; a replication floor from repeated baseline runs, reported beside every difference and never subtracted; a decision log. That study's teacher-forced KL (frozen trajectories, per-position token KL) is the model for the gate's plan-trace KL. Its finding that NVFP4 diverges about 10× more than FP8 from BF16, on Llama 3.1 8B, is a prior on which quantization faults should matter. It is a prior for a different model and task. It is not a result for Qwen3-4B on AppWorld.
 - Prior experience with a retrain → validate → deploy gate, as knowledge of a design. No code, data, or numbers from it.
-- Representation-health diagnostics from that same work, as knowledge: per-dimension statistics and effective rank, reused as a monitor on the embeddings the input-drift detector uses.
-- vLLM on this GPU, from the quantization study, as evidence the card can run vLLM. Re-measure memory for this model.
+- vLLM on this GPU, from the quantization study, as evidence the card can run vLLM. Re-measure memory for this model at agent context lengths.
 
 Reference implementations, for checks only. Do not copy their code, and do not ship them as this repo's tests:
 
@@ -59,5 +66,7 @@ Reference implementations, for checks only. Do not copy their code, and do not s
 - confseq (MIT; early-stage, last release v0.0.11 in January 2023): confidence-sequence boundaries.
 - SciPy: KS and chi-square.
 - The released code of Gao et al.: the MMD test, as the stage 3 anchor.
+
+smolagents (Apache 2.0) and AppWorld (Apache 2.0 with the encrypted-redistribution requirement in `DATA.md`) are runtime dependencies, not reference checks. They are not vendored.
 
 Do not depend on Alibi Detect. Its license is BSL 1.1 since January 2024 (`PRIOR_WORK.md`).
