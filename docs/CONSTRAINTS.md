@@ -20,6 +20,15 @@ Python 3.11+ (AppWorld's floor). vLLM for serving. smolagents for the agent loop
 
 No custom CUDA or Triton kernels. No Kubernetes in the core. No custom simulated environment or tool set unless AppWorld integration requires it.
 
+### Environments
+
+Two Python environments, because AppWorld 0.1.3 pins `pydantic<2`, `fastapi<0.111`, and `pytest<9`, while vLLM 0.30 requires `pydantic>=2.12` and `fastapi>=0.133`. They cannot share one.
+
+- **Service environment**, `requirements.txt` at the root: the gateway, smolagents, AppWorld, the statistics, tests, and the River and SciPy reference checks. It reaches vLLM only over its OpenAI-compatible HTTP API. The pins resolved and imported together on Python 3.12 on 2026-09-27, and the CPU offline-gate tests passed in it; nothing has run against vLLM or AppWorld data yet. The gateway's FastAPI and pydantic versions are the ones AppWorld allows.
+- **vLLM environment**, pinned in `docker/vllm/` when stage 0 starts: vLLM with the torch and Transformers it pins. Full-vocabulary teacher-forced KL scoring runs here, since it needs torch and Transformers on the GPU.
+
+confseq is not in `requirements.txt`. Version 0.0.11 ships only as source and needs system Boost to build, which this machine does not have. Installing Boost is a system package change; ask first.
+
 ## Code execution
 
 The agent's actions are model-generated code or API calls. They execute only through AppWorld (`DECISIONS.md` D18). smolagents documents its `LocalPythonExecutor` as not a security boundary; it never runs an action here. Where AppWorld executes, in process or in Docker via `appworld serve`, is `DECISIONS.md` D20 and is settled before the first episode.
