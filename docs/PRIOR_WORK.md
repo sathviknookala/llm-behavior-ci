@@ -6,14 +6,17 @@ Read Gao et al., Podkopaev & Ramdas, Lindon et al., and the substitution-audit p
 
 ## Positioning
 
-Detector benchmarks (Failing Loudly) and model-substitution tests (Gao et al. and successors) compare against a reference once, or batch by batch. The anytime-valid literature is evaluated mostly in simulation. Lindon et al. cover general software canaries. The survey that produced the handoff found no head-to-head of fixed-window tests, CUSUM, ADWIN, and anytime-valid methods on detection delay, misses, and false alarms over long healthy traffic in an LLM service's release lifecycle.
+Detector benchmarks (Failing Loudly) and model-substitution tests (Gao et al. and successors) compare against a reference once, or batch by batch. The anytime-valid literature is evaluated mostly in simulation. Lindon et al. cover general software canaries. Agent benchmarks such as AppWorld score an agent once per task set; they are not release lifecycles. The survey that produced the handoff found no head-to-head of fixed-window tests, CUSUM, ADWIN, and anytime-valid methods on detection delay, misses, and false alarms over long healthy traffic in an LLM service's release lifecycle.
 
-That comparison, with harm defined by labeled data and nondeterminism measured as a source of false alarms, is the contribution this repo is built to make. It is an engineering benchmark, not a new statistical method.
+That survey was run for an LLM classification service. It was not repeated for tool-using agents. Survey agent regression-testing and agent-monitoring work before the protocol leaves draft status and before writing any comparison claim.
+
+The contribution this repo is built to make is that comparison for a tool-using agent: harm defined by AppWorld's evaluator, plan-only gates checked against executed harm, and nondeterminism and trajectory divergence measured as sources of false alarms. It is an engineering benchmark, not a new statistical method.
 
 ## Papers
 
 | Item | Fact as recorded | Source |
 |---|---|---|
+| AppWorld (Trivedi et al.; ACL 2024) | 9 apps, 457 APIs, about 100 simulated people; a benchmark of 750 tasks solved by interactive coding; state-based unit-test evaluation that also checks for collateral damage. Reports GPT-4o solving about 49% of `test_normal` and about 30% of `test_challenge` tasks. Checked 2026-09-27 | arxiv.org/abs/2407.18901 ; github.com/StonyBrookNLP/appworld |
 | Model equality testing (Gao, Liang, Guestrin; ICLR 2025) | Detecting a silently changed API model (quantization, watermarking, fine-tuning, system-prompt changes) as two-sample testing; MMD with a string kernel; median power 77.4% across real-world modifications; discrepancies on production endpoints; code released | arxiv.org/abs/2410.20247 |
 | Auditing model substitution in LLM APIs (2025) | Text-only statistical tests need many queries and miss subtle substitutions such as quantized models; log-probability methods are defeated by ordinary inference nondeterminism; proposes trusted execution environments. Authors not confirmed in the handoff | arxiv.org/abs/2504.04715 |
 | Rank-based uniformity test (2025) | A query-efficient test for detecting quantization, fine-tuning, or full substitution behind black-box APIs | arxiv.org/abs/2506.06975 |
@@ -30,12 +33,14 @@ That comparison, with harm defined by labeled data and nondeterminism measured a
 | Foundations | ADWIN: Bifet & Gavaldà, SDM 2007. CUSUM: Page, Biometrika 1954. MMD: Gretton et al., JMLR 2012. Classifier two-sample tests: Lopez-Paz & Oquab, ICLR 2017 | cs.upc.edu/~gavalda/papers/adwin06.pdf ; jmlr.org/papers/v13/gretton12a.html |
 | Nondeterminism (Thinking Machines, September 2025) | LLM inference is not batch-invariant, so outputs change with concurrent load even at temperature 0. Batch-invariant kernels give bit-identical outputs | thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference |
 
-The 84% and 51% figures, the 77.4% median power, and the 75% false-alarm figure are claims in those papers. They are not results of this repo.
+The 84% and 51% figures, the 77.4% median power, the 75% false-alarm figure, and AppWorld's GPT-4o figures are claims in those papers. They are not results of this repo, and no Qwen3-4B figure on AppWorld exists here.
 
 ## Tools
 
 | Item | Fact as recorded | Source |
 |---|---|---|
+| smolagents | Apache 2.0. `CodeAgent` writes actions as Python; `ToolCallingAgent` writes JSON tool calls. Its `LocalPythonExecutor` is documented as not a security boundary. Checked 2026-09-27 | github.com/huggingface/smolagents |
+| AppWorld runtime | Python 3.11+. `world.execute` runs code in a stateful shell against the task's database; `world.evaluate()` scores one task; `evaluate_tasks` scores a batch. Per task: `success`, and requirement passes and fails labeled `no_op_pass` or `no_op_fail`. Aggregates are TGC and SGC. Checked 2026-09-27 | github.com/StonyBrookNLP/appworld |
 | vLLM log-probabilities | `logprobs` per token is capped by `max_logprobs`, default 20. `prompt_logprobs` gives teacher-forced scores. No full-vocabulary logits through the API, so exact KL needs Transformers | docs.vllm.ai/en/stable/configuration/engine_args |
 | vLLM determinism | Outputs vary with batch composition even at temperature 0. `VLLM_BATCH_INVARIANT=1` enables batch-invariant kernels at a performance cost, on compute capability 8.0+. This card qualifies | docs.vllm.ai/en/latest/features/batch_invariance |
 | vLLM metrics | Prometheus `/metrics`: time to first token, time per output token, end-to-end latency, KV-cache use, queue depth | docs.vllm.ai/en/stable/design/metrics |
@@ -50,7 +55,7 @@ Checked 2026-09-26 against the projects' LICENSE files, as recorded in the hando
 | Tool | License as recorded | Role relative to this repo |
 |---|---|---|
 | Evidently | Apache-2.0. Batch tests; no sequential tests found | Positioning only. A sequential test upstream would be an optional PR after asking |
-| NannyML | Apache-2.0. CBPE/DLE label-free estimation | The label-free monitor follows the idea, implemented here, with error reported against true accuracy |
+| NannyML | Apache-2.0. CBPE/DLE label-free estimation | Positioning only. Its confidence-based estimate assumes a classifier and is not in the agent design |
 | River | BSD-3. ADWIN, KSWIN, Page-Hinkley | Reference check only |
 | confseq | MIT. Early-stage, v0.0.11, January 2023 | Reference check only |
 | promptfoo | MIT. A GitHub Action for prompt regressions | Positioning only |
