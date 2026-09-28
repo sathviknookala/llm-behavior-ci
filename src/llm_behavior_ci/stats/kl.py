@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 import math
 from statistics import fmean
@@ -8,10 +10,22 @@ class NextTokenKLError(ValueError):
     pass
 
 
+class TruncatedKLError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class NextTokenKLResult:
     position_kl_nats: tuple[float, ...]
     mean_kl_nats: float
+
+
+@dataclass(frozen=True)
+class TruncatedKLResult:
+    position_kl_nats: tuple[float, ...]
+    mean_kl_nats: float
+    approximation: str
+    vocabulary_size: int | None
 
 
 def _normalize(
@@ -43,6 +57,15 @@ def next_token_kl(
     production_log_probabilities: Sequence[Sequence[float]],
     candidate_log_probabilities: Sequence[Sequence[float]],
 ) -> NextTokenKLResult:
+    """Inputs must be aligned log-probabilities over the same vocabulary positions. A single selected-token log-probability is not full-vocabulary KL.
+
+    Null hypothesis: the two distributions are equal, so KL is zero.
+    Assumptions: each position is renormalized independently; -inf means no mass.
+    Direction of harm: larger KL.
+    Boundary: none.
+    Reset: stateless.
+    Evidence: mean_kl_nats.
+    """
     production_positions = tuple(production_log_probabilities)
     candidate_positions = tuple(candidate_log_probabilities)
     if not production_positions:
@@ -89,4 +112,45 @@ def next_token_kl(
     return NextTokenKLResult(
         position_kl_nats=position_values,
         mean_kl_nats=fmean(position_values),
+    )
+
+
+def truncated_next_token_kl(
+    production_log_probabilities: Sequence[Sequence[float]],
+    candidate_log_probabilities: Sequence[Sequence[float]],
+    *,
+    vocabulary_size: int | None = None,
+) -> TruncatedKLResult:
+    """Top-k truncated next-token KL on aligned log-probabilities.
+
+    Null hypothesis: the two distributions are equal, so KL is zero.
+    Assumptions: each position is renormalized independently; -inf means no mass.
+    Direction of harm: larger KL.
+    Boundary: none.
+    Reset: stateless.
+    Evidence: mean_kl_nats.
+    """
+    production_positions = tuple(production_log_probabilities)
+    candidate_positions = tuple(candidate_log_probabilities)
+    longest = 0
+    for position in (*production_positions, *candidate_positions):
+        longest = max(longest, len(position))
+    if vocabulary_size is not None:
+        if (
+            not isinstance(vocabulary_size, int)
+            or isinstance(vocabulary_size, bool)
+            or vocabulary_size < longest
+        ):
+            raise TruncatedKLError(
+                "vocabulary_size must be an int at least as large as the longest support"
+            )
+    try:
+        result = next_token_kl(production_positions, candidate_positions)
+    except NextTokenKLError as error:
+        raise TruncatedKLError(*error.args) from error
+    return TruncatedKLResult(
+        position_kl_nats=result.position_kl_nats,
+        mean_kl_nats=result.mean_kl_nats,
+        approximation="top_k",
+        vocabulary_size=vocabulary_size,
     )

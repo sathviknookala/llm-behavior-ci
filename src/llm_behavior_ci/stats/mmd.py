@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 import math
 import random
@@ -71,6 +73,30 @@ def _mmd_squared(
     return max(production_term + candidate_term - 2.0 * cross_term, 0.0)
 
 
+def cluster_swap_bits(
+    clusters: Sequence[str],
+    rng: random.Random,
+) -> tuple[int, ...]:
+    """One paired-swap bit per pair, constant inside a cluster id.
+
+    Null hypothesis: the two samples are equal under paired exchangeability.
+    Assumptions: cluster mode preserves within-cluster dependence by swapping whole clusters.
+    Direction of harm: larger MMD.
+    Boundary: permutation p-value (exceedances + 1) / (permutations + 1), unchanged.
+    Reset: stateless.
+    Evidence: p_value.
+    """
+    bits_by_label: dict[str, int] = {}
+    labels: list[str] = []
+    for label in clusters:
+        if not isinstance(label, str) or label == "":
+            raise MMDError("cluster labels must be non-empty")
+        labels.append(label)
+        if label not in bits_by_label:
+            bits_by_label[label] = rng.getrandbits(1)
+    return tuple(bits_by_label[label] for label in labels)
+
+
 def mmd_permutation_test(
     production: Sequence[Sequence[float]],
     candidate: Sequence[Sequence[float]],
@@ -78,7 +104,17 @@ def mmd_permutation_test(
     bandwidth: float,
     permutations: int,
     seed: int,
+    clusters: Sequence[str] | None = None,
 ) -> MMDResult:
+    """Paired permutation test for maximum mean discrepancy.
+
+    Null hypothesis: the two samples are equal under paired exchangeability.
+    Assumptions: cluster mode preserves within-cluster dependence by swapping whole clusters.
+    Direction of harm: larger MMD.
+    Boundary: permutation p-value (exceedances + 1) / (permutations + 1), unchanged.
+    Reset: stateless.
+    Evidence: p_value.
+    """
     production_points = _points(production, "production")
     candidate_points = _points(candidate, "candidate")
     if len(production_points[0]) != len(candidate_points[0]):
@@ -99,6 +135,12 @@ def mmd_permutation_test(
         or permutations < 1
     ):
         raise MMDError("permutations must be a positive integer")
+    if clusters is not None:
+        if len(clusters) != len(production_points):
+            raise MMDError("clusters must have one label per pair")
+        for label in clusters:
+            if not isinstance(label, str) or label == "":
+                raise MMDError("cluster labels must be non-empty")
 
     observed = _mmd_squared(
         production_points, candidate_points, kernel_denominator
@@ -109,15 +151,27 @@ def mmd_permutation_test(
     for _ in range(permutations):
         permuted_production = []
         permuted_candidate = []
-        for production_point, candidate_point in zip(
-            production_points, candidate_points, strict=True
-        ):
-            if random_generator.getrandbits(1):
-                permuted_production.append(candidate_point)
-                permuted_candidate.append(production_point)
-            else:
-                permuted_production.append(production_point)
-                permuted_candidate.append(candidate_point)
+        if clusters is None:
+            for production_point, candidate_point in zip(
+                production_points, candidate_points, strict=True
+            ):
+                if random_generator.getrandbits(1):
+                    permuted_production.append(candidate_point)
+                    permuted_candidate.append(production_point)
+                else:
+                    permuted_production.append(production_point)
+                    permuted_candidate.append(candidate_point)
+        else:
+            bits = cluster_swap_bits(clusters, random_generator)
+            for bit, production_point, candidate_point in zip(
+                bits, production_points, candidate_points, strict=True
+            ):
+                if bit:
+                    permuted_production.append(candidate_point)
+                    permuted_candidate.append(production_point)
+                else:
+                    permuted_production.append(production_point)
+                    permuted_candidate.append(candidate_point)
         permuted = _mmd_squared(
             permuted_production,
             permuted_candidate,
