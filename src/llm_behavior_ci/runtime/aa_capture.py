@@ -171,9 +171,10 @@ def _modes(modes: Sequence[str]) -> tuple[ModeName, ...]:
         raise EpisodeRejected("modes must be a non-empty tuple")
     chosen: list[ModeName] = []
     for mode in modes:
-        if mode not in {"plan", "execute"}:
+        if mode == "plan" or mode == "execute":
+            chosen.append(mode)
+        else:
             raise EpisodeRejected("mode must be plan or execute")
-        chosen.append(mode)
     if len(set(chosen)) != len(chosen):
         raise EpisodeRejected("modes contains a duplicate")
     return tuple(chosen)
@@ -486,7 +487,7 @@ def capture_aa(
             jobs.append((len(jobs), item, mode))
     slots: list[AAPairRecord | None] = [None] * len(jobs)
 
-    def run_job(index: int, item: ScheduledInput, mode: str) -> None:
+    def run_job(index: int, item: ScheduledInput, mode: ModeName) -> None:
         runtime = runtime_factory(mode)
         pair = run_pair(
             item.task_id,
