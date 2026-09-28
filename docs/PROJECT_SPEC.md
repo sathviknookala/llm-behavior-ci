@@ -31,11 +31,13 @@ seeded AppWorld task stream (simulated users)
 | Configuration registry | this repo | Versioned production and candidate configurations: model revision, quantization, serving flags, prompt, plan-trace format, agent-runtime settings. Each has a hash that travels in every log row |
 | Task-stream harness | this repo | Emits AppWorld task IDs in seeded order at a pre-registered arrival rate, open-loop, with the pre-registered task-mix schedule |
 | Episode log | this repo | Per step: model input and output, top-k log-probabilities, the action, AppWorld's execution output and any error, latency, timestamp. Per episode: configuration hash, task ID, seed, evaluator result |
-| `stats` | this repo | Paired bootstrap, next-token KL, and MMD |
+| `stats` | this repo | Paired and clustered bootstrap, KL, MMD, fixed-window tests, CUSUM, ADWIN, confidence sequences, e-detectors, harmful-shift tests, and the sequential canary test |
 | `lifecycle.offline_gate` | this repo | Offline CI regression gate over plan traces |
 | `lifecycle.canary` | this repo | Paired canary tests and the rollback decision |
 | `lifecycle.monitoring` | this repo | Sequential and change-detection monitors on the production stream, and alert de-duplication |
 | Benchmark and reporting | this repo | Fault injection, shared-stream method comparison, the end-to-end tier flow, and every artifact under `results/` |
+
+This table defines the target ownership, not completion. As of 2026-09-28, the repo contains configuration and record schemas, deterministic task-set selection and streams, a plan/execute episode path, a paired runner that calls that path twice on separate worlds, an A/A capture command over a supplied stream, fake-based CPU tests, lazy live adapters, the statistics implementations, a validation runner over those statistics, versioned fault diffs, a plan-only offline gate, a canary controller, a production monitor, a local SQLite episode store, and public aggregate export. The capture records evaluator disagreement, requirement fractions, trajectory divergence, and plan-scoring inputs. It applies no protocol threshold. A synthetic run is not a noise-floor result. The validation runner scores supplied seeds, reference values, and A/A rows, and it writes no measurement under `results/`. The gate, canary, and monitor decide from caller-supplied settings on injected worlds. The repo does not contain the FastAPI gateway, smolagents wiring, a live AppWorld or vLLM run, a served canary, a webhook, filled model or container contexts, protocol validity evidence, or measurements. `STAGES.md` records implementation progress separately from gate completion.
 
 Rule for the integration boundary: every environment mutation goes through AppWorld, so its evaluator sees the true final state. smolagents' local Python executor is never the place an action runs.
 
@@ -78,7 +80,7 @@ Three parts, all of which stay answerable:
 
 ## Five kinds of evidence
 
-All five survive any allowed change:
+All five are required end-state evidence; none is complete in the current tree. All five survive any allowed change:
 
 1. **A running service.** The gateway of this repo in front of smolagents, vLLM, and AppWorld. It logs every episode step, versions configurations, pairs canary episodes, and rolls back.
 2. **An offline regression gate in CI.** Compares production and candidate plan traces on the fixed `train` tasks and blocks the candidate from canary when it fails.

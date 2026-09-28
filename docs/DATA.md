@@ -40,6 +40,8 @@ Local only, never committed or published:
 - database state;
 - raw episode logs.
 
+A public validation summary follows the same list. Scenario and task ids used to cluster a run stay local. The summary may carry the input hash, counts, seeds, method parameters, and aggregate intervals.
+
 Local artifacts live under `data/raw/` and `data/processed/`, which a local Git exclude file keeps out of git, or in the log store (`DECISIONS.md` D10). `data/manifests/` is tracked and holds only public items. The exclude file is not cloned, so recreate it on every clone and check `git status` before every commit.
 
 ### Split restrictions

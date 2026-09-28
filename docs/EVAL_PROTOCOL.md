@@ -57,19 +57,37 @@ Every item below is fixed on `train` and `dev` and committed here before `test_n
 | Batch-invariant mode | OPEN | Stage 0 measures the A/A floor with and without `VLLM_BATCH_INVARIANT=1`, including the throughput cost. The benchmark records which mode was on. |
 | Gao et al. match tolerance | OPEN | The anchor is their reported median power of 77.4% across modifications (arxiv.org/abs/2410.20247). The tolerance for "matched" is not chosen. |
 
-## Current offline-gate demo
+## Current plan-only offline gate
 
-`src/llm_behavior_ci/stats/` currently provides a deterministic, standard-library execution path over hardcoded healthy inputs. The inputs are generic score vectors, next-token distributions, and embeddings. They are not plan traces, and no AppWorld task is involved:
+`src/llm_behavior_ci/stats/` implements the stage 2 method set with standard-library execution paths and formula-level unit tests. `src/llm_behavior_ci/lifecycle/offline_gate.py` runs `run_pair` in plan mode on a caller-supplied `train` task set and applies three checks whose thresholds come only from `GateSettings`:
 
-- a paired percentile bootstrap of `candidate - production`;
-- per-position `D_KL(production || candidate)` in nats from normalized log-probabilities, with no epsilon flooring when candidate support is missing;
-- a biased squared MMD with an RBF kernel and a Monte Carlo p-value from within-pair production/candidate swaps, preserving the paired design.
+- a scenario-clustered paired bootstrap of plan-quality scores;
+- truncated top-k plan KL when the tokenizers match and the top-k tables align;
+- plan-level MMD with a permutation p-value.
 
-`src/llm_behavior_ci/lifecycle/offline_gate.py` combines those three checks and `scripts/run_offline_gate.py` prints their evidence. This path proves that the modules compose and that GitHub-hosted CPU CI can execute them. It does not establish calibration, false-alarm control, coverage, reference agreement, an A/A floor, or a release threshold. It therefore satisfies neither the stage 2 nor stage 3 gate.
+`scripts/run_offline_gate.py` prints a public decision. Missing arguments and execution failures exit 2 and are not BLOCK decisions. The GitHub-hosted CPU workflow runs the unit, CI, and synthetic integration suites, then checks that a bare invocation exits 2. This path proves that the modules compose on CPU. It does not establish calibration, false-alarm control, coverage, reference agreement, an A/A floor, or a release threshold. It therefore satisfies neither the stage 2 nor stage 3 gate. The validation runner below does not fill those gaps.
+
+## A/A capture command
+
+`src/llm_behavior_ci/runtime/aa_capture.py` and `scripts/evaluation/capture_aa.py` pair one configuration with itself on a caller-supplied finite stream. Repetitions, concurrency, and modes are explicit arguments. Concurrency does not change task order, membership, or the recorded offsets. The command stores evaluator disagreement, requirement fractions, trajectory divergence, and plan-scoring inputs. Tool-count homogeneity reuses `chi_square_homogeneity` only when the counts meet that function's contract, and the p-value is not a decision. Plan-scoring inputs are the plan texts and top-k log probabilities; no KL limit is applied. A missing evaluator outcome stays missing. A zero requirement total leaves the fraction undefined, so the fraction difference stays unset. `test_normal` is rejected. `--observe-hardware` records MiB and wall time from `nvidia-smi` only; otherwise those fields are unset. A caller-supplied probe is not GPU evidence. This command fills none of the open slots above, including the batch-invariant A/A floor.
+
+## Validation runner
+
+`src/llm_behavior_ci/experiments/validation.py` and the `scripts/evaluation/` commands `validate_method.py`, `compare_plan_kl.py`, and `assess_harm_study.py` score supplied inputs. They fill none of the open slots above. They do not read `GateSettings`, do not choose α, a harm margin, a horizon, or a tolerance, and do not write under `results/`. `test_normal` and `test_challenge` are rejected.
+
+`validate_method` takes explicit seeds, reference cases, and monitor observations. The report stores the seeds, method parameters, input hash, sample counts, and Wilson intervals. A catalog method is implemented before any report exists. It is validated only when a report's `benchmark_eligible` flag is true, which requires every minimum check for that method to have been requested and to have passed. CUSUM and ADWIN reports record the alarm rate and do not claim a nominal false-alarm bound. Fixed-window methods also record the single-look rate and the repeated-look rate. Reference agreement compares this package's statistic with the number in the case. SciPy, River, and confseq are reported as importable and are not called.
+
+A/A dependence is accepted for provenance `local_runtime`, or for `gpu` when the caller also sets a hardware reading and a memory value. Synthetic provenance, an unread GPU, and missing labels leave the effect fields empty. Repeated-task effect is within-task variance over total variance. Scenario clustering is a one-way intraclass correlation. Inference variation is the evaluator disagreement rate on pair rows, or the within-task mean absolute deviation on a monitor series. `MonitorObservation` does not carry scenario, task, or repetition; those labels are a parallel `AAContext` or rows copied from a capture. Task and scenario ids stay out of the public summary.
+
+`compare_plan_kl` keeps, at each position, the top-k production log-probabilities, restricts the candidate to those indexes, and records full mean KL minus truncated mean KL. The approximation name, k, and vocabulary size are stored. `gpu_floor_measured` stays false. A passed status on a supplied sample is not a vLLM truncation floor. `score_top_k` does not accept a vocabulary size; the comparison calls `truncated_next_token_kl`.
+
+`assess_harm_study` is the stage 1 planner in `STAGES.md`. Its power calculation and its feasibility flag are not entries in the slots above. The harm margin, α, and sample sizes remain open until they are written in this file.
+
+`STUDY_BUDGETS` caps how large a `cpu_fast`, `simulation`, or `gpu` call may be (`CONSTRAINTS.md`). The caps are not protocol parameters.
 
 ## What each tier is allowed to use
 
-The library implements the full set in `STAGES.md` stage 2. Each consumer uses a subset:
+The library implements the full set in `STAGES.md` stage 2. The plan-only gate, the canary controller, and the production monitor are CPU decision paths. Their thresholds come from the caller and are not the open slots above. The A/A capture records paired outcomes and plan-scoring inputs and does not apply the decision rules below. Each consumer uses a subset:
 
 - **Tier 1, offline CI gate:** plan mode only, on the fixed `train` task set, with identical task and tool context for both configurations. Paired bootstrap on plan-quality metrics; teacher-forced plan-trace KL when the tokenizer matches; MMD on plan representations. Fail when a confidence interval crosses the margin or a divergence test rejects. Passing allows canary entry.
 - **Tier 2, canary:** paired execution in isolated AppWorld worlds from the same initial state; the candidate's episode is served and production's is the shadow reference. The sequential canary test; a confidence sequence on the paired success difference; a fixed-window baseline. Behavior signals as each episode ends; evaluator outcomes after the pre-registered outcome delay. Roll back on sufficient evidence of harmful degradation. Developed and tuned on `dev`; benchmarked on `test_normal`.
@@ -98,7 +116,7 @@ Scope line that travels with the claim: seeded AppWorld task streams with simula
 
 ## What is not ground truth
 
-An LLM judge. The agent's own claim that it completed a task. A plan-quality metric by itself. A divergence with no evaluator-measured drop in task success. A threshold chosen on `test_normal`. A fault label revised after `test_normal`. A method that has not passed its null check. A synthetic-null false-alarm rate reported without the A/A and task-mix-shift streams.
+An LLM judge. The agent's own claim that it completed a task. A plan-quality metric by itself. A divergence with no evaluator-measured drop in task success. A threshold chosen on `test_normal`. A fault label revised after `test_normal`. A method that has not passed its null check. A synthetic-null false-alarm rate reported without the A/A and task-mix-shift streams. A `benchmark_eligible` flag on caller-supplied provenance. A normal-approximation power number. A top-k versus full KL error on supplied arrays reported as a vLLM truncation floor.
 
 ## Run log
 

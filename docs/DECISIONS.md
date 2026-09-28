@@ -36,6 +36,8 @@ Bootstrap, KL (here, teacher-forced on plan traces), MMD, CUSUM, ADWIN, confiden
 
 **Why:** confseq's last release noted in the handoff is v0.0.11 (January 2023). The implementation has to be explainable in an interview and valid under this project's null.
 
+**Current implementation note (2026-09-28):** `experiments/validation.py` compares a method with a caller-supplied reference number. It records whether SciPy, River, and confseq can be imported and does not call them. That is not yet the shared-input reference check in this decision. confseq remains uninstalled until system Boost is approved (`CONSTRAINTS.md`). No method's null behavior is committed.
+
 ## D5 — Hardware and money
 
 **Status:** LOCKED (handoff 2026-09-26)
@@ -49,6 +51,8 @@ One GPU, planned for 24 GB, including a canary that holds two versions. No cloud
 Python, FastAPI, vLLM, Transformers, smolagents, AppWorld, Postgres or DuckDB over Parquet, Prometheus, Grafana optional, Docker Compose, GitHub Actions, pytest. No custom CUDA or Triton. No Kubernetes in the core. No custom simulated environment or tool set unless AppWorld integration requires it.
 
 **Still open inside the boundary:** Postgres versus DuckDB (D10); Grafana versus a static page (D11).
+
+**Current implementation note (2026-09-27):** This is the target boundary, not an installed-stack inventory. The CPU suite currently uses `unittest`; pytest is pinned but unused. `requirements.txt` does not yet include smolagents or Transformers, and no gateway, Compose stack, or vLLM environment exists.
 
 ## D7 — Default model
 
@@ -78,6 +82,8 @@ The headline is the measured statistical behavior of the lifecycle: statisticall
 
 Postgres, or DuckDB over Parquet. Either passes the change test. Choose when stage 0 starts and update this entry with the reason. Do not run both as the system of record. Episode logs hold AppWorld content and stay local (`DATA.md`).
 
+`EpisodeStore` currently uses SQLite for the local CPU episode path. It is an interim implementation and does not resolve this decision.
+
 ## D11 — Dashboard
 
 **Status:** OPEN
@@ -89,6 +95,8 @@ Grafana, or a static page, showing vLLM latency beside behavior metrics. Either 
 **Status:** OPEN — Sathvik
 
 Self-hosted runner under the rules in `CONSTRAINTS.md`, or a local `make gate` whose result is posted as a commit status. Ask before registering a runner.
+
+The current workflow is CPU-only on a GitHub-hosted runner. No Makefile, GPU job, or commit-status path exists.
 
 ## D13 — Alert channel
 
@@ -128,6 +136,8 @@ No code, data, or numbers from outside employment enter this repo. Before any pu
 
 smolagents runs the agent loop against the configuration's vLLM server. Two interfaces pass the change test: a `CodeAgent` whose Python actions run in AppWorld's execution shell, which is how AppWorld tasks are designed to be solved; or a `ToolCallingAgent` with AppWorld APIs exposed as tools, which puts many tool schemas in context. Choose when stage 1 starts and record the reason. Either way, every mutation goes through AppWorld, and smolagents' `LocalPythonExecutor` never executes an action.
 
+The current `runtime/agent.py` supplies an injectable agent-loop protocol and a direct HTTP `VLLMAgent` adapter for CPU-testable episode composition. smolagents is not wired, so this adapter does not resolve the action-interface choice.
+
 ## D19 — Evaluation lifecycle
 
 **Status:** LOCKED (Sathvik 2026-09-27)
@@ -147,3 +157,5 @@ Model-generated actions run on his machine. AppWorld's in-process shell restrict
 In each Tier 2 canary pair, the candidate's episode is the served result and production's episode is the shadow reference. Episodes served before rollback, and failures among them, are counted from the candidate side.
 
 **Why:** A canary's cost is what a bad candidate served. If production's episode were served, that cost would always be zero.
+
+`run_pair` currently calls the reference episode and then the candidate. That call order is recorded and is not this served-result rule. `CanaryController` counts candidate episodes as served and can roll back from `CanarySettings`, but no gateway serves an episode.

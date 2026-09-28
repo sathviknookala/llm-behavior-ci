@@ -1,6 +1,6 @@
 # Stages
 
-Read before starting or closing a stage. Status of every stage: **not started**. A hardcoded CPU demo of the three offline-gate statistics exists; it has no plan traces, AppWorld integration, null validation, reference checks, protocol thresholds, or measurements and does not complete a stage. A stage is complete when its gate's evidence is committed, not when a process starts.
+Read before starting or closing a stage. No stage is complete. Implementation has begun across stages 0–5, but a stage is complete only when its gate's evidence is committed. The current task stream, fake-driven episode path, paired runner, A/A capture command, statistics library, validation runner, versioned fault diffs, plan-only offline gate, canary controller, production monitor, SQLite store, and public export are reusable components; they are not stage-gate evidence.
 
 Suggested numeric defaults belong in `EVAL_PROTOCOL.md` and stay open until that file is pre-registered. Do not invent a threshold in a script.
 
@@ -8,18 +8,20 @@ Keep the order. Stages 0–2 produce the noise floor and the null checks. Stages
 
 Splits follow the canonical policy in `PROJECT_SPEC.md`. Stages 0–5 use only `train` and `dev`. `test_normal` is first run in stage 6, after every methodology choice is frozen. `test_challenge` is unused.
 
-| Stage | Splits | Status |
-|---|---|---|
-| 0 Service skeleton, AppWorld integration, task-stream harness, noise floor | `train`, `dev` | not started |
-| 1 Split selection, baseline agent, task-mix drift | `train`, `dev` | not started |
-| 2 Statistics library and validity checks | `train`, `dev` | not started |
-| 3 Tier 1: offline CI regression gate | gate on `train`; harm labels on `dev` | not started |
-| 4 Tier 2: canary evaluation and automatic rollback | `dev` | not started |
-| 5 Tier 3: continuous production monitoring and alerts | `dev` | not started |
-| 6 Fault-injection benchmark | gate on `train`; canary and monitors on `test_normal` | not started |
-| 7 Write-up and resume facts | — | not started |
+| Stage | Splits | Implementation status | Gate status |
+|---|---|---|---|
+| 0 Service skeleton, AppWorld integration, task-stream harness, noise floor | `train`, `dev` | paired CPU path and A/A capture; no noise-floor result | unmet |
+| 1 Split selection, baseline agent, task-mix drift | `train`, `dev` | selection, episode abstractions, and a harm-study planner; no evaluator outcomes | unmet |
+| 2 Statistics library and validity checks | `train`, `dev` | library and validation runner; no committed null, reference, A/A, or truncation result | unmet |
+| 3 Tier 1: offline CI regression gate | gate on `train`; harm labels on `dev` | plan-only gate and versioned fault diffs; no committed harm labels or protocol thresholds | unmet |
+| 4 Tier 2: canary evaluation and automatic rollback | `dev` | controller on injected execute pairs; no gateway or live rollback | unmet |
+| 5 Tier 3: continuous production monitoring and alerts | `dev` | monitor against caller-supplied baselines; no webhook or live stream | unmet |
+| 6 Fault-injection benchmark | gate on `train`; canary and monitors on `test_normal` | versioned fault diffs only; benchmark not started | unmet |
+| 7 Write-up and resume facts | — | not started | unmet |
 
 ## Stage 0 — service skeleton, AppWorld integration, task-stream harness, and noise floor
+
+Current code provides configuration and record schemas, deterministic task streams, a fake-driven episode path, paired execution on injected worlds (`run_pair` in `runtime/episode.py`), an A/A capture command (`scripts/evaluation/capture_aa.py`), lazy AppWorld and vLLM adapters, SQLite episode storage, aggregate export, and a synthetic CPU integration contract. CPU tests show a shared pair id, separate worlds, independent mutations, a preserved candidate failure, distinct run identities, and a schedule that does not change with concurrency. There is no gateway, live service integration, load run, or committed noise-floor result. The capture rejects `test_normal`. Memory and wall time stay unset unless the command is asked to read `nvidia-smi`. A probe or a synthetic test is not GPU evidence, and no GPU capture has been written under `results/`.
 
 Gateway (FastAPI):
 
@@ -36,6 +38,8 @@ Gate: no dropped logs under the target load; the stream schedule is reproducible
 
 ## Stage 1 — split selection, baseline agent, and task-mix drift
 
+Current code can load a catalog manifest, deterministically select and hash a task set, generate a seeded stream, and run a plan or execute episode through injected interfaces. `assess_harm_study` in `experiments/validation.py` compares supplied production and do-nothing evaluator outcomes with scenario-clustered bootstrap intervals, reports success by app and difficulty, and computes `harm_detection_power` at supplied sample sizes. The power formula is a one-sided normal approximation: the null paired-mean difference is 0, the alternative is `-harm_margin`, and the variance is an argument. Feasibility stays unset until both evaluator arms exist, and it is false when the power target fails or the production-minus-do-nothing interval does not lie above zero. The command rejects `test_normal` and `test_challenge`. No AppWorld version, resolved task set, model revision, prompt, action interface, baseline, task-mix curve, or power calculation is fixed, and no evaluator outcomes have been supplied.
+
 - **Environment.** AppWorld at a pinned version. The split roles are the canonical policy in `PROJECT_SPEC.md`. The Tier 1 gate's fixed `train` subset, and the `dev` and `test_normal` stream rules, are each defined by a deterministic selection rule and seed (`EVAL_PROTOCOL.md`). `test_normal` is selected by rule, not run.
 - **Default agent.** A Qwen3-4B chat checkpoint (Apache 2.0), thinking mode off, served by vLLM and driven by smolagents with the action interface in `DECISIONS.md` D18. Record the exact revisions. The prompt and step limit are fixed.
 - **Plan mode.** The same prompt, task, and tool context as the executing agent, instructed to emit an explicit plan trace in a fixed format without executing any tool.
@@ -46,7 +50,9 @@ Gate: production success beats the do-nothing agent, and a committed power calcu
 
 ## Stage 2 — statistics library and its validity checks
 
-Implement in this repo:
+The Python implementations and formula-level unit tests exist under `src/llm_behavior_ci/stats/` and `tests/unit/`. `experiments/validation.py` and `tests/validity/` run simulated-null, coverage, stopping, repeated-look, reference, A/A-dependence, and KL-truncation checks on caller-supplied inputs. `implemented_methods()` lists every catalog method as not validated. `benchmark_eligible` is true only when that run requested every minimum check and each one passed. CUSUM and ADWIN are recorded without a nominal false-alarm bound, matching their implementations. Level and at-most methods are judged against the spec's α and tolerance. The local suite is not in the GitHub workflow. No simulated-null rate, reference match, real A/A false-alarm rate, or truncation error is committed under `results/`.
+
+Implemented in this repo:
 
 - the paired bootstrap, resampling by AppWorld scenario when several task instances or repeated episodes share one scenario;
 - teacher-forced plan-trace KL: full-vocabulary (Transformers) and top-k (vLLM prompt log-probabilities);
@@ -61,7 +67,7 @@ Implement in this repo:
 - the Podkopaev–Ramdas harmful-shift test;
 - a sequential canary test in the style of Lindon et al.
 
-Validity checks, run in CI on CPU:
+The stage gate still requires these CPU checks before a method is benchmark-eligible:
 
 - simulated nulls confirm each method's false-alarm rate or coverage at its nominal level (fixed-window tests are expected to inflate over repeated looks; show that too);
 - reference checks against River, confseq, and SciPy on shared inputs;
@@ -73,7 +79,9 @@ Gate: every method matches its reference, and its measured null behavior is comm
 
 ## Stage 3 — Tier 1: the offline CI regression gate
 
-**Fault catalog.** Each entry is a configuration diff. Each is run by execution on `dev`, scored by AppWorld's evaluator, to measure its true drop in task success with a scenario-clustered confidence interval, and classified as harmful (the drop is at least the pre-registered margin) or benign before any gate or monitor sees it. The labels are frozen before `test_normal` is run.
+`lifecycle/offline_gate.py` runs `run_pair` in plan mode on a caller-supplied `train` task set. It applies clustered paired bootstrap, truncated plan KL, and plan MMD using `GateSettings`. A runtime failure raises `GateExecutionError` and is not a BLOCK. The script exits 2 when its arguments are missing or the run cannot decide. CPU CI checks that bare invocation. Thresholds come from the caller. There is no committed harm label, protocol threshold, or GPU path. It does not satisfy this stage.
+
+**Fault catalog.** Each entry is a configuration diff. Each is run by execution on `dev`, scored by AppWorld's evaluator, to measure its true drop in task success with a scenario-clustered confidence interval, and classified as harmful (the drop is at least the pre-registered margin) or benign before any gate or monitor sees it. The labels are frozen before `test_normal` is run. `experiments/faults.py` can apply a diff from `configs/faults/` and record that label from execute-mode pairs on a caller-supplied `dev` set. The API-documentation and LoRA entries name schema leaves the configuration hash does not have yet, so they are not representable. Nothing under `results/` is a frozen label.
 
 1. FP8 weights (vLLM FP8 quantization).
 2. NVFP4 weights (made with llm-compressor, or a published checkpoint; log which).
@@ -97,6 +105,8 @@ Gate: end to end in GitHub Actions, or the local-runner path in `CONSTRAINTS.md`
 
 ## Stage 4 — Tier 2: canary evaluation and automatic rollback
 
+`stats/canary.py` contains the sequential statistical primitive and unit tests. `run_pair` runs the reference episode and then the candidate in separate worlds and keeps a failed candidate. `scripts/evaluation/capture_aa.py` replays a supplied stream of one configuration and records disagreement, requirement fractions, trajectory divergence, and plan-scoring inputs. It does not apply the canary stopping rule. `lifecycle/canary.py` starts after a PASS gate, observes execute-mode pairs, and can continue, roll back, or promote from `CanarySettings`. Candidate episodes are counted as served. `run_pair` still calls the reference episode first, and no gateway serves an episode, so this is not yet the served-result path in `DECISIONS.md` D21. There is no traffic split, alert channel, or chaos test.
+
 Developed, tuned, and acceptance-tested on `dev`. The gateway sends a pre-registered fraction of tasks to the canary. Each canary task is initialized twice from the same AppWorld task state, in two isolated worlds. The candidate executes in one and its episode is the served result; production executes in the other as the shadow reference. Their tool trajectories diverge naturally. AppWorld's evaluator scores both. Two vLLM processes share the GPU with split `gpu_memory_utilization`. The fallback, only after that path has been tried, is LoRA adapters on one base model (`PROJECT_SPEC.md`).
 
 The canary test compares the paired outcomes as episodes finish: task success and the fraction of requirements passed from the evaluator, with the outcome delay pre-registered; behavior signals (tool-call errors, trajectory length, tool selection) as each episode ends. Methods: the sequential canary test, a confidence sequence on the paired success difference, and a fixed-window baseline.
@@ -110,6 +120,8 @@ Measure the candidate episodes served before rollback, how many of those failed,
 Gate: on `dev`, for a planted harmful candidate, the whole sequence works end to end: gate pass, canary, reject, roll back, alert.
 
 ## Stage 5 — Tier 3: continuous production monitoring and alerts
+
+`lifecycle/monitoring.py` normalizes episodes and runs the configured detectors against caller-supplied frozen baselines. Alerts for one signal are de-duplicated in process. `tool_selection` and `task_mix` are normalized and are not monitored series. There is no webhook, dashboard, or live production stream.
 
 Developed, tuned, and acceptance-tested on `dev`. After promotion, the previous known-good production configuration is the reference. Monitors on the production stream:
 
