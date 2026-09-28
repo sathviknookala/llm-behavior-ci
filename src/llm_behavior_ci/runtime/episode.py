@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import threading
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, Literal
 
@@ -8,6 +10,7 @@ from llm_behavior_ci.config import (
     RunConfiguration,
     RunIdentity,
     new_episode_identity,
+    new_pair_id,
     run_configuration_hash,
 )
 from llm_behavior_ci.records import (
@@ -15,6 +18,7 @@ from llm_behavior_ci.records import (
     EvaluatorOutcome,
     LocalTaskRef,
     ModelStep,
+    PairedResult,
     RecordedError,
     ToolStep,
 )
@@ -87,6 +91,7 @@ def _finish(
     run: RunIdentity,
     task_id: str,
     config: RunConfiguration,
+    scenario_id: str | None,
     mode: str,
     started_at: datetime,
     clock: Callable[[], datetime],
@@ -104,7 +109,7 @@ def _finish(
         run=run,
         task=LocalTaskRef(
             task_id=task_id,
-            scenario_id=None,
+            scenario_id=scenario_id,
             split=config.task.split,
         ),
         mode=mode,
@@ -131,6 +136,7 @@ def run_episode(
     runtime: RuntimeDependencies,
     pair_id: str | None = None,
     on_step: Callable[[ModelStep | ToolStep], None] | None = None,
+    scenario_id: str | None = None,
 ) -> EpisodeResult:
     """Run one plan or execute episode and return a local ``EpisodeResult``.
 
@@ -139,7 +145,8 @@ def run_episode(
     from ``runtime.session_factory``, and always closes that session. Plan
     mode takes one model turn and never executes or evaluates. Execute mode
     enforces the configured step limit, records tool results, and evaluates
-    only after the agent stops.
+    only after the agent stops. ``scenario_id`` is stored on the local task
+    reference when the caller has one; it is not ground truth.
     """
 
     _reject(task_id, config, mode, run)
@@ -163,6 +170,7 @@ def run_episode(
                     run=run,
                     task_id=task_id,
                     config=config,
+                    scenario_id=scenario_id,
                     mode=mode,
                     started_at=started_at,
                     clock=runtime.clock,
@@ -185,6 +193,7 @@ def run_episode(
                 run=run,
                 task_id=task_id,
                 config=config,
+                scenario_id=scenario_id,
                 mode=mode,
                 started_at=started_at,
                 clock=runtime.clock,
@@ -206,6 +215,7 @@ def run_episode(
                     run=run,
                     task_id=task_id,
                     config=config,
+                    scenario_id=scenario_id,
                     mode=mode,
                     started_at=started_at,
                     clock=runtime.clock,
@@ -237,6 +247,7 @@ def run_episode(
                     run=run,
                     task_id=task_id,
                     config=config,
+                    scenario_id=scenario_id,
                     mode=mode,
                     started_at=started_at,
                     clock=runtime.clock,
@@ -256,6 +267,7 @@ def run_episode(
                     run=run,
                     task_id=task_id,
                     config=config,
+                    scenario_id=scenario_id,
                     mode=mode,
                     started_at=started_at,
                     clock=runtime.clock,
@@ -301,6 +313,7 @@ def run_episode(
                     run=run,
                     task_id=task_id,
                     config=config,
+                    scenario_id=scenario_id,
                     mode=mode,
                     started_at=started_at,
                     clock=runtime.clock,
@@ -320,3 +333,248 @@ def run_episode(
                 tool_output = result.output_text
     finally:
         session.close()
+
+
+@dataclass(frozen=True)
+class EvaluatorDifference:
+    """Candidate minus reference on AppWorld evaluator outcomes.
+
+    ``success_difference`` is the candidate success flag minus the reference
+    success flag, each as 0 or 1. ``requirement_fraction_difference`` is set
+    only when both fractions are defined. A zero requirement total leaves
+    that fraction undefined, so it is not treated as zero.
+    """
+
+    success_difference: int
+    requirement_fraction_difference: float | None
+
+
+@dataclass(frozen=True)
+class PairExecution:
+    """Local facts about one paired run that ``PairedResult`` does not store.
+
+    ``execution_order`` is the role order in which ``run_episode`` was called.
+    The seeds are the sampling seeds recorded on the episodes and the run
+    seeds of the two configurations. ``initial_state_identity`` is the shared
+    identity captured before either world was mutated.
+    """
+
+    pair_id: str
+    execution_order: tuple[str, str]
+    reference_episode_id: str
+    candidate_episode_id: str
+    reference_seed: int
+    candidate_seed: int
+    reference_run_seed: int
+    candidate_run_seed: int
+    initial_state_identity: str
+
+
+_PAIR_EXECUTIONS: dict[str, PairExecution] = {}
+_PAIR_LOCK = threading.Lock()
+
+
+def pair_execution(pair: PairedResult) -> PairExecution:
+    """Return the execution record ``run_pair`` stored for this pair."""
+
+    pair_id = pair.reference.episode.pair_id
+    if pair_id is None:
+        raise EpisodeRejected("pair execution was not recorded")
+    with _PAIR_LOCK:
+        record = _PAIR_EXECUTIONS.get(pair_id)
+    if record is None:
+        raise EpisodeRejected("pair execution was not recorded")
+    return record
+
+
+def evaluator_difference(pair: PairedResult) -> EvaluatorDifference | None:
+    """Return evaluator differences only when both outcomes exist.
+
+    A missing evaluator outcome is not a success and is not a zero. The
+    difference is ``None`` until both episodes have been evaluated.
+    """
+
+    reference = pair.reference.evaluator_outcome
+    candidate = pair.candidate.evaluator_outcome
+    if reference is None or candidate is None:
+        return None
+    fraction_difference: float | None = None
+    if (
+        reference.requirement_fraction is not None
+        and candidate.requirement_fraction is not None
+    ):
+        fraction_difference = (
+            candidate.requirement_fraction - reference.requirement_fraction
+        )
+    return EvaluatorDifference(
+        success_difference=int(candidate.success) - int(reference.success),
+        requirement_fraction_difference=fraction_difference,
+    )
+
+
+def _close_sessions(sessions: list[AppWorldSession]) -> None:
+    first_error: Exception | None = None
+    closed: list[AppWorldSession] = []
+    while sessions:
+        session = sessions.pop(0)
+        if any(session is item for item in closed):
+            continue
+        closed.append(session)
+        try:
+            session.close()
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+
+
+def _initial_state_identity(session: AppWorldSession) -> str:
+    reader = getattr(session, "initial_state_identity", None)
+    if callable(reader):
+        value = reader()
+        if not isinstance(value, str) or value == "":
+            raise EpisodeRejected("initial state identity is missing")
+        return value
+    context = session.context()
+    payload = "\n".join(
+        (context.task_id, context.instruction, context.api_documentation)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _compatible_pair(
+    reference_config: RunConfiguration,
+    candidate_config: RunConfiguration,
+    reference_run: RunIdentity,
+    candidate_run: RunIdentity,
+) -> None:
+    if reference_run.run_id == candidate_run.run_id:
+        raise EpisodeRejected("paired runs must have distinct run identities")
+    if (
+        reference_config.task.task_set_hash != candidate_config.task.task_set_hash
+        or reference_config.task.split != candidate_config.task.split
+    ):
+        raise EpisodeRejected("task sets are not compatible")
+    if (
+        reference_config.agent.sampling.seed
+        != candidate_config.agent.sampling.seed
+    ):
+        raise EpisodeRejected("pair episodes must share an execution seed")
+
+
+def _open_worlds(
+    task_id: str,
+    runtime: RuntimeDependencies,
+) -> tuple[AppWorldSession, AppWorldSession, str]:
+    first = runtime.session_factory(task_id)
+    try:
+        second = runtime.session_factory(task_id)
+    except Exception:
+        _close_sessions([first])
+        raise
+    try:
+        if first is second:
+            raise EpisodeRejected("paired worlds must be separate")
+        first_identity = _initial_state_identity(first)
+        second_identity = _initial_state_identity(second)
+        if first_identity != second_identity:
+            raise EpisodeRejected("paired worlds do not share an initial state")
+    except Exception:
+        _close_sessions([first, second])
+        raise
+    return first, second, first_identity
+
+
+def run_pair(
+    task_id: str,
+    reference_config: RunConfiguration,
+    candidate_config: RunConfiguration,
+    *,
+    reference_run: RunIdentity,
+    candidate_run: RunIdentity,
+    runtime: RuntimeDependencies,
+    mode: Literal["plan", "execute"],
+    scenario_id: str | None = None,
+) -> PairedResult:
+    """Run one reference episode and one candidate episode as a pair.
+
+    Mints one pair id and calls ``run_episode`` twice, reference first.
+    Both worlds are opened from ``task_id`` before either episode runs.
+    The session factory must return a distinct world each time; one world
+    is never passed the other's tool output. Run identities and episode
+    identities stay distinct. Task-set hash, split, and sampling seed must
+    already be compatible with ``PairedResult``.
+
+    A failed episode is kept on the pair. Missing evaluation is not rewritten
+    as success. Evaluator differences are available from
+    ``evaluator_difference`` only when both outcomes exist. Ordering, seeds,
+    and the initial-state identity are available from ``pair_execution``.
+    """
+
+    _reject(task_id, reference_config, mode, reference_run)
+    _reject(task_id, candidate_config, mode, candidate_run)
+    _compatible_pair(
+        reference_config,
+        candidate_config,
+        reference_run,
+        candidate_run,
+    )
+    pair_id = new_pair_id()
+    reference_session, candidate_session, initial_state_identity = _open_worlds(
+        task_id,
+        runtime,
+    )
+    pending = [reference_session, candidate_session]
+
+    def factory(requested: str) -> AppWorldSession:
+        if requested != task_id:
+            raise EpisodeRejected("paired episode requested a different task")
+        if not pending:
+            raise EpisodeRejected("paired world was reused")
+        return pending.pop(0)
+
+    paired_runtime = RuntimeDependencies(
+        session_factory=factory,
+        agent=runtime.agent,
+        clock=runtime.clock,
+    )
+    try:
+        reference_episode = run_episode(
+            task_id,
+            reference_config,
+            mode,
+            run=reference_run,
+            runtime=paired_runtime,
+            pair_id=pair_id,
+            scenario_id=scenario_id,
+        )
+        candidate_episode = run_episode(
+            task_id,
+            candidate_config,
+            mode,
+            run=candidate_run,
+            runtime=paired_runtime,
+            pair_id=pair_id,
+            scenario_id=scenario_id,
+        )
+    finally:
+        _close_sessions(pending)
+    pair = PairedResult(
+        reference=replace(reference_episode, role="reference"),
+        candidate=replace(candidate_episode, role="candidate"),
+    )
+    record = PairExecution(
+        pair_id=pair_id,
+        execution_order=("reference", "candidate"),
+        reference_episode_id=pair.reference.episode.episode_id,
+        candidate_episode_id=pair.candidate.episode.episode_id,
+        reference_seed=pair.reference.execution_seed,
+        candidate_seed=pair.candidate.execution_seed,
+        reference_run_seed=reference_config.run_seed,
+        candidate_run_seed=candidate_config.run_seed,
+        initial_state_identity=initial_state_identity,
+    )
+    with _PAIR_LOCK:
+        _PAIR_EXECUTIONS[pair_id] = record
+    return pair
