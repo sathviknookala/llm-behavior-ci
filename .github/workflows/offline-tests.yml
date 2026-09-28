@@ -23,4 +23,10 @@ jobs:
       - run: python -m unittest discover -s tests/unit -p "test_*.py"
       - run: python -m unittest discover -s tests/ci -p "test_*.py"
       - run: python -m unittest discover -s tests/integration -p "test_*.py"
-      - run: python scripts/run_offline_gate.py
+      - name: Bare offline gate exits 2
+        run: |
+          set +e
+          python scripts/run_offline_gate.py
+          code=$?
+          set -e
+          test "$code" -eq 2

@@ -2,10 +2,197 @@ import math
 import unittest
 from unittest.mock import patch
 
+from llm_behavior_ci.config import GateSettings, RunConfiguration
 from llm_behavior_ci.lifecycle.offline_gate import run_offline_gate
-from llm_behavior_ci.stats.bootstrap import paired_bootstrap
-from llm_behavior_ci.stats.kl import NextTokenKLError, next_token_kl
+from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.runtime.agent import AgentTurn
+from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
+from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.stats.bootstrap import clustered_paired_bootstrap, paired_bootstrap
+from llm_behavior_ci.stats.kl import NextTokenKLError, next_token_kl, truncated_next_token_kl
 from llm_behavior_ci.stats.mmd import MMDError, mmd_permutation_test
+from llm_behavior_ci.tasks.selection import (
+    TaskSet,
+    canonical_task_set_bytes,
+    task_set_hash_from_bytes,
+)
+from datetime import datetime, timedelta, timezone
+import copy
+
+_START = datetime(2026, 9, 27, 15, 0, tzinfo=timezone.utc)
+_PLAN = "1. open the calendar"
+_LOGPROBS = (
+    (
+        TokenLogprob(token_id=7, logprob=-0.2, rank=0),
+        TokenLogprob(token_id=9, logprob=-1.5, rank=1),
+    ),
+)
+
+
+def _payload() -> dict[str, object]:
+    return {
+        "model": {
+            "model": {
+                "repository": "Qwen/Qwen3-4B",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
+            },
+            "tokenizer": {
+                "repository": "Qwen/Qwen3-4B",
+                "revision": "fedcba9876543210fedcba9876543210fedcba98",
+            },
+            "quantization": {"method": "none"},
+            "vllm_version": "0.30.0",
+            "serving": {
+                "dtype": "bfloat16",
+                "max_model_len": 8192,
+                "gpu_memory_utilization": 0.9,
+                "max_num_seqs": 16,
+                "max_num_batched_tokens": 8192,
+                "kv_cache_dtype": "bfloat16",
+                "enable_prefix_caching": False,
+                "enable_chunked_prefill": False,
+                "enforce_eager": False,
+                "tensor_parallel_size": 1,
+                "max_logprobs": 20,
+                "batch_invariant": False,
+            },
+        },
+        "agent": {
+            "smolagents_version": "1.22.0",
+            "action_interface": "code",
+            "prompt": {
+                "prompt_version": "prompt-v1",
+                "plan_format_version": "plan-v1",
+                "thinking_enabled": False,
+            },
+            "step_limit": 40,
+            "sampling": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 20,
+                "min_p": 0.0,
+                "seed": 17,
+                "max_tokens": 512,
+            },
+        },
+        "task": {
+            "appworld_version": "0.1.3.post1",
+            "split": "train",
+            "selection_rule": "deterministic_sample",
+            "selection_seed": 20260926,
+            "task_count": 50,
+            "task_set_hash": "c" * 64,
+        },
+        "run_seed": 7,
+        "git_commit": "a" * 40,
+        "protocol_hash": "e" * 64,
+    }
+
+
+def _task_set() -> TaskSet:
+    tasks = (("task-a", "scenario-1"), ("task-b", None))
+    payload = canonical_task_set_bytes(
+        appworld_version="0.1.3.post1",
+        split="train",
+        selection_rule="deterministic_sample",
+        selection_seed=20260926,
+        tasks=tasks,
+    )
+    return TaskSet(
+        appworld_version="0.1.3.post1",
+        split="train",
+        selection_rule="deterministic_sample",
+        selection_seed=20260926,
+        task_count=2,
+        scenario_count=2,
+        task_ids=("task-a", "task-b"),
+        scenario_ids=("scenario-1", None),
+        task_set_hash=task_set_hash_from_bytes(payload),
+    )
+
+
+def _config(task_set: TaskSet, *, run_seed: int = 7) -> RunConfiguration:
+    payload = copy.deepcopy(_payload())
+    payload["run_seed"] = run_seed
+    payload["task"] = {
+        "appworld_version": task_set.appworld_version,
+        "split": task_set.split,
+        "selection_rule": task_set.selection_rule,
+        "selection_seed": task_set.selection_seed,
+        "task_count": task_set.task_count,
+        "task_set_hash": task_set.task_set_hash,
+    }
+    return RunConfiguration.from_dict(payload)
+
+
+def _settings() -> GateSettings:
+    return GateSettings(
+        confidence_level=0.9,
+        bootstrap_resamples=40,
+        score_margin=-0.02,
+        kl_limit_nats=0.05,
+        mmd_bandwidth=1.0,
+        mmd_permutations=19,
+        mmd_alpha=0.05,
+        plan_format_version="plan-v1",
+    )
+
+
+class FakeSession:
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+
+    def context(self) -> TaskContext:
+        return TaskContext(
+            task_id=self.task_id,
+            instruction="solve the task",
+            api_documentation="calendar docs",
+        )
+
+    def execute(self, action: str) -> ToolResult:
+        del action
+        raise AssertionError("plan mode must not execute tools")
+
+    def evaluate(self) -> EvaluationResult:
+        raise AssertionError("plan mode must not evaluate")
+
+    def close(self) -> None:
+        return None
+
+
+class PlanAgent:
+    def __init__(self, clock) -> None:
+        self._clock = clock
+        self.config = None
+
+    def begin(self, context: TaskContext, config: RunConfiguration) -> None:
+        del context
+        self.config = config
+
+    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+        del tool_output
+        return AgentTurn(
+            prompt_text="plan the next action",
+            output_text=_PLAN,
+            top_k_logprobs=_LOGPROBS,
+            latency_seconds=0.1,
+            started_at=self._clock(),
+            action=None,
+            app_name=None,
+            api_name=None,
+        )
+
+
+def _clock():
+    current = _START
+
+    def tick() -> datetime:
+        nonlocal current
+        value = current
+        current = current + timedelta(seconds=1)
+        return value
+
+    return tick
 
 
 class OfflineGateTests(unittest.TestCase):
@@ -79,38 +266,71 @@ class OfflineGateTests(unittest.TestCase):
                 seed=7,
             )
 
-    def test_orchestrator_calls_all_three_checks(self) -> None:
+    def test_orchestrator_calls_required_checks(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        clock = _clock()
+        runtime = RuntimeDependencies(
+            session_factory=lambda task_id: FakeSession(task_id),
+            agent=PlanAgent(clock),
+            clock=clock,
+        )
         with (
             patch(
-                "llm_behavior_ci.lifecycle.offline_gate.paired_bootstrap",
-                wraps=paired_bootstrap,
+                "llm_behavior_ci.lifecycle.offline_gate.clustered_paired_bootstrap",
+                wraps=clustered_paired_bootstrap,
             ) as bootstrap_call,
             patch(
-                "llm_behavior_ci.lifecycle.offline_gate.next_token_kl",
-                wraps=next_token_kl,
+                "llm_behavior_ci.lifecycle.offline_gate.truncated_next_token_kl",
+                wraps=truncated_next_token_kl,
             ) as kl_call,
             patch(
                 "llm_behavior_ci.lifecycle.offline_gate.mmd_permutation_test",
                 wraps=mmd_permutation_test,
             ) as mmd_call,
         ):
-            result = run_offline_gate()
+            decision = run_offline_gate(
+                reference,
+                candidate,
+                task_set,
+                settings=_settings(),
+                runtime=runtime,
+            )
         bootstrap_call.assert_called_once()
         kl_call.assert_called_once()
         mmd_call.assert_called_once()
-        self.assertTrue(result.bootstrap_passed)
-        self.assertTrue(result.next_token_kl_passed)
-        self.assertTrue(result.mmd_passed)
-        self.assertTrue(result.passed)
+        self.assertEqual(decision.outcome, "PASS")
+        self.assertEqual(decision.reason_codes, ())
 
-    def test_orchestrator_fails_when_a_check_rejects(self) -> None:
-        with patch(
-            "llm_behavior_ci.lifecycle.offline_gate.DEMO_MINIMUM_SCORE_DELTA",
-            0.01,
-        ):
-            result = run_offline_gate()
-        self.assertFalse(result.bootstrap_passed)
-        self.assertFalse(result.passed)
+    def test_orchestrator_blocks_when_score_margin_rejects(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        clock = _clock()
+        runtime = RuntimeDependencies(
+            session_factory=lambda task_id: FakeSession(task_id),
+            agent=PlanAgent(clock),
+            clock=clock,
+        )
+        decision = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=GateSettings(
+                confidence_level=0.9,
+                bootstrap_resamples=40,
+                score_margin=0.01,
+                kl_limit_nats=0.05,
+                mmd_bandwidth=1.0,
+                mmd_permutations=19,
+                mmd_alpha=0.05,
+                plan_format_version="plan-v1",
+            ),
+            runtime=runtime,
+        )
+        self.assertEqual(decision.outcome, "BLOCK")
+        self.assertIn("plan_quality_margin", decision.reason_codes)
 
 
 if __name__ == "__main__":
