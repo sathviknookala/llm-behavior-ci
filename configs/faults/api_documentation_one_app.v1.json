@@ -1,0 +1,7 @@
+{
+  "fault_id": "api_documentation_one_app",
+  "version": "1",
+  "kind": "api_documentation",
+  "patches": [],
+  "schema_request": "optional hashed leaves agent.api_docs_version and agent.api_docs_app, omitted from canonical JSON when unset"
+}

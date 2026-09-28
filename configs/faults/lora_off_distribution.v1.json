@@ -1,0 +1,7 @@
+{
+  "fault_id": "lora_off_distribution",
+  "version": "1",
+  "kind": "lora",
+  "patches": [],
+  "schema_request": "optional hashed leaves model.lora.repository and model.lora.revision, omitted from canonical JSON when unset"
+}

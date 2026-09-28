@@ -5,6 +5,17 @@ methods that have passed their required checks. A missing local runtime
 or GPU reading stays missing.
 """
 
+from llm_behavior_ci.experiments.faults import (
+    FaultError,
+    FaultPatch,
+    FaultSpec,
+    HarmLabel,
+    apply_fault,
+    freeze_harm_label,
+    load_fault,
+    load_fault_catalog,
+    measure_harm,
+)
 from llm_behavior_ci.experiments.validation import (
     AAContext,
     AADependenceReport,
@@ -39,6 +50,10 @@ __all__ = [
     "AAStudyRow",
     "BaselineOutcome",
     "CheckResult",
+    "FaultError",
+    "FaultPatch",
+    "FaultSpec",
+    "HarmLabel",
     "HarmStudyReport",
     "KLApproximationReport",
     "KLPositionSample",
@@ -50,11 +65,16 @@ __all__ = [
     "ValidationError",
     "ValidationReport",
     "aa_study_rows",
+    "apply_fault",
     "apply_validation_reports",
     "assess_harm_study",
     "compare_plan_kl",
+    "freeze_harm_label",
     "harm_detection_power",
     "implemented_methods",
+    "load_fault",
+    "load_fault_catalog",
+    "measure_harm",
     "method_spec",
     "minimum_checks",
     "reference_library_status",

@@ -1,0 +1,11 @@
+{
+  "fault_id": "fp8_weights",
+  "version": "1",
+  "kind": "quantization",
+  "patches": [
+    {
+      "path": "model.quantization.method",
+      "value": "fp8"
+    }
+  ]
+}

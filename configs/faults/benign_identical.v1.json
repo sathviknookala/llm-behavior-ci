@@ -1,0 +1,7 @@
+{
+  "fault_id": "benign_identical",
+  "version": "1",
+  "kind": "benign_control",
+  "control": "identical",
+  "patches": []
+}

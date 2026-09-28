@@ -1,0 +1,12 @@
+{
+  "fault_id": "benign_batch_invariant",
+  "version": "1",
+  "kind": "benign_control",
+  "control": "batch_invariant",
+  "patches": [
+    {
+      "path": "model.serving.batch_invariant",
+      "value": true
+    }
+  ]
+}

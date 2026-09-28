@@ -1,0 +1,11 @@
+{
+  "fault_id": "sampling_temperature_one",
+  "version": "1",
+  "kind": "sampling",
+  "patches": [
+    {
+      "path": "agent.sampling.temperature",
+      "value": 1.0
+    }
+  ]
+}

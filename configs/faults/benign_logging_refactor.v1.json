@@ -1,0 +1,12 @@
+{
+  "fault_id": "benign_logging_refactor",
+  "version": "1",
+  "kind": "benign_control",
+  "control": "logging_refactor",
+  "patches": [
+    {
+      "path": "git_commit",
+      "value": "cccccccccccccccccccccccccccccccccccccccc"
+    }
+  ]
+}

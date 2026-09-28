@@ -1,0 +1,11 @@
+{
+  "fault_id": "token_limit_truncation",
+  "version": "1",
+  "kind": "token_limit",
+  "patches": [
+    {
+      "path": "agent.sampling.max_tokens",
+      "value": 16
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "fault_id": "model_downgrade_qwen3_1_7b",
+  "version": "1",
+  "kind": "model",
+  "patches": [
+    {
+      "path": "model.model.repository",
+      "value": "Qwen/Qwen3-1.7B"
+    },
+    {
+      "path": "model.tokenizer.repository",
+      "value": "Qwen/Qwen3-1.7B"
+    }
+  ]
+}

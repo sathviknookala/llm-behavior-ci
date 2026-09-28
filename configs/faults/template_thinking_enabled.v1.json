@@ -1,0 +1,11 @@
+{
+  "fault_id": "template_thinking_enabled",
+  "version": "1",
+  "kind": "template",
+  "patches": [
+    {
+      "path": "agent.prompt.thinking_enabled",
+      "value": true
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "fault_id": "nvfp4_weights",
+  "version": "1",
+  "kind": "quantization",
+  "patches": [
+    {
+      "path": "model.quantization.method",
+      "value": "nvfp4"
+    }
+  ]
+}

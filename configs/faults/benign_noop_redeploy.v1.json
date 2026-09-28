@@ -1,0 +1,12 @@
+{
+  "fault_id": "benign_noop_redeploy",
+  "version": "1",
+  "kind": "benign_control",
+  "control": "noop_redeploy",
+  "patches": [
+    {
+      "path": "git_commit",
+      "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ]
+}
