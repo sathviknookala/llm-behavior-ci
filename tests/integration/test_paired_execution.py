@@ -15,6 +15,15 @@ from pathlib import Path
 from llm_behavior_ci.config import RunConfiguration, StreamSettings, new_run_identity
 from llm_behavior_ci.records import RecordError, assert_public_payload
 from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.runtime.aa_capture import (
+    GpuSnapshot,
+    capture_aa,
+    format_summary,
+    main,
+    parse_gpu_snapshot,
+    repeated_schedule,
+    write_local_capture,
+)
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
 from llm_behavior_ci.runtime.episode import (
@@ -667,3 +676,395 @@ class PairedExecutionTests(unittest.TestCase):
         self.assertEqual(pair_execution(pair).initial_state_identity, expected)
         self.assertEqual(len(worlds), 2)
         self.assertEqual([world.close_count for world in worlds], [1, 1])
+
+
+class AACaptureTests(unittest.TestCase):
+    def _factory(
+        self,
+        *,
+        diverge: bool,
+        fail_second: bool = False,
+        slow_task: str | None = None,
+    ):
+        lock = threading.Lock()
+        calls = {"n": 0}
+
+        def factory(mode: str) -> RuntimeDependencies:
+            clock = Clock()
+            agent = PairAgent(clock, mode=mode, diverge=diverge)
+
+            def session_factory(task_id: str) -> World:
+                if slow_task is not None and task_id == slow_task:
+                    time.sleep(0.05)
+                with lock:
+                    calls["n"] += 1
+                    fail = fail_second and calls["n"] % 2 == 0
+                return World(task_id, f"state:{task_id}", fail=fail)
+
+            return RuntimeDependencies(
+                session_factory=session_factory,
+                agent=agent,
+                clock=clock,
+            )
+
+        return factory
+
+    def test_reproducible_input_schedules(self) -> None:
+        task_set = _task_set()
+        settings = _stream_settings(task_set)
+        arrivals = tuple(generate_stream(task_set, settings))
+        self.assertEqual(
+            repeated_schedule(arrivals, repetitions=2),
+            repeated_schedule(arrivals, repetitions=2),
+        )
+        self.assertEqual(
+            arrivals,
+            tuple(generate_stream(task_set, replace(settings, concurrency=1))),
+        )
+        replay = tuple(generate_stream(task_set, settings))
+        self.assertEqual(arrivals, replay)
+        config = _stream_config(task_set)
+        slow = arrivals[0].task_id
+        first = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=2,
+            concurrency=1,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False, slow_task=slow),
+            observe_hardware=False,
+        )
+        second = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=2,
+            concurrency=2,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False, slow_task=slow),
+            observe_hardware=False,
+        )
+        self.assertEqual(first.schedule, second.schedule)
+        self.assertEqual(
+            [item.task_id for item in first.schedule],
+            [arrival.task_id for arrival in arrivals] * 2,
+        )
+        self.assertEqual(
+            [record.schedule.task_id for record in second.records],
+            [item.task_id for item in second.schedule],
+        )
+        self.assertEqual(first.concurrency, 1)
+        self.assertEqual(second.concurrency, 2)
+        self.assertTrue(
+            all(item.stream_seed == settings.stream_seed for item in first.schedule)
+        )
+        self.assertEqual(first.disagreement_count, 0)
+        self.assertEqual(first.missing_outcome_count, 0)
+        self.assertEqual(first.evaluated_pairs, len(first.records))
+        self.assertFalse(first.cost.hardware_observed)
+        self.assertIsNone(first.cost.memory_used_mib)
+        self.assertIsNone(first.cost.wall_seconds)
+        summary = format_summary(first)
+        for task_id in task_set.task_ids:
+            self.assertNotIn(task_id, summary)
+
+    def test_capture_records_outcomes_divergence_and_plan_inputs(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+        result = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("plan", "execute"),
+            runtime_factory=self._factory(diverge=True),
+            observe_hardware=False,
+        )
+        self.assertEqual(len(result.records), 2)
+        plan, execute = result.records
+        self.assertEqual(plan.mode, "plan")
+        self.assertEqual(execute.mode, "execute")
+        self.assertIsNone(plan.evaluator_disagreement)
+        self.assertIsNotNone(plan.plan_scoring_inputs)
+        assert plan.plan_scoring_inputs is not None
+        self.assertEqual(plan.plan_scoring_inputs.reference_plan_text, "1. reference step")
+        self.assertEqual(plan.plan_scoring_inputs.candidate_plan_text, "1. candidate step")
+        self.assertEqual(
+            plan.plan_scoring_inputs.reference_steps[0][0][0],
+            (7, -0.2),
+        )
+        self.assertIsNone(execute.plan_scoring_inputs)
+        self.assertTrue(execute.evaluator_disagreement)
+        self.assertEqual(execute.reference_requirement_fraction, 1.0)
+        self.assertEqual(execute.candidate_requirement_fraction, 0.0)
+        self.assertEqual(execute.trajectory.first_divergent_step, 0)
+        self.assertEqual(execute.trajectory.length_difference, 0)
+        self.assertEqual(
+            execute.trajectory.reference_tool_counts,
+            (("reference_lookup", 1),),
+        )
+        self.assertEqual(
+            execute.trajectory.candidate_tool_counts,
+            (("candidate_lookup", 1),),
+        )
+        self.assertEqual(plan.trajectory.first_divergent_step, 0)
+        self.assertIsNotNone(result.tool_selection)
+        assert result.tool_selection is not None
+        self.assertGreater(result.tool_selection.statistic, 0.0)
+        self.assertEqual(result.evaluated_pairs, 1)
+        self.assertEqual(result.disagreement_count, 1)
+        self.assertEqual(result.missing_outcome_count, 0)
+        self.assertEqual(
+            result.records[0].pair.reference.run.configuration_hash,
+            result.records[0].pair.candidate.run.configuration_hash,
+        )
+        self.assertNotEqual(
+            result.records[0].pair.reference.run.run_id,
+            result.records[0].pair.candidate.run.run_id,
+        )
+        failed = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False, fail_second=True),
+            observe_hardware=False,
+        )
+        self.assertEqual(len(failed.records), 1)
+        self.assertEqual(failed.records[0].pair.candidate.status, "failed")
+        self.assertIsNone(failed.records[0].evaluator_disagreement)
+        self.assertIsNone(failed.records[0].candidate_requirement_fraction)
+        self.assertEqual(failed.records[0].reference_requirement_fraction, 1.0)
+        self.assertEqual(failed.disagreement_count, 0)
+        self.assertEqual(failed.missing_outcome_count, 1)
+        self.assertEqual(failed.evaluated_pairs, 0)
+
+    def test_synthetic_capture_is_not_hardware_evidence(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+
+        def probe() -> GpuSnapshot:
+            raise AssertionError("synthetic capture must not probe the GPU")
+
+        result = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False),
+            observe_hardware=False,
+            gpu_probe=probe,
+        )
+        self.assertFalse(result.cost.hardware_observed)
+        self.assertIsNone(result.cost.memory_used_mib)
+        self.assertIsNone(result.cost.memory_total_mib)
+        self.assertIsNone(result.cost.wall_seconds)
+        self.assertEqual(result.cost.source, "not_observed")
+        calls = {"n": 0}
+
+        def counting_probe() -> GpuSnapshot:
+            calls["n"] += 1
+            return GpuSnapshot(
+                memory_used_mib=1000 + calls["n"],
+                memory_total_mib=24576,
+                process_count=0,
+            )
+
+        probed = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False),
+            observe_hardware=True,
+            gpu_probe=counting_probe,
+        )
+        self.assertFalse(probed.cost.hardware_observed)
+        self.assertEqual(probed.cost.source, "probe")
+        self.assertEqual(probed.cost.memory_used_mib, 1002)
+        self.assertEqual(probed.cost.memory_total_mib, 24576)
+        self.assertIsNotNone(probed.cost.wall_seconds)
+        self.assertNotIn("memory_used_mib", format_summary(probed))
+
+    def test_gpu_snapshot_text_is_not_a_zero_default(self) -> None:
+        idle = parse_gpu_snapshot("100, 24576\n", "\n")
+        self.assertEqual(idle.memory_used_mib, 100)
+        self.assertEqual(idle.memory_total_mib, 24576)
+        self.assertEqual(idle.process_count, 0)
+        busy = parse_gpu_snapshot("100, 24576\n200, 24576\n", "42\n99\n")
+        self.assertEqual(busy.memory_used_mib, 100)
+        self.assertEqual(busy.process_count, 2)
+        with self.assertRaises(RuntimeUnavailable):
+            parse_gpu_snapshot("", "")
+        with self.assertRaises(RuntimeUnavailable):
+            parse_gpu_snapshot("N/A, 24576\n", "")
+
+    def test_busy_gpu_does_not_start(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+        started = {"n": 0}
+
+        def factory(mode: str) -> RuntimeDependencies:
+            started["n"] += 1
+            return self._factory(diverge=False)(mode)
+
+        def probe() -> GpuSnapshot:
+            return GpuSnapshot(
+                memory_used_mib=20000,
+                memory_total_mib=24576,
+                process_count=1,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "compute processes"):
+            capture_aa(
+                config,
+                arrivals,
+                task_set_hash=task_set.task_set_hash,
+                repetitions=1,
+                concurrency=1,
+                modes=("execute",),
+                runtime_factory=factory,
+                observe_hardware=True,
+                gpu_probe=probe,
+            )
+        self.assertEqual(started["n"], 0)
+        with self.assertRaisesRegex(EpisodeRejected, "test_normal"):
+            capture_aa(
+                replace(config, task=replace(config.task, split="test_normal")),
+                arrivals,
+                task_set_hash=config.task.task_set_hash,
+                repetitions=1,
+                concurrency=1,
+                modes=("execute",),
+                runtime_factory=factory,
+                observe_hardware=False,
+            )
+        self.assertEqual(started["n"], 0)
+
+    def test_local_capture_is_not_a_public_result(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+        result = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False),
+            observe_hardware=False,
+        )
+        with self.subTest("writer"):
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "results"
+                output = root / "aa-capture.json"
+                with self.assertRaisesRegex(EpisodeRejected, "public result"):
+                    write_local_capture(result, output, results_root=root)
+                self.assertFalse(output.exists())
+        with self.subTest("payload"):
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "capture.json"
+                write_local_capture(
+                    result,
+                    output,
+                    results_root=Path(temporary) / "results",
+                )
+                payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["visibility"], "local")
+            with self.assertRaises(RecordError):
+                assert_public_payload(payload)
+
+    def test_command_requires_arguments_and_refuses_results(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "scripts/evaluation/capture_aa.py"],
+            cwd=_ROOT,
+            env={**os.environ, "PYTHONPATH": "src"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 2)
+        task_set = _task_set()
+        config = _stream_config(task_set)
+        settings = _stream_settings(task_set)
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "configuration.json"
+            task_path = root / "task-set.json"
+            stream_path = root / "stream.json"
+            results_root = root / "results"
+            output = results_root / "capture.json"
+            config_path.write_text(
+                json.dumps(config.to_dict()),
+                encoding="utf-8",
+            )
+            task_path.write_text(
+                json.dumps(
+                    {
+                        "appworld_version": task_set.appworld_version,
+                        "split": task_set.split,
+                        "selection_rule": task_set.selection_rule,
+                        "selection_seed": task_set.selection_seed,
+                        "task_count": task_set.task_count,
+                        "scenario_count": task_set.scenario_count,
+                        "task_ids": list(task_set.task_ids),
+                        "scenario_ids": list(task_set.scenario_ids),
+                        "task_set_hash": task_set.task_set_hash,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stream_path.write_text(
+                json.dumps(settings.to_dict()),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = main(
+                    [
+                        "--configuration",
+                        str(config_path),
+                        "--task-set",
+                        str(task_path),
+                        "--stream-settings",
+                        str(stream_path),
+                        "--repetitions",
+                        "1",
+                        "--concurrency",
+                        "1",
+                        "--modes",
+                        "execute",
+                        "--output",
+                        str(output),
+                        "--vllm-base-url",
+                        "http://127.0.0.1:9",
+                        "--results-root",
+                        str(results_root),
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("public result", stderr.getvalue())
+            self.assertFalse(output.exists())
+            rendered = stdout.getvalue()
+            for task_id in task_set.task_ids:
+                self.assertNotIn(task_id, rendered)
+                self.assertNotIn(task_id, stderr.getvalue())
