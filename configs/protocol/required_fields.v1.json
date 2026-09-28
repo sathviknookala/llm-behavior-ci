@@ -1,0 +1,12 @@
+[
+  "configurations",
+  "task_selections",
+  "harm_labels",
+  "validation_reports",
+  "gate",
+  "canary",
+  "monitor",
+  "stream",
+  "analysis_version",
+  "seeds"
+]

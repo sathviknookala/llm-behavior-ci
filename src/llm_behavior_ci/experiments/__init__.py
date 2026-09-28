@@ -5,6 +5,15 @@ methods that have passed their required checks. A missing local runtime
 or GPU reading stays missing.
 """
 
+from llm_behavior_ci.experiments.protocol import (
+    ProtocolError,
+    ProtocolLock,
+    ProtocolSettings,
+    admit_test_normal,
+    bind_protocol,
+    lock_protocol,
+    require_protocol_lock,
+)
 from llm_behavior_ci.experiments.faults import (
     FaultError,
     FaultPatch,
@@ -60,23 +69,30 @@ __all__ = [
     "ImplementedMethod",
     "MethodSpec",
     "MethodValidationStatus",
+    "ProtocolError",
+    "ProtocolLock",
+    "ProtocolSettings",
     "ReferenceCase",
     "StudyBudget",
     "ValidationError",
     "ValidationReport",
     "aa_study_rows",
+    "admit_test_normal",
     "apply_fault",
     "apply_validation_reports",
     "assess_harm_study",
+    "bind_protocol",
     "compare_plan_kl",
     "freeze_harm_label",
     "harm_detection_power",
     "implemented_methods",
     "load_fault",
     "load_fault_catalog",
+    "lock_protocol",
     "measure_harm",
     "method_spec",
     "minimum_checks",
     "reference_library_status",
+    "require_protocol_lock",
     "validate_method",
 ]
