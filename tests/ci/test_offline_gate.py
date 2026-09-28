@@ -2,10 +2,10 @@ import math
 import unittest
 from unittest.mock import patch
 
-from offline_gate.mmd import MMDError, mmd_permutation_test
-from offline_gate.next_token_kl import NextTokenKLError, next_token_kl
-from offline_gate.offline import run_offline_gate
-from offline_gate.paired_bootstrap import paired_bootstrap
+from llm_behavior_ci.lifecycle.offline_gate import run_offline_gate
+from llm_behavior_ci.stats.bootstrap import paired_bootstrap
+from llm_behavior_ci.stats.kl import NextTokenKLError, next_token_kl
+from llm_behavior_ci.stats.mmd import MMDError, mmd_permutation_test
 
 
 class OfflineGateTests(unittest.TestCase):
@@ -82,15 +82,15 @@ class OfflineGateTests(unittest.TestCase):
     def test_orchestrator_calls_all_three_checks(self) -> None:
         with (
             patch(
-                "offline_gate.offline.paired_bootstrap",
+                "llm_behavior_ci.lifecycle.offline_gate.paired_bootstrap",
                 wraps=paired_bootstrap,
             ) as bootstrap_call,
             patch(
-                "offline_gate.offline.next_token_kl",
+                "llm_behavior_ci.lifecycle.offline_gate.next_token_kl",
                 wraps=next_token_kl,
             ) as kl_call,
             patch(
-                "offline_gate.offline.mmd_permutation_test",
+                "llm_behavior_ci.lifecycle.offline_gate.mmd_permutation_test",
                 wraps=mmd_permutation_test,
             ) as mmd_call,
         ):
@@ -105,7 +105,8 @@ class OfflineGateTests(unittest.TestCase):
 
     def test_orchestrator_fails_when_a_check_rejects(self) -> None:
         with patch(
-            "offline_gate.offline.DEMO_MINIMUM_SCORE_DELTA", 0.01
+            "llm_behavior_ci.lifecycle.offline_gate.DEMO_MINIMUM_SCORE_DELTA",
+            0.01,
         ):
             result = run_offline_gate()
         self.assertFalse(result.bootstrap_passed)

@@ -1,5 +1,4 @@
 appworld==0.1.3.post1
-smolagents[openai]==1.26.0
 fastapi==0.110.3
 uvicorn==0.27.1
 prometheus-client==0.26.0

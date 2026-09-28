@@ -12,9 +12,35 @@ License and facts were read from the repository README, `LICENSE`, and `pyprojec
 
 ### Rules that follow from AppWorld's terms
 
-- The authors ask that no code or data extracted or derived from the `.bundle` files be posted online in plain text or images. Task instructions, API documentation, plan traces, trajectories, and evaluator reports are treated as derived content: they stay in local logs under `data/` or the log store, never in git or any public artifact.
-- Committed artifacts under `results/` carry task IDs, outcomes, counts, and statistics.
+- The authors ask that no code or data extracted or derived from the `.bundle` files be posted online in plain text or images. This repo goes further and keeps everything episode-level local, under the artifact policy below.
 - AppWorld's canary string stays in any local file that carries its content.
+
+### Public and local artifacts
+
+This is the single artifact policy; `EVAL_PROTOCOL.md`, `CONSTRAINTS.md`, and the `results/`, `configs/`, and `data/` READMEs point here. It applies to git, CI logs, and any publication.
+
+The public repo may contain only:
+
+- AppWorld, package, model, and configuration versions and hashes;
+- split names;
+- deterministic selection rules and seeds;
+- scenario, task, and episode counts;
+- cryptographic hashes of the resolved local task sets;
+- aggregate statistics, confidence intervals, detector outputs, cost and latency summaries, and figures built from them.
+
+Local only, never committed or published:
+
+- resolved task IDs;
+- task instructions and any task content;
+- API documentation derived from protected content;
+- plans and plan traces;
+- trajectories and tool outputs;
+- evaluator reports;
+- per-task outcomes;
+- database state;
+- raw episode logs.
+
+Local artifacts live under `data/raw/` and `data/processed/`, which a local Git exclude file keeps out of git, or in the log store (`DECISIONS.md` D10). `data/manifests/` is tracked and holds only public items. The exclude file is not cloned, so recreate it on every clone and check `git status` before every commit.
 
 ### Split restrictions
 
@@ -26,7 +52,18 @@ AppWorld has four splits: `train`, `dev`, `test_normal`, `test_challenge`. As re
 - Hardcoding API calls into the agent's logic is not allowed; generic prompt hints drawn from `train` or `dev` failures are.
 - State checkpointing inside an episode gives an unrealistic advantage and is not used by the agent.
 
-For this repo: thresholds and prompts are tuned only on `train` and `dev`. Automated per-episode consumption of `test_*` outcomes by a gate, canary, or monitor is not manual inspection, but no one reads `test_*` task content or task-wise reports, and no choice is revised after seeing them. The split roles are pre-registered in `EVAL_PROTOCOL.md`.
+### Split roles in this repo
+
+Canonical in `PROJECT_SPEC.md`; `DECISIONS.md` D8 locks it.
+
+| Split | Role here | Ground truth released | Human inspection |
+|---|---|---|---|
+| `train` | Development-visible tasks; the permanent fixed task set of the Tier 1 CI gate | Full | Allowed |
+| `dev` | Calibration, execution-based harm labels, power analysis, canary and monitor development, threshold tuning | Full | Allowed |
+| `test_normal` | The frozen held-out final benchmark for the Tier 2 canary and Tier 3 monitoring | Evaluation programs and difficulty indicators only | Not allowed |
+| `test_challenge` | Unused unless separately pre-registered later | Evaluation programs and difficulty indicators only | Not allowed |
+
+Prompts, thresholds, and every other methodology choice are tuned only on `train` and `dev`. During the frozen `test_normal` benchmark, evaluator outcomes may be consumed programmatically by the pre-registered canary and monitor logic. No human inspects an individual `test_normal` task or its task-wise report, and no design choice changes afterward. Slices of `test_normal` results use only metadata AppWorld releases for that split: the difficulty indicators, plus the agent's own observed behavior.
 
 ## Dropped with the classification tasks
 
@@ -43,4 +80,4 @@ The arXiv metadata, HuffPost News Category, Wild-Time, CivilComments, and WildCh
 
 1. Ask Sathvik to accept the terms.
 2. Confirm the license line in this file against the source, and correct it if needed.
-3. Record the install date, the exact package and data version, and where `APPWORLD_ROOT` lives on disk. Environment bytes and logs do not belong in git.
+3. Record the install date, the exact package and data version, and where `APPWORLD_ROOT` lives on disk. Environment bytes, resolved task sets, and logs do not belong in git.

@@ -33,7 +33,7 @@ confseq is not in `requirements.txt`. Version 0.0.11 ships only as source and ne
 
 The agent's actions are model-generated code or API calls. They execute only through AppWorld (`DECISIONS.md` D18). smolagents documents its `LocalPythonExecutor` as not a security boundary; it never runs an action here. Where AppWorld executes, in process or in Docker via `appworld serve`, is `DECISIONS.md` D20 and is settled before the first episode.
 
-No CI job, hosted or self-hosted, prints AppWorld content, because job logs are public on a public repo (`DATA.md`). The gate reports task IDs and statistics only.
+No CI job, hosted or self-hosted, prints anything on the local-only list in `DATA.md`, because job logs are public on a public repo. The Tier 1 gate resolves its fixed `train` task set locally, checks it against the committed hash, and reports only the split name, task-set hash, counts, configuration hashes, and aggregate statistics.
 
 No build command exists. The standard-library offline-gate test command is recorded in `AGENTS.md`; no GPU or full-suite command exists.
 

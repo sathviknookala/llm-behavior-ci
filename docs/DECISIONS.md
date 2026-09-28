@@ -24,7 +24,7 @@ The five kinds in `PROJECT_SPEC.md`: the gateway service over smolagents, vLLM, 
 
 **Status:** LOCKED (Sathvik 2026-09-27; replaces dataset labels)
 
-Task outcomes come from AppWorld's evaluator: database-state unit tests that give per-task success and per-requirement passes and fails. Harm is a drop in evaluator task success against the margin in `EVAL_PROTOCOL.md`, measured by execution before any gate or monitor sees the fault. An LLM judge is not ground truth, and neither is the agent's own completion claim. Plan-quality metrics are gate signals, not ground truth.
+Task outcomes come from AppWorld's evaluator: database-state unit tests that give per-task success and per-requirement passes and fails. Harm is a drop in evaluator task success against the margin in `EVAL_PROTOCOL.md`. Each fault's harmful or benign label is measured by execution on `dev` before any gate or monitor sees the fault, and frozen before `test_normal` is run; `test_normal` effect sizes are reported and never relabel a fault. An LLM judge is not ground truth, and neither is the agent's own completion claim. Plan-quality metrics are gate signals, not ground truth.
 
 The margin itself is OPEN. See `EVAL_PROTOCOL.md`.
 
@@ -58,9 +58,13 @@ Qwen3-4B chat, Apache 2.0, thinking mode off, served by vLLM. Plan traces are em
 
 ## D8 — Task environment
 
-**Status:** LOCKED as AppWorld (Sathvik 2026-09-27; replaces the arXiv and HuffPost classification tasks). Version and split roles OPEN.
+**Status:** LOCKED as AppWorld, with split roles (Sathvik 2026-09-27; replaces the arXiv and HuffPost classification tasks). Version OPEN.
 
-AppWorld owns the tasks, per-task simulated database state, APIs, state mutations, and the evaluator. The repo owns the lifecycle around it. The proposed split roles are in `EVAL_PROTOCOL.md`; they must respect AppWorld's development restrictions (`DATA.md`). The former T1 and T2 tasks and their datasets are dropped, not deferred.
+AppWorld owns the tasks, per-task simulated database state, APIs, state mutations, and the evaluator. The repo owns the lifecycle around it. The former T1 and T2 tasks and their datasets are dropped, not deferred.
+
+Split roles, canonical in `PROJECT_SPEC.md`: `train` holds development-visible tasks and the permanent fixed task set of the Tier 1 CI gate; `dev` is for calibration, execution-based harm labels, power analysis, canary and monitor development, and threshold tuning; `test_normal` is the frozen held-out final benchmark for the Tier 2 canary and Tier 3 monitoring, after which no methodology choice changes; `test_challenge` is unused unless separately pre-registered later.
+
+**Why:** Only `train` and `dev` release the metadata a plan-quality metric needs and allow tuning under AppWorld's restrictions (`DATA.md`). Holding `test_normal` back keeps the headline an out-of-sample measurement.
 
 ## D9 — Headline
 
@@ -128,10 +132,18 @@ smolagents runs the agent loop against the configuration's vLLM server. Two inte
 
 **Status:** LOCKED (Sathvik 2026-09-27)
 
-Three phases, in order: the offline CI regression gate on plan traces without tool execution; canary evaluation with paired execution in isolated AppWorld worlds and sequential rollback; continuous production monitoring against the previous known-good configuration. Details in `PROJECT_SPEC.md` and `STAGES.md` stages 3–5.
+Three tiers, in order: Tier 1, the offline CI regression gate on plan traces over the fixed `train` tasks, without tool execution; Tier 2, canary evaluation with paired execution in isolated AppWorld worlds and sequential rollback; Tier 3, continuous production monitoring against the previous known-good configuration. In the final benchmark a candidate that escapes the gate enters the canary on `test_normal`, and a promoted candidate enters monitoring on `test_normal`. Details in `PROJECT_SPEC.md` and `STAGES.md` stages 3–6.
 
 ## D20 — Code-execution boundary
 
 **Status:** OPEN — Sathvik
 
 Model-generated actions run on his machine. AppWorld's in-process shell restricts destructive modules by default; `appworld serve` can also run the environment in Docker. Choose before the first agent episode runs, and record which.
+
+## D21 — Canary served-result rule
+
+**Status:** LOCKED (Sathvik 2026-09-27)
+
+In each Tier 2 canary pair, the candidate's episode is the served result and production's episode is the shadow reference. Episodes served before rollback, and failures among them, are counted from the candidate side.
+
+**Why:** A canary's cost is what a bad candidate served. If production's episode were served, that cost would always be zero.

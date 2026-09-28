@@ -2,12 +2,12 @@ from dataclasses import asdict, dataclass
 import json
 import math
 
-from offline_gate.mmd import MMDResult, mmd_permutation_test
-from offline_gate.next_token_kl import NextTokenKLResult, next_token_kl
-from offline_gate.paired_bootstrap import (
+from llm_behavior_ci.stats.bootstrap import (
     PairedBootstrapResult,
     paired_bootstrap,
 )
+from llm_behavior_ci.stats.kl import NextTokenKLResult, next_token_kl
+from llm_behavior_ci.stats.mmd import MMDResult, mmd_permutation_test
 
 
 DEMO_PRODUCTION_SCORES = (1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0)

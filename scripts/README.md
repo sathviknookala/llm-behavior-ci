@@ -1,6 +1,6 @@
 # Scripts
 
-- `data/`: AppWorld install checks and task-ID manifest entry points.
+- `data/`: AppWorld install checks, deterministic task-set selection, and manifest entry points.
 - `service/`: gateway, vLLM, and configuration lifecycle entry points.
 - `replay/`: task-stream launchers.
 - `evaluation/`: AppWorld evaluator runs, baselines, harm measurement, and validity checks.

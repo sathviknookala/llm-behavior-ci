@@ -69,6 +69,13 @@ run or episode is opened, they are not configuration fields, and they
 do not enter the hash. task_set_hash, protocol_hash, and git_commit are
 copied from the supplied configuration onto a run identity.
 
+StreamSettings, GateSettings, CanarySettings, and MonitorSettings are
+the shared inputs for the task stream, the offline gate, the canary,
+and production monitors. Lifecycle code imports them from this module.
+Every rate, delay, horizon, fraction, margin, level, and stopping rule
+is a constructor argument. These types contain no protocol values, and
+none of their fields enter the run-configuration hash.
+
 Closed tokens: splits are train, dev, test_normal, and test_challenge;
 action interfaces are code and tool_calling; quantization methods are
 none, fp8, and nvfp4; model dtypes are bfloat16, float16, and float32;
@@ -87,7 +94,7 @@ import math
 import re
 import uuid
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Callable, Mapping, TypeVar, get_type_hints
+from typing import Any, Callable, Mapping, TypeVar, get_type_hints
 
 _T = TypeVar("_T")
 
@@ -146,6 +153,16 @@ _GIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUNTIME_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{64}\.[0-9a-f]{32}$")
+_RULE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+MONITOR_SIGNALS = frozenset(
+    {
+        "task_success",
+        "requirement_fraction",
+        "tool_error_count",
+        "invalid_tool_call_count",
+        "trajectory_length",
+    }
+)
 
 
 class ConfigError(ValueError):
@@ -227,6 +244,35 @@ def _closed_unit(value: object, name: str) -> float:
     return number
 
 
+def _open_probability(value: object, name: str) -> float:
+    number = _finite_float(value, name)
+    if not 0.0 < number < 1.0:
+        raise ConfigError(
+            f"{name} must be greater than zero and less than one"
+        )
+    return number
+
+
+def _positive_float(value: object, name: str) -> float:
+    number = _finite_float(value, name)
+    if number <= 0.0:
+        raise ConfigError(f"{name} must be greater than zero")
+    return number
+
+
+def _nonnegative_float(value: object, name: str) -> float:
+    number = _finite_float(value, name)
+    if number < 0.0:
+        raise ConfigError(f"{name} must be zero or greater")
+    return number
+
+
+def _rule_name(value: object, name: str) -> str:
+    if not isinstance(value, str) or _RULE_NAME.fullmatch(value) is None:
+        raise ConfigError(f"{name} must be a lowercase identifier")
+    return value
+
+
 def _temperature(value: object) -> float:
     number = _finite_float(value, "temperature")
     if number < 0.0:
@@ -288,6 +334,18 @@ def _construct(name: str, factory: Callable[[], _T]) -> _T:
         raise ConfigError(f"{name}: {message}") from error
 
 
+def _load(
+    cls: type[_T],
+    mapping: Mapping[str, object],
+    **overrides: object,
+) -> _T:
+    arguments: dict[str, Any] = {}
+    for key, value in mapping.items():
+        arguments[key] = value
+    arguments.update(overrides)
+    return cls(**arguments)
+
+
 def _plain_dict(value: object, cls: type) -> dict[str, object]:
     hints = get_type_hints(cls)
     payload: dict[str, object] = {}
@@ -326,13 +384,7 @@ class ModelRevision:
     ) -> ModelRevision:
         mapping = _object(payload, name)
         _require_fields(mapping, cls, name)
-        return _construct(
-            name,
-            lambda: cls(
-                repository=mapping["repository"],
-                revision=mapping["revision"],
-            ),
-        )
+        return _construct(name, lambda: _load(cls, mapping))
 
 
 @dataclass(frozen=True)
@@ -353,7 +405,7 @@ class QuantizationSettings:
     ) -> QuantizationSettings:
         mapping = _object(payload, name)
         _require_fields(mapping, cls, name)
-        return _construct(name, lambda: cls(method=mapping["method"]))
+        return _construct(name, lambda: _load(cls, mapping))
 
 
 @dataclass(frozen=True)
@@ -396,23 +448,7 @@ class VLLMBehaviorSettings:
     ) -> VLLMBehaviorSettings:
         mapping = _object(payload, name)
         _require_fields(mapping, cls, name)
-        return _construct(
-            name,
-            lambda: cls(
-                dtype=mapping["dtype"],
-                max_model_len=mapping["max_model_len"],
-                gpu_memory_utilization=mapping["gpu_memory_utilization"],
-                max_num_seqs=mapping["max_num_seqs"],
-                max_num_batched_tokens=mapping["max_num_batched_tokens"],
-                kv_cache_dtype=mapping["kv_cache_dtype"],
-                enable_prefix_caching=mapping["enable_prefix_caching"],
-                enable_chunked_prefill=mapping["enable_chunked_prefill"],
-                enforce_eager=mapping["enforce_eager"],
-                tensor_parallel_size=mapping["tensor_parallel_size"],
-                max_logprobs=mapping["max_logprobs"],
-                batch_invariant=mapping["batch_invariant"],
-            ),
-        )
+        return _construct(name, lambda: _load(cls, mapping))
 
 
 @dataclass(frozen=True)
@@ -450,11 +486,12 @@ class ModelConfiguration:
         serving = VLLMBehaviorSettings.from_dict(mapping["serving"])
         return _construct(
             name,
-            lambda: cls(
+            lambda: _load(
+                cls,
+                mapping,
                 model=model,
                 tokenizer=tokenizer,
                 quantization=quantization,
-                vllm_version=mapping["vllm_version"],
                 serving=serving,
             ),
         )
@@ -482,14 +519,7 @@ class PromptSettings:
     ) -> PromptSettings:
         mapping = _object(payload, name)
         _require_fields(mapping, cls, name)
-        return _construct(
-            name,
-            lambda: cls(
-                prompt_version=mapping["prompt_version"],
-                plan_format_version=mapping["plan_format_version"],
-                thinking_enabled=mapping["thinking_enabled"],
-            ),
-        )
+        return _construct(name, lambda: _load(cls, mapping))
 
 
 @dataclass(frozen=True)
@@ -520,17 +550,7 @@ class SamplingSettings:
     ) -> SamplingSettings:
         mapping = _object(payload, name)
         _require_fields(mapping, cls, name)
-        return _construct(
-            name,
-            lambda: cls(
-                temperature=mapping["temperature"],
-                top_p=mapping["top_p"],
-                top_k=mapping["top_k"],
-                min_p=mapping["min_p"],
-                seed=mapping["seed"],
-                max_tokens=mapping["max_tokens"],
-            ),
-        )
+        return _construct(name, lambda: _load(cls, mapping))
 
 
 @dataclass(frozen=True)
@@ -563,11 +583,10 @@ class AgentConfiguration:
         sampling = SamplingSettings.from_dict(mapping["sampling"])
         return _construct(
             name,
-            lambda: cls(
-                smolagents_version=mapping["smolagents_version"],
-                action_interface=mapping["action_interface"],
+            lambda: _load(
+                cls,
+                mapping,
                 prompt=prompt,
-                step_limit=mapping["step_limit"],
                 sampling=sampling,
             ),
         )
@@ -601,17 +620,7 @@ class TaskConfiguration:
     ) -> TaskConfiguration:
         mapping = _object(payload, name)
         _require_fields(mapping, cls, name)
-        return _construct(
-            name,
-            lambda: cls(
-                appworld_version=mapping["appworld_version"],
-                split=mapping["split"],
-                selection_rule=mapping["selection_rule"],
-                selection_seed=mapping["selection_seed"],
-                task_count=mapping["task_count"],
-                task_set_hash=mapping["task_set_hash"],
-            ),
-        )
+        return _construct(name, lambda: _load(cls, mapping))
 
 
 @dataclass(frozen=True)
@@ -650,16 +659,10 @@ class RunConfiguration:
         model = ModelConfiguration.from_dict(mapping["model"])
         agent = AgentConfiguration.from_dict(mapping["agent"])
         task = TaskConfiguration.from_dict(mapping["task"])
-        arguments: dict[str, object] = {
-            "model": model,
-            "agent": agent,
-            "task": task,
-            "run_seed": mapping["run_seed"],
-            "git_commit": mapping["git_commit"],
-        }
-        if "protocol_hash" in mapping:
-            arguments["protocol_hash"] = mapping["protocol_hash"]
-        return _construct(name, lambda: cls(**arguments))
+        return _construct(
+            name,
+            lambda: _load(cls, mapping, model=model, agent=agent, task=task),
+        )
 
 
 def canonical_configuration_json(configuration: RunConfiguration) -> str:
@@ -706,6 +709,26 @@ class RunIdentity:
         _git_revision(self.git_commit, "git_commit")
         _embeds(self.run_id, f"{self.configuration_hash}.", "run_id")
 
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, RunIdentity)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "run identity",
+    ) -> RunIdentity:
+        mapping = dict(_object(payload, name))
+        _require_fields(
+            mapping,
+            cls,
+            name,
+            optional=frozenset({"protocol_hash"}),
+        )
+        if "protocol_hash" not in mapping:
+            mapping["protocol_hash"] = None
+        return _construct(name, lambda: _load(cls, mapping))
+
 
 @dataclass(frozen=True)
 class EpisodeIdentity:
@@ -719,6 +742,19 @@ class EpisodeIdentity:
         _embeds(self.episode_id, f"{self.run_id}.", "episode_id")
         if self.pair_id is not None:
             _runtime_token(self.pair_id, "pair_id")
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, EpisodeIdentity)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "episode identity",
+    ) -> EpisodeIdentity:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name, optional=frozenset({"pair_id"}))
+        return _construct(name, lambda: _load(cls, mapping))
 
 
 def new_run_identity(configuration: RunConfiguration) -> RunIdentity:
@@ -750,3 +786,261 @@ def new_episode_identity(
         run_id=run.run_id,
         pair_id=pair_id,
     )
+
+
+@dataclass(frozen=True)
+class StoppingRule:
+    """A caller-supplied stopping rule.
+
+    ``alpha``, ``horizon_episodes``, and ``name`` are required. ``threshold``
+    is the decision threshold for rules that use one. ``None`` means the
+    named rule has no threshold parameter. No level or threshold is filled in.
+    """
+
+    name: str
+    alpha: float
+    horizon_episodes: int
+    threshold: float | None = None
+
+    def __post_init__(self) -> None:
+        _rule_name(self.name, "name")
+        _open_probability(self.alpha, "alpha")
+        _positive(self.horizon_episodes, "horizon_episodes")
+        if self.threshold is not None:
+            _finite_float(self.threshold, "threshold")
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, StoppingRule)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "stopping rule",
+    ) -> StoppingRule:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name, optional=frozenset({"threshold"}))
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+@dataclass(frozen=True)
+class StreamSettings:
+    """Seeded task-stream inputs.
+
+    ``task_mix_rule`` is a public rule name. Resolved task ids stay in the
+    local task set. Constructing a ``test_normal`` stream does not run it.
+    """
+
+    split: str
+    selection_rule: str
+    selection_seed: int
+    task_set_hash: str
+    stream_seed: int
+    arrival_rate_per_second: float
+    concurrency: int
+    with_replacement: bool
+    task_mix_rule: str
+
+    def __post_init__(self) -> None:
+        _choice(self.split, SPLITS, "split")
+        _text(self.selection_rule, "selection_rule")
+        _integer(self.selection_seed, "selection_seed")
+        _sha256(self.task_set_hash, "task_set_hash")
+        _integer(self.stream_seed, "stream_seed")
+        _positive_float(self.arrival_rate_per_second, "arrival_rate_per_second")
+        _positive(self.concurrency, "concurrency")
+        _flag(self.with_replacement, "with_replacement")
+        _text(self.task_mix_rule, "task_mix_rule")
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, StreamSettings)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "stream settings",
+    ) -> StreamSettings:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+@dataclass(frozen=True)
+class GateSettings:
+    """Explicit inputs of the plan-only offline gate.
+
+    ``score_margin`` is the margin for the paired score-difference interval.
+    ``kl_limit_nats`` is the KL bound. ``mmd_alpha`` is the permutation-test
+    level. The gate implementation applies those comparisons. These fields
+    do not carry demo constants.
+    """
+
+    confidence_level: float
+    bootstrap_resamples: int
+    score_margin: float
+    kl_limit_nats: float
+    mmd_bandwidth: float
+    mmd_permutations: int
+    mmd_alpha: float
+    plan_format_version: str
+
+    def __post_init__(self) -> None:
+        _open_probability(self.confidence_level, "confidence_level")
+        _positive(self.bootstrap_resamples, "bootstrap_resamples")
+        _finite_float(self.score_margin, "score_margin")
+        _nonnegative_float(self.kl_limit_nats, "kl_limit_nats")
+        _positive_float(self.mmd_bandwidth, "mmd_bandwidth")
+        _positive(self.mmd_permutations, "mmd_permutations")
+        _open_probability(self.mmd_alpha, "mmd_alpha")
+        _text(self.plan_format_version, "plan_format_version")
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, GateSettings)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "gate settings",
+    ) -> GateSettings:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+@dataclass(frozen=True)
+class CanarySettings:
+    """Explicit inputs of paired canary execution.
+
+    ``fraction`` is the share of tasks sent to the canary. ``harm_margin``
+    is the drop in evaluator task success that the canary treats as harm.
+    ``outcome_delay_seconds`` is the additional delay before evaluator
+    outcomes become visible. Zero is an explicit delay of none.
+    """
+
+    fraction: float
+    outcome_delay_seconds: float
+    harm_margin: float
+    stopping_rule: StoppingRule
+
+    def __post_init__(self) -> None:
+        _open_unit(self.fraction, "fraction")
+        _nonnegative_float(self.outcome_delay_seconds, "outcome_delay_seconds")
+        _positive_float(self.harm_margin, "harm_margin")
+        _kind(self.stopping_rule, StoppingRule, "stopping_rule")
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, CanarySettings)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "canary settings",
+    ) -> CanarySettings:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        stopping_rule = StoppingRule.from_dict(mapping["stopping_rule"])
+        return _construct(
+            name,
+            lambda: _load(cls, mapping, stopping_rule=stopping_rule),
+        )
+
+
+def _signals(value: object) -> tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ConfigError("signals must be a list of monitor signals")
+    if not value:
+        raise ConfigError("signals must name at least one monitor signal")
+    chosen: list[str] = []
+    for item in value:
+        chosen.append(_choice(item, MONITOR_SIGNALS, "signals"))
+    if len(set(chosen)) != len(chosen):
+        raise ConfigError("signals contains a duplicate")
+    return tuple(chosen)
+
+
+def _stopping_rules(value: object, name: str) -> tuple[StoppingRule, ...]:
+    if isinstance(value, (str, StoppingRule)) or not isinstance(
+        value, (list, tuple)
+    ):
+        raise ConfigError(f"{name} must be a list of stopping rules")
+    if not value:
+        raise ConfigError(f"{name} must contain at least one rule")
+    rules: list[StoppingRule] = []
+    for item in value:
+        if isinstance(item, StoppingRule):
+            rules.append(item)
+        else:
+            rules.append(StoppingRule.from_dict(item, name=name))
+    return tuple(rules)
+
+
+@dataclass(frozen=True)
+class MonitorSettings:
+    """Explicit inputs of production monitors.
+
+    ``signals`` selects the monitored series. ``task_success`` is the
+    evaluator success flag. ``requirement_fraction`` is passed requirements
+    over total requirements when that total is positive. ``tool_error_count``
+    counts tool executions that returned an error. ``invalid_tool_call_count``
+    counts actions that did not parse into a call. ``trajectory_length`` is
+    the number of model and tool steps. ``reference_configuration_hash`` is
+    the previous known-good configuration.
+    """
+
+    reference_configuration_hash: str
+    outcome_delay_seconds: float
+    signals: tuple[str, ...]
+    stopping_rules: tuple[StoppingRule, ...]
+
+    def __post_init__(self) -> None:
+        _sha256(self.reference_configuration_hash, "reference_configuration_hash")
+        _nonnegative_float(self.outcome_delay_seconds, "outcome_delay_seconds")
+        if not isinstance(self.signals, tuple):
+            raise ConfigError("signals must be a tuple")
+        if not self.signals:
+            raise ConfigError("signals must name at least one monitor signal")
+        if len(set(self.signals)) != len(self.signals):
+            raise ConfigError("signals contains a duplicate")
+        for signal in self.signals:
+            _choice(signal, MONITOR_SIGNALS, "signals")
+        if (
+            not isinstance(self.stopping_rules, tuple)
+            or not self.stopping_rules
+        ):
+            raise ConfigError("stopping_rules must be a non-empty tuple")
+        for rule in self.stopping_rules:
+            _kind(rule, StoppingRule, "stopping_rules")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "reference_configuration_hash": self.reference_configuration_hash,
+            "outcome_delay_seconds": self.outcome_delay_seconds,
+            "signals": list(self.signals),
+            "stopping_rules": [rule.to_dict() for rule in self.stopping_rules],
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "monitor settings",
+    ) -> MonitorSettings:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        signals = _signals(mapping["signals"])
+        stopping_rules = _stopping_rules(
+            mapping["stopping_rules"],
+            name="stopping_rules",
+        )
+        return _construct(
+            name,
+            lambda: _load(
+                cls,
+                mapping,
+                signals=signals,
+                stopping_rules=stopping_rules,
+            ),
+        )

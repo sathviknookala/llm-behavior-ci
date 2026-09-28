@@ -1,4 +1,4 @@
-from offline_gate.offline import main
+from llm_behavior_ci.lifecycle.offline_gate import main
 
 
 if __name__ == "__main__":
