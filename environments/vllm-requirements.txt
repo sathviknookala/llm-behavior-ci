@@ -1,1 +1,6 @@
-vllm==0.30.0
+--extra-index-url https://wheels.vllm.ai/0.30.0/cu129
+--extra-index-url https://download.pytorch.org/whl/cu129
+vllm==0.30.0+cu129
+torch==2.13.0+cu129
+torchvision==0.28.0+cu129
+torchaudio==2.11.0+cu129
