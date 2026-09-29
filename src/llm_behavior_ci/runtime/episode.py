@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Callable, Literal
 
 from llm_behavior_ci.config import (
@@ -30,9 +30,11 @@ from llm_behavior_ci.runtime.agent import (
     build_appworld_executor,
     validate_chat_request,
 )
+from llm_behavior_ci.runtime.clock import wall_now
 from llm_behavior_ci.runtime.appworld import (
     AppWorldSession,
     EvaluationResult,
+    ToolResult,
 )
 
 _COMPLETED = frozenset({"plan_emitted", "agent_stopped", "appworld_completed"})
@@ -102,6 +104,19 @@ def _outcome(result: EvaluationResult) -> EvaluatorOutcome:
         total_requirements=result.total_requirements,
         difficulty=result.difficulty,
     )
+
+
+def _observation(result: ToolResult) -> str | None:
+    if result.error_message is None:
+        return result.output_text
+    if result.output_text is not None:
+        return result.output_text
+    message = result.error_message
+    if message.startswith("Execution failed."):
+        lines = [line.strip() for line in message.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+    return message
 
 
 def _model_step(index: int, turn: AgentTurn) -> ModelStep:
@@ -299,6 +314,12 @@ def run_episode(
             model_turns += 1
             if on_step is not None:
                 on_step(step)
+            if turn.rejection is not None:
+                tool_output = (
+                    "That output was not one apis.<app>.<api>(...) call. "
+                    "Emit exactly one call, with keyword arguments, and no other text."
+                )
+                continue
             if turn.action is None:
                 evaluation = session.evaluate()
                 return _finish(
@@ -405,13 +426,7 @@ def run_episode(
                     termination_reason="appworld_completed",
                     episode_errors=(),
                 )
-            if result.error_message is not None:
-                if result.output_text is not None:
-                    tool_output = result.output_text
-                else:
-                    tool_output = result.error_message
-            else:
-                tool_output = result.output_text
+            tool_output = _observation(result)
     finally:
         session.close()
 
@@ -638,7 +653,7 @@ def build_runtime(
     return RuntimeDependencies(
         session_factory=LiveAppWorldSession,
         agent=agent,
-        clock=clock or (lambda: datetime.now(timezone.utc)),
+        clock=clock or wall_now,
     )
 
 

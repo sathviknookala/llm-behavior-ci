@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Callable, Mapping, Protocol
 
 from llm_behavior_ci.config import ACTION_INTERFACES, RunConfiguration
 from llm_behavior_ci.records import TokenLogprob
-from llm_behavior_ci.runtime.actions import parse_model_output
+from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
+from llm_behavior_ci.runtime.clock import monotonic, wall_now
 from llm_behavior_ci.runtime.api_docs import (
     ApiDocsCorruptionError,
     resolve_api_documentation,
@@ -72,6 +72,7 @@ class AgentTurn:
     action: str | None
     app_name: str | None
     api_name: str | None
+    rejection: str | None = None
 
 
 class AgentLoop(Protocol):
@@ -610,21 +611,26 @@ class SmolagentsVLLMAgent(_SmolModel):
 
     def next_turn(self, *, tool_output: str | None) -> AgentTurn:
         state = self._state()
-        started_at = datetime.now(timezone.utc)
+        started_at = wall_now()
         if tool_output is not None:
             state.history.append({"role": "user", "content": tool_output})
         messages = self.messages()
-        began = time.perf_counter()
+        began = monotonic()
         chat_message = self.generate(messages)
-        latency_seconds = time.perf_counter() - began
+        latency_seconds = monotonic() - began
         output_text = chat_message.content or ""
         raw = chat_message.raw
         choice = raw["choices"][0]
         logprobs = parse_logprobs(choice)
+        rejection = None
         if self._mode == "plan":
             action, app_name, api_name = None, None, None
         else:
-            action, app_name, api_name = parse_model_output(output_text)
+            try:
+                action, app_name, api_name = parse_model_output(output_text)
+            except ActionRejected as error:
+                action, app_name, api_name = None, None, None
+                rejection = str(error)
         state.history.append({"role": "assistant", "content": output_text})
         return AgentTurn(
             prompt_text=messages[-1]["content"],
@@ -635,6 +641,7 @@ class SmolagentsVLLMAgent(_SmolModel):
             action=action,
             app_name=app_name,
             api_name=api_name,
+            rejection=rejection,
         )
 
     def plan_prefix_payload(

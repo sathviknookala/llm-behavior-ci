@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
@@ -52,13 +53,102 @@ def _is_sequence(value: object) -> bool:
     return isinstance(value, (list, tuple))
 
 
+def _parameter_text(parameters: object) -> str:
+    parts: list[str] = []
+    if isinstance(parameters, Mapping):
+        required = parameters.get("required", [])
+        optional = parameters.get("optional", [])
+        if isinstance(required, list):
+            parts.extend(
+                name for name in required if isinstance(name, str) and name != ""
+            )
+        if isinstance(optional, list):
+            parts.extend(
+                f"{name}?"
+                for name in optional
+                if isinstance(name, str) and name != ""
+            )
+        return ", ".join(parts)
+    if not isinstance(parameters, list):
+        return ""
+    for item in parameters:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or name == "":
+            continue
+        type_name = item.get("type")
+        piece = name
+        if isinstance(type_name, str) and type_name != "":
+            piece = f"{name}:{type_name}"
+        if not item.get("required"):
+            piece += "?"
+        parts.append(piece)
+    return ", ".join(parts)
+
+
+def _api_line(app_name: str, api_name: str, doc: object) -> str:
+    description = ""
+    parameters: object = []
+    if isinstance(doc, Mapping):
+        raw_description = doc.get("description", "")
+        if isinstance(raw_description, str):
+            description = " ".join(raw_description.split())
+        parameters = doc.get("parameters", [])
+    parameter_text = _parameter_text(parameters)
+    if parameter_text:
+        return f"{app_name}.{api_name}: {description} | {parameter_text}"
+    return f"{app_name}.{api_name}: {description}"
+
+
+def render_api_documentation(documentation: object) -> str:
+    """Turn AppWorld's API-doc collection into line-oriented prompt text.
+
+    A string is kept unchanged so fakes and already-rendered text stay
+    stable. A mapping of app to API docs becomes one ``app.api:`` line per
+    API, apps and APIs sorted, with the description and parameter name and
+    type. That is the form ``api-docs-corrupt-v1`` can redact, and it drops
+    response schemas. Anything else falls back to ``str``.
+    """
+
+    if documentation is None:
+        return ""
+    if isinstance(documentation, str):
+        return documentation
+    if not isinstance(documentation, Mapping):
+        return str(documentation)
+    if not documentation:
+        return ""
+    lines: list[str] = []
+    for app_name in sorted(documentation, key=str):
+        apis = documentation[app_name]
+        if not isinstance(apis, Mapping):
+            return str(documentation)
+        for api_name in sorted(apis, key=str):
+            lines.append(_api_line(str(app_name), str(api_name), apis[api_name]))
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+_EXECUTION_FAILED = "Execution failed."
+_NO_CODE = "No code available to execute."
+
+
+def _execute_output_is_error(value: str) -> bool:
+    stripped = value.lstrip()
+    return stripped.startswith(_EXECUTION_FAILED) or stripped.startswith(_NO_CODE)
+
+
 class LiveAppWorldSession:
     """AppWorld session adapter that imports AppWorld only when a world is opened.
 
-    ``context`` reads the task instruction and API docs without executing.
-    ``execute`` maps a returned string or a raised error onto ``ToolResult``.
-    ``evaluate`` reads the raw evaluator counts and lets ``RuntimeUnavailable``
-    propagate. ``close`` is idempotent.
+    ``context`` reads the task instruction and renders API docs without
+    executing. ``execute`` treats AppWorld's returned ``Execution failed.``
+    text as a recoverable tool error; a raised exception is the same.
+    ``evaluate`` reads ``pass_count`` and ``num_tests`` from the
+    ``TestTracker``. ``close`` is idempotent. The live world has no
+    ``initial_state_identity`` method.
     """
 
     def __init__(
@@ -78,15 +168,10 @@ class LiveAppWorldSession:
 
     def context(self) -> TaskContext:
         task = self._world.task
-        documentation = getattr(task, "api_docs", "")
-        if documentation is None:
-            documentation = ""
-        elif not isinstance(documentation, str):
-            documentation = str(documentation)
         return TaskContext(
             task_id=self._task_id,
             instruction=task.instruction,
-            api_documentation=documentation,
+            api_documentation=render_api_documentation(getattr(task, "api_docs", "")),
         )
 
     def execute(self, action: str) -> ToolResult:
@@ -100,16 +185,17 @@ class LiveAppWorldSession:
                 app_name=None,
                 api_name=None,
             )
-        if isinstance(value, str):
+        text = value if isinstance(value, str) else str(value)
+        if _execute_output_is_error(text):
             return ToolResult(
-                output_text=value,
-                error_message=None,
-                recoverable=False,
+                output_text=None,
+                error_message=text,
+                recoverable=True,
                 app_name=None,
                 api_name=None,
             )
         return ToolResult(
-            output_text=str(value),
+            output_text=text,
             error_message=None,
             recoverable=False,
             app_name=None,
@@ -121,16 +207,17 @@ class LiveAppWorldSession:
 
         raw = self._world.evaluate()
         success = bool(raw.success)
-        passes = getattr(raw, "passes", None)
-        fails = getattr(raw, "fails", None)
-        if _is_sequence(passes) and _is_sequence(fails):
-            passed = len(passes)
-            total = passed + len(fails)
-        elif hasattr(raw, "pass_count") and hasattr(raw, "fail_count"):
+        if hasattr(raw, "pass_count") and hasattr(raw, "num_tests"):
             passed = int(raw.pass_count)
-            total = passed + int(raw.fail_count)
+            total = int(raw.num_tests)
         else:
-            raise RuntimeUnavailable("evaluation result is missing counts")
+            passes = getattr(raw, "passes", None)
+            failures = getattr(raw, "failures", None)
+            if _is_sequence(passes) and _is_sequence(failures):
+                passed = len(passes)
+                total = passed + len(failures)
+            else:
+                raise RuntimeUnavailable("evaluation result is missing counts")
         difficulty = getattr(raw, "difficulty", None)
         return EvaluationResult(
             success=success,

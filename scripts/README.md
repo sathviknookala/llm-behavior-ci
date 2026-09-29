@@ -8,7 +8,7 @@
 
 `evaluation/lock_protocol.py` records caller-supplied settings. With no arguments it exits 2. A lock is not pre-registration.
 
-`evaluation/smoke_live_episode.py` runs one execute-mode AppWorld episode against a live vLLM endpoint. It requires `--configuration` (model and agent JSON), `--task-set` (local resolved task-set JSON with public fields plus task and scenario ids), `--task-index`, `--base-url`, and `--store`. `APPWORLD_ROOT` must be set to an existing directory. With no arguments it exits 2. A store path under a directory named `results` is refused. It prints one public-safe JSON summary and does not print task text, task ids, actions, observations, or prompts. It is not a benchmark and not a gate. The script does not claim an episode has been run.
+`evaluation/smoke_live_episode.py` runs one execute-mode AppWorld episode against a live vLLM endpoint. It requires `--configuration` (model and agent JSON), `--task-set` (local resolved task-set JSON with public fields plus task and scenario ids), `--task-index`, `--base-url`, and `--store`. `APPWORLD_ROOT` must be set to an existing directory. With no arguments it exits 2. A store path under a directory named `results` is refused. It prints one public-safe JSON summary and does not print task text, task ids, actions, observations, or prompts. It is not a benchmark and not a gate. One `train_smoke` execute episode has been run; it reached the step limit without an evaluator outcome. The public summary is in `docs/RUNTIME_CONTEXT.md`.
 
 `service/serve.py` starts the FastAPI gateway. With missing required arguments it exits 2 and refuses a store path under a directory named `results`. There is no live AppWorld episode, load run, or Compose stack.
 

@@ -26,7 +26,7 @@ def _parse_native_call(text: str) -> tuple[str, str, str]:
     try:
         tree = ast.parse(stripped, mode="exec")
     except SyntaxError as error:
-        raise ActionRejected("action is not valid Python") from error
+        raise ActionRejected(f"action is not valid Python: {error.msg}") from error
     if len(tree.body) != 1:
         raise ActionRejected("action must be a single expression")
     statement = tree.body[0]

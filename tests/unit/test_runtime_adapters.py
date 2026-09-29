@@ -26,10 +26,12 @@ from llm_behavior_ci.runtime.agent import (
     served_model_id,
     validate_chat_request,
 )
+from llm_behavior_ci.runtime.api_docs import resolve_api_documentation
 from llm_behavior_ci.runtime.appworld import (
     LiveAppWorldSession,
     TaskContext,
     _open_appworld,
+    render_api_documentation,
 )
 from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 from llm_behavior_ci.runtime.prompts import (
@@ -148,7 +150,15 @@ class FakeWorld:
         return f"ok:{action}"
 
     def evaluate(self) -> SimpleNamespace:
-        return SimpleNamespace(success=True, passes=["a"], fails=[], difficulty=2)
+        return SimpleNamespace(
+            success=True,
+            passes=["a"],
+            failures=[],
+            pass_count=1,
+            fail_count=0,
+            num_tests=1,
+            difficulty=2,
+        )
 
     def close(self) -> None:
         self.closed += 1
@@ -206,6 +216,90 @@ class RuntimeAdapterTests(unittest.TestCase):
         session.close()
         session.close()
         self.assertEqual(world.closed, 1)
+
+    def test_live_execute_treats_appworld_failure_text_as_a_tool_error(self) -> None:
+        world = FakeWorld()
+
+        def execute(action: str) -> str:
+            del action
+            return "Execution failed. Traceback:\nmissing field\n"
+
+        world.execute = execute
+        session = LiveAppWorldSession("task-1", opener=lambda task_id: world)
+        failed = session.execute("apis.supervisor.complete_task()")
+        self.assertIsNone(failed.output_text)
+        self.assertTrue(failed.recoverable)
+        self.assertTrue(failed.error_message.startswith("Execution failed."))
+        ok = LiveAppWorldSession(
+            "task-1",
+            opener=lambda task_id: SimpleNamespace(
+                task=world.task,
+                execute=lambda action: "Execution successful.",
+                close=lambda: None,
+            ),
+        ).execute("apis.calendar.show()")
+        self.assertEqual(ok.output_text, "Execution successful.")
+        self.assertIsNone(ok.error_message)
+
+    def test_live_evaluate_uses_num_tests_not_the_recorded_pair_count(self) -> None:
+        world = FakeWorld()
+        world.evaluate = lambda: SimpleNamespace(
+            success=False,
+            passes=["a"],
+            failures=[],
+            pass_count=1,
+            fail_count=0,
+            num_tests=3,
+            difficulty=1,
+        )
+        session = LiveAppWorldSession("task-1", opener=lambda task_id: world)
+        evaluation = session.evaluate()
+        self.assertFalse(evaluation.success)
+        self.assertEqual(evaluation.passed_requirements, 1)
+        self.assertEqual(evaluation.total_requirements, 3)
+
+    def test_rendered_api_docs_are_sorted_lines_the_corruptor_can_redact(self) -> None:
+        rendered = render_api_documentation(
+            {
+                "supervisor": {
+                    "complete_task": {
+                        "description": "Mark the task done.",
+                        "parameters": [
+                            {"name": "answer", "type": "string", "required": False},
+                            {"name": "status", "type": "string", "required": True},
+                        ],
+                        "response_schemas": {"success": {"type": "object"}},
+                    }
+                },
+                "calendar": {
+                    "show": {
+                        "description": "Show the day.",
+                        "parameters": [
+                            {"name": "date", "type": "string", "required": True}
+                        ],
+                    }
+                },
+            }
+        )
+        self.assertEqual(
+            rendered,
+            "calendar.show: Show the day. | date:string\n"
+            "supervisor.complete_task: Mark the task done. | "
+            "answer:string?, status:string\n",
+        )
+        corrupted = resolve_api_documentation(
+            rendered,
+            api_docs_version="api-docs-corrupt-v1",
+            api_docs_app="supervisor",
+        )
+        self.assertIn("calendar.show: Show the day. | date:string", corrupted)
+        self.assertIn(
+            "supervisor.complete_task: [documentation removed]",
+            corrupted,
+        )
+        self.assertNotIn("Mark the task done.", corrupted)
+        self.assertEqual(render_api_documentation("calendar docs"), "calendar docs")
+        self.assertEqual(render_api_documentation(None), "")
 
     def test_completion_payload_contains_sampling_prompt_and_thinking(self) -> None:
         agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
@@ -537,21 +631,23 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_concurrent_begins_isolate_history(self) -> None:
         agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
-        barrier = threading.Barrier(2)
+        barrier = threading.Barrier(2, timeout=5)
         seen: dict[str, list[str]] = {"a": [], "b": []}
         errors: list[BaseException] = []
+        markers = threading.local()
+
+        def urlopen(request, timeout=None):
+            del request, timeout
+            return _FakeResponse(
+                _completion_body(f"CALL calendar lookup\n{markers.marker}")
+            )
 
         def worker(name: str, marker: str) -> None:
             try:
                 agent.begin(_context(), _config())
                 barrier.wait()
-                with patch(
-                    "urllib.request.urlopen",
-                    side_effect=lambda request, timeout=None: _FakeResponse(
-                        _completion_body(f"CALL calendar lookup\n{marker}")
-                    ),
-                ):
-                    turn = agent.next_turn(tool_output=None)
+                markers.marker = marker
+                turn = agent.next_turn(tool_output=None)
                 barrier.wait()
                 messages = agent.messages()
                 seen[name] = [item["content"] for item in messages if item["role"] == "assistant"]
@@ -561,10 +657,11 @@ class RuntimeAdapterTests(unittest.TestCase):
 
         first = threading.Thread(target=worker, args=("a", "action-a()"))
         second = threading.Thread(target=worker, args=("b", "action-b()"))
-        first.start()
-        second.start()
-        first.join()
-        second.join()
+        with patch("urllib.request.urlopen", side_effect=urlopen):
+            first.start()
+            second.start()
+            first.join()
+            second.join()
         self.assertEqual(errors, [])
         self.assertEqual(seen["a"], ["CALL calendar lookup\naction-a()"])
         self.assertEqual(seen["b"], ["CALL calendar lookup\naction-b()"])

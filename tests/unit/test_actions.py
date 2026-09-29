@@ -1,6 +1,7 @@
 import unittest
 
 from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
+from llm_behavior_ci.runtime.prompts import render_system_text
 
 
 class ActionParserTests(unittest.TestCase):
@@ -70,6 +71,29 @@ class ActionParserTests(unittest.TestCase):
             parse_model_output("CALL calendar lookup\napp.lookup()"),
             ("app.lookup()", "calendar", "lookup"),
         )
+
+    def test_prompt_v2_execute_asks_for_one_native_call(self) -> None:
+        text = render_system_text(
+            prompt_version="prompt-v2",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="execute",
+        )
+        self.assertIn("apis.<app>.<api>(...)", text)
+        self.assertIn("apis.supervisor.complete_task(...)", text)
+        self.assertIn("Pass every argument by keyword.", text)
+        self.assertIn("Do not repeat a call that just failed.", text)
+        self.assertNotIn("CALL <app> <api>", text)
+        self.assertNotIn("STOP", text)
+        legacy = render_system_text(
+            prompt_version="prompt-v1",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="execute",
+        )
+        self.assertIn("CALL <app> <api>", legacy)
 
 
 if __name__ == "__main__":

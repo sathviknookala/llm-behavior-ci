@@ -140,6 +140,8 @@ The loop stays in this repo because the lifecycle depends on what it records: pe
 
 The baseline action interface is `code` (`configs/models/qwen3_4b_production.json`). It matches how AppWorld tasks are designed to be solved and keeps AppWorld's large API catalog out of the context as structured tool schemas. This selects `AppWorldActionExecutor`; it does not adopt `CodeAgent`. Adopting `CodeAgent` (Python actions in AppWorld's shell, which is how AppWorld tasks are designed to be solved) or `ToolCallingAgent` (AppWorld APIs as tools, which puts many tool schemas in context) as the loop is a change to this decision, and needs a live AppWorld catalog and an installed smolagents to test. On CPU, smolagents is not installed, so `SmolagentsVLLMAgent` and the executors run on their plain-object fallback bases with the same control flow.
 
+**Live check (2026-09-29).** One `train_smoke` execute episode persisted. The public summary is in `docs/RUNTIME_CONTEXT.md`. The shell accepts keyword arguments only. A malformed model output is not executed; the episode records it and continues. The run reached `agent.step_limit` (40) without `apis.supervisor.complete_task`, so the evaluator did not run. Opening a world freezes time; `runtime/clock.py` keeps episode timestamps and latencies on the real clock.
+
 ## D19 — Evaluation lifecycle
 
 **Status:** LOCKED (Sathvik 2026-09-27)
@@ -151,6 +153,8 @@ Three tiers, in order: Tier 1, the offline CI regression gate on plan traces ove
 **Status:** LOCKED as in-process AppWorld (Sathvik 2026-09-29)
 
 Model-generated actions run on his machine, in AppWorld's in-process shell, which restricts destructive modules by default. The path is `run_episode` → `LiveAppWorldSession` → `AppWorld(task_id)` → `world.execute` → `world.evaluate`. AppWorld's Docker or `appworld serve` mode is not used: it adds RPC, lifecycle, networking, and state management without changing the statistical experiment. Revisit only if the in-process executor causes an actual security or reliability problem.
+
+**Live package (2026-09-29).** `world.execute` returns a string. Failure text starts with `Execution failed.` and is a recoverable tool error; a raise is the closed-database case. `world.evaluate` returns a `TestTracker`. The adapter reads `pass_count` and `num_tests`. There is no `initial_state_identity` method. `str(task.api_docs)` does not fit in `max_model_len` 32768; `context()` renders one sorted `app.api:` line per API and drops response schemas. That render is what `api-docs-corrupt-v1` can still redact. It does not use the solution's `required_apis`.
 
 ## D21 — Canary served-result rule
 

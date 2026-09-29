@@ -76,9 +76,11 @@ There is **no** task- or world-method named as a docs selector. App-relevant fil
 
 `api-docs-corrupt-v1` redacts lines that match `^app.api`. On this task, `str(ApiDocCollection)` is a single-line dict-style dump: corruption against every app key left the string unchanged (`corruption_changes=false`). A reduction that keeps the fault meaningful must emit line-oriented `app.api: ...` text (or another form the corruptor can match), not bare `str(collection)`.
 
-## Recommendation (not implemented in this lane)
+## Recommendation (not taken)
 
 Reduction is required: current initial context plus an 8-turn / 8192-token reserve exceeds 32768, so documentation cannot stay as `str(world.task.api_docs)`.
+
+The `keep_apis(required_apis)` path below was not taken. `required_apis` is parsed from the compiled solution, and the shipped render keeps the full catalog.
 
 Smallest deterministic reduction that still lets the API-documentation corruption fault change the docs string:
 
@@ -90,4 +92,50 @@ On this smoke task that line-oriented `keep_apis(required_apis)` form measured a
 
 ## Conclusion
 
-Reduction is recommended: initial context is 115336 tokens against `max_model_len` 32768, so even before multi-turn history the prompt does not fit; keep Python coercion unchanged in this lane and apply a `keep_apis(required_apis)` plus corruption-compatible line render later.
+The unreduced `str(ApiDocCollection)` does not fit: initial context is 115336 tokens against `max_model_len` 32768.
+
+## Reduction applied
+
+`LiveAppWorldSession.context()` no longer uses `str(api_docs)`. For a mapping it writes one sorted line per API, `app.api: description | name:type`, and drops response schemas. Strings are left unchanged. This is not `GroundTruth.required_apis`: that list is parsed from the compiled solution, and putting it in the prompt would show the solution's API set. `Task.allowed_apps` is already what `ApiDocCollection.load` receives, and on this task it is the full 11-app catalog, so an app filter does not shrink the text.
+
+The line form is what `api-docs-corrupt-v1` matches. On this same task index, corrupting `supervisor` changed the rendered string.
+
+Measured again on 2026-09-29 through `POST /tokenize` with the messages shape (`add_generation_prompt=true`, `enable_thinking=false`) and `prompt-v2`:
+
+| Quantity | Value |
+| --- | --- |
+| Rendered documentation characters | 63580 |
+| Rendered documentation lines | 457 |
+| Documentation tokens (prompt tokenize) | 13309 |
+| System-prompt tokens (`prompt-v2`, execute, code, thinking off) | 122 |
+| Task-instruction tokens | 33 |
+| Initial-context tokens (messages) | 13481 |
+| Headroom (`32768 − 13481`) | 19287 |
+| Headroom after 8 turns of 1024 generated tokens | 11095 |
+| Headroom after 16 turns of 1024 generated tokens | 2903 |
+
+Eight full turns fit, and sixteen still fit before observation text. `step_limit` remains 40; a turn that actually emits 1024 tokens plus a long observation can still fill the window late in an episode. That is history growth, not a reason to cut the catalog down to the solution's APIs.
+
+`AppWorld` has no `initial_state_identity` method. `execute` returns `Execution failed.` text instead of raising. `evaluate` returns a `TestTracker` with `pass_count`, `fail_count`, `num_tests`, `passes`, and `failures`. The adapter follows that shape.
+
+## Live execute episode
+
+On 2026-09-29 one `train_smoke` execute episode was run with `scripts/evaluation/smoke_live_episode.py` against the already-running Qwen3-4B server at `127.0.0.1:8000`, task index 0. The SQLite log stayed under `data/processed/`. It is not a `results/` artifact. No task text, action, or observation is copied here.
+
+The run used working-tree code on top of `a26eef9`. The script's configuration hash was `d4ea3f9877b77b094cffb029d363d45239f866dc95f84ac494134cfc186eda77`, which embeds that git revision. Prompt-body edits are not hashed fields. A later run will not reproduce that hash.
+
+| Field | Value |
+| --- | --- |
+| `termination_reason` | `step_limit` |
+| `status` | `failed` |
+| `model_step_count` | 40 |
+| `tool_step_count` | 39 |
+| `model_latency_seconds` | 91.585 |
+| `wall_seconds` | 92.476 |
+| `evaluator_success` | null |
+| `passed_requirements` | null |
+| `total_requirements` | null |
+
+`apis.supervisor.complete_task` was not called, so `evaluate()` did not run. Of the 39 tool steps, 12 returned an output and 27 were `Execution failed.` API errors. 39 of 40 model outputs started with `apis.`. The limit is the production `agent.step_limit` of 40.
+
+Earlier attempts in the same session stopped at `invalid_action` when a prose turn was fatal. This run is after that turn is recorded and skipped, and after a failed shell call is fed back as its last line rather than the traceback. The shell accepts keyword arguments only. Opening a world freezes `datetime` and `perf_counter`; episode timestamps use `runtime/clock.py` so they stay on the real clock.

@@ -76,6 +76,9 @@ _NATIVE_CODE_EXECUTE = (
     "of the form apis.<app>.<api>(...).\n"
     "Do not emit prose, Markdown fences, or any wrapper syntax "
     "around the call.\n"
+    "Pass every argument by keyword.\n"
+    "Do not repeat a call that just failed.\n"
+    "When the task is done, call apis.supervisor.complete_task(...).\n"
 )
 
 

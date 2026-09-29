@@ -121,6 +121,7 @@ def _turn(
     api_name: str | None = None,
     prompt_text: str = _PROMPT,
     started_at: datetime = _START,
+    rejection: str | None = None,
 ) -> AgentTurn:
     return AgentTurn(
         prompt_text=prompt_text,
@@ -131,6 +132,7 @@ def _turn(
         action=action,
         app_name=app_name,
         api_name=api_name,
+        rejection=rejection,
     )
 
 
@@ -209,6 +211,7 @@ class FakeAgent:
             api_name=source.api_name,
             prompt_text=source.prompt_text,
             started_at=self._clock(),
+            rejection=source.rejection,
         )
 
 
@@ -461,6 +464,42 @@ class EpisodeRunnerTests(unittest.TestCase):
         self.assertEqual(agent.tool_outputs[1], "missing")
         self.assertTrue(result.evaluator_outcome.success)
 
+    def test_execution_failed_traceback_feeds_back_the_last_line(self) -> None:
+        config = _config()
+        clock = _clock()
+        session = FakeSession()
+        traceback = (
+            "Execution failed. Traceback:\n"
+            "  File \"<python-input>\", line 1, in <module>\n"
+            "    apis.calendar.show()\n"
+            "{'message': 'missing token'}\n"
+        )
+        session.tool_results = [
+            ToolResult(
+                output_text=None,
+                error_message=traceback,
+                recoverable=True,
+                app_name="calendar",
+                api_name="show",
+            )
+        ]
+        agent = FakeAgent(
+            [
+                _turn("apis.calendar.show()", action="apis.calendar.show()", app_name="calendar", api_name="show"),
+                _turn("STOP", action=None),
+            ],
+            clock=clock,
+        )
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(result.tool_steps[0].error.message, traceback)
+        self.assertEqual(agent.tool_outputs[1], "{'message': 'missing token'}")
+
     def test_execute_mode_sends_actions_through_session_execute(self) -> None:
         config = _config()
         clock = _clock()
@@ -558,6 +597,7 @@ class EpisodeRunnerTests(unittest.TestCase):
             "choices": [
                 {
                     "message": {"content": plan_with_call},
+                    "token_ids": [7],
                     "logprobs": {
                         "content": [
                             {
@@ -669,6 +709,33 @@ class EpisodeRunnerTests(unittest.TestCase):
         self.assertEqual(session.evaluate_count, 0)
         self.assertEqual(result.episode_errors[0].source, "runtime")
         self.assertIsNone(result.evaluator_outcome)
+
+    def test_rejected_output_is_not_executed_and_the_episode_continues(self) -> None:
+        config = _config()
+        clock = _clock()
+        session = FakeSession()
+        agent = FakeAgent(
+            [
+                _turn("not a call", action=None, rejection="action is not valid Python"),
+                _turn("STOP", action=None),
+            ],
+            clock=clock,
+        )
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(session.execute_count, 0)
+        self.assertEqual(session.evaluate_count, 1)
+        self.assertEqual(result.termination_reason, "agent_stopped")
+        self.assertEqual(len(result.model_steps), 2)
+        self.assertEqual(agent.tool_outputs[1], (
+            "That output was not one apis.<app>.<api>(...) call. "
+            "Emit exactly one call, with keyword arguments, and no other text."
+        ))
 
 
 if __name__ == "__main__":
