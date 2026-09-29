@@ -358,11 +358,19 @@ class EpisodeRunnerTests(unittest.TestCase):
         self.assertEqual(len(result.model_steps), 1)
         self.assertEqual(result.episode_errors[0].source, "runtime")
         self.assertEqual(result.episode_errors[0].message, "execute failed")
+        self.assertEqual(session.evaluate_count, 0)
+        self.assertIsNone(result.evaluator_outcome)
 
-    def test_step_limit_stops_execute_mode(self) -> None:
+    def test_step_limit_evaluates_without_completing(self) -> None:
         config = replace(_config(), agent=replace(_config().agent, step_limit=1))
         clock = _clock()
         session = FakeSession()
+        session.evaluation = EvaluationResult(
+            success=True,
+            passed_requirements=1,
+            total_requirements=1,
+            difficulty=1,
+        )
         result = run_episode(
             "task-1",
             config,
@@ -371,10 +379,19 @@ class EpisodeRunnerTests(unittest.TestCase):
             runtime=_runtime(session, AlwaysActionAgent(clock), clock),
         )
         self.assertEqual(len(result.model_steps), 1)
+        self.assertEqual(session.evaluate_count, 1)
+        self.assertEqual(session.close_count, 1)
         self.assertEqual(result.termination_reason, "step_limit")
         self.assertEqual(result.status, "failed")
-        self.assertEqual(session.evaluate_count, 0)
-        self.assertEqual(session.close_count, 1)
+        self.assertIsNotNone(result.evaluator_outcome)
+        assert result.evaluator_outcome is not None
+        self.assertTrue(result.evaluator_outcome.success)
+        self.assertEqual(result.evaluator_outcome.passed_requirements, 1)
+        self.assertEqual(result.evaluator_outcome.total_requirements, 1)
+        self.assertEqual(result.evaluator_outcome.difficulty, 1)
+        self.assertEqual(result.episode_errors[0].source, "step_limit")
+        self.assertEqual(result.episode_errors[0].message, "step limit reached")
+        self.assertFalse(result.episode_errors[0].recoverable)
 
     def test_model_and_tool_records_are_present(self) -> None:
         config = _config()

@@ -190,9 +190,12 @@ def run_episode(
     set, git commit, or protocol. Mints one episode identity, opens a session
     from ``runtime.session_factory``, and always closes that session. Plan
     mode takes one model turn and never executes or evaluates. Execute mode
-    enforces the configured step limit, records tool results, and evaluates
-    only after the agent stops. ``scenario_id`` is stored on the local task
-    reference when the caller has one; it is not ground truth.
+    enforces the configured step limit and records tool results. It evaluates
+    when the agent stops, when ``complete_task`` succeeds, and when the step
+    limit is reached. A step-limit evaluation does not change the failed
+    status. Unrecoverable runtime and tool failures are not evaluated.
+    ``scenario_id`` is stored on the local task reference when the caller
+    has one; it is not ground truth.
     """
 
     _reject(task_id, config, mode, run)
@@ -259,6 +262,7 @@ def run_episode(
         next_index = 0
         while True:
             if model_turns >= config.agent.step_limit:
+                evaluation = session.evaluate()
                 return _finish(
                     identity=identity,
                     run=run,
@@ -271,7 +275,7 @@ def run_episode(
                     model_steps=model_steps,
                     tool_steps=tool_steps,
                     plan_text=None,
-                    evaluator_outcome=None,
+                    evaluator_outcome=_outcome(evaluation),
                     termination_reason="step_limit",
                     episode_errors=(
                         RecordedError(

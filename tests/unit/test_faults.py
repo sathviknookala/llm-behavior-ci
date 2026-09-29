@@ -506,8 +506,14 @@ class FaultLabelProvenanceTests(unittest.TestCase):
         fault = _fp8_fault()
         candidate = apply_fault(base, fault)
         clock = Clock()
+
+        class CrashingWorld(World):
+            def execute(self, action: str) -> ToolResult:
+                del action
+                raise RuntimeError("execute failed")
+
         runtime = RuntimeDependencies(
-            session_factory=lambda task_id: World(task_id, success=False),
+            session_factory=lambda task_id: CrashingWorld(task_id, success=False),
             agent=ActingAgent(clock),
             clock=clock,
         )
