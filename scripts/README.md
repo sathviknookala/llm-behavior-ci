@@ -8,6 +8,8 @@
 
 `evaluation/lock_protocol.py` records caller-supplied settings. With no arguments it exits 2. A lock is not pre-registration.
 
+`evaluation/smoke_live_episode.py` runs one execute-mode AppWorld episode against a live vLLM endpoint. It requires `--configuration` (model and agent JSON), `--task-set` (local resolved task-set JSON with public fields plus task and scenario ids), `--task-index`, `--base-url`, and `--store`. `APPWORLD_ROOT` must be set to an existing directory. With no arguments it exits 2. A store path under a directory named `results` is refused. It prints one public-safe JSON summary and does not print task text, task ids, actions, observations, or prompts. It is not a benchmark and not a gate. The script does not claim an episode has been run.
+
 `service/serve.py` starts the FastAPI gateway. With missing required arguments it exits 2 and refuses a store path under a directory named `results`. There is no live AppWorld episode, load run, or Compose stack.
 
 `service/launch_vllm.py` starts one vLLM server for the `model` section of `--configuration` (a model file such as `configs/models/qwen3_4b_production.json` or a full run configuration). Run it with the vLLM environment's interpreter: `PYTHONPATH=src .venv-vllm/bin/python scripts/service/launch_vllm.py --configuration ...`. The argv is `build_vllm_launch_spec`'s, plus `--host` and `--port`; the environment is the spec's, which always includes `VLLM_USE_FLASHINFER_SAMPLER` from `model.serving.sampler_backend`, plus the machine-only `TRITON_PTXAS_BLACKWELL_PATH` (`docs/CONSTRAINTS.md`). `--dry-run` prints the argv and environment as JSON. It execs `vllm` in the foreground; detach it with `setsid`. With no arguments, or from an interpreter without vLLM, it exits 2.
