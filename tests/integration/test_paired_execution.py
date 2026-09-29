@@ -1284,6 +1284,73 @@ class AACaptureTests(unittest.TestCase):
         self.assertNotIn("1. reference step", summary)
         self.assertNotIn("frozen_plan_text", summary)
 
+    def test_teacher_forced_plan_kl_stays_empty_when_token_ids_differ(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+
+        class MismatchedSupportAgent(PairAgent):
+            def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
+                del tool_output
+                return [{"role": "user", "content": "emit a plan"}]
+
+            def teacher_force_plan(
+                self,
+                *,
+                messages: list[dict[str, str]],
+                plan_text: str,
+            ) -> tuple[tuple[TokenLogprob, ...], ...]:
+                del messages, plan_text
+                if not hasattr(self, "_forced"):
+                    self._forced = True
+                    return (
+                        (
+                            TokenLogprob(token_id=1, logprob=-0.1, rank=0),
+                            TokenLogprob(token_id=2, logprob=-2.3, rank=1),
+                        ),
+                    )
+                return (
+                    (
+                        TokenLogprob(token_id=1, logprob=-0.4, rank=0),
+                        TokenLogprob(token_id=9, logprob=-1.1, rank=1),
+                    ),
+                )
+
+        def factory(mode: str) -> RuntimeDependencies:
+            clock = Clock()
+            return RuntimeDependencies(
+                session_factory=lambda task_id: World(task_id, f"state:{task_id}"),
+                agent=MismatchedSupportAgent(clock, mode=mode, diverge=True),
+                clock=clock,
+            )
+
+        result = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("plan",),
+            runtime_factory=factory,
+            observe_hardware=False,
+        )
+        record = result.records[0]
+        assert record.teacher_forced_plan_kl is not None
+        self.assertEqual(
+            record.teacher_forced_plan_kl.frozen_plan_text,
+            "1. reference step",
+        )
+        self.assertIsNone(record.teacher_forced_plan_kl.mean_kl_nats)
+        self.assertIsNone(record.teacher_forced_plan_kl.position_kl_nats)
+        self.assertEqual(
+            record.teacher_forced_plan_kl.reference_top_k,
+            (((1, -0.1), (2, -2.3)),),
+        )
+        self.assertEqual(
+            record.teacher_forced_plan_kl.candidate_top_k,
+            (((1, -0.4), (9, -1.1)),),
+        )
+
     def test_teacher_forced_plan_kl_missing_without_teacher_force(self) -> None:
         task_set = _task_set()
         arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]

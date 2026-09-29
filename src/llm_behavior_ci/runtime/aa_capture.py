@@ -54,6 +54,7 @@ from llm_behavior_ci.runtime.episode import (
 )
 from llm_behavior_ci.runtime.scoring import ScoringError, score_top_k
 from llm_behavior_ci.stats.chi_square import ChiSquareError, ChiSquareResult, chi_square_homogeneity
+from llm_behavior_ci.stats.kl import TruncatedKLError
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 from llm_behavior_ci.tasks.streams import StreamError, TaskArrival, generate_stream
 
@@ -381,6 +382,32 @@ def _logprob_arrays(
     return tuple(tuple(item.logprob for item in position) for position in positions)
 
 
+def _support_ids(
+    positions: Sequence[Sequence[TokenLogprob]],
+) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(item.token_id for item in position) for position in positions)
+
+
+def _unscored_forced(
+    frozen_plan_text: str,
+    reference_positions: Sequence[Sequence[TokenLogprob]] | None = None,
+    candidate_positions: Sequence[Sequence[TokenLogprob]] | None = None,
+) -> TeacherForcedPlanKL:
+    return TeacherForcedPlanKL(
+        frozen_plan_text=frozen_plan_text,
+        reference_top_k=(
+            None
+            if reference_positions is None
+            else _top_k_tables(reference_positions)
+        ),
+        candidate_top_k=(
+            None
+            if candidate_positions is None
+            else _top_k_tables(candidate_positions)
+        ),
+    )
+
+
 def teacher_forced_plan_kl(
     *,
     runtime: RuntimeDependencies,
@@ -391,8 +418,10 @@ def teacher_forced_plan_kl(
     """Teacher-force one frozen plan under both identical A sides.
 
     Reuses the offline-gate pattern: same messages, same plan text, score
-    with ``score_top_k``. Missing teacher-force leaves KL fields empty
-    rather than falling back to independently generated plans.
+    with ``score_top_k`` only when both sides expose the same token ids in
+    the same order. A support mismatch leaves the KL empty and keeps both
+    tables. Missing teacher-force leaves KL fields empty rather than
+    falling back to independently generated plans.
     """
 
     teacher_force = getattr(runtime.agent, "teacher_force_plan", None)
@@ -432,13 +461,23 @@ def teacher_forced_plan_kl(
         return TeacherForcedPlanKL(frozen_plan_text=frozen_plan_text)
     if not reference_positions or not candidate_positions:
         return TeacherForcedPlanKL(frozen_plan_text=frozen_plan_text)
+    if _support_ids(reference_positions) != _support_ids(candidate_positions):
+        return _unscored_forced(
+            frozen_plan_text,
+            reference_positions,
+            candidate_positions,
+        )
     try:
         scored = score_top_k(
             _logprob_arrays(reference_positions),
             _logprob_arrays(candidate_positions),
         )
-    except ScoringError:
-        return TeacherForcedPlanKL(frozen_plan_text=frozen_plan_text)
+    except (ScoringError, TruncatedKLError):
+        return _unscored_forced(
+            frozen_plan_text,
+            reference_positions,
+            candidate_positions,
+        )
     return TeacherForcedPlanKL(
         frozen_plan_text=frozen_plan_text,
         mean_kl_nats=scored.mean_kl_nats,
