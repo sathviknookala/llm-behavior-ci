@@ -6,14 +6,19 @@ recorded offsets. Evaluator disagreement and requirement fractions are
 recorded only from evaluator outcomes. A missing outcome is not an
 agreement and is not a success.
 
-Plan-scoring inputs are the plan texts and top-k log probabilities.
-This module does not apply a KL limit, a margin, or a stopping rule.
-Tool-selection homogeneity reuses ``chi_square_homogeneity`` when the
-counts meet that function's contract. The p-value is not a decision.
+Plan-scoring inputs are the plan texts and top-k log probabilities from
+independent generation. Beside them, plan-mode pairs also record a
+teacher-forced top-k KL on one frozen reference plan scored under both
+A sides. This module does not apply a KL limit, a margin, or a stopping
+rule. Tool-selection homogeneity reuses ``chi_square_homogeneity`` when
+the counts meet that function's contract. The p-value is not a decision.
 
 ``test_normal`` is rejected here. Hardware fields stay empty unless a
 snapshot is taken. A caller-supplied probe is not GPU evidence;
 ``nvidia-smi`` is. Synthetic captures leave memory and wall time unset.
+With no expected-process allowance, any compute process refuses a timed
+start. An explicit caller allowance names the baseline server by pid
+and/or exact process name; unexpected concurrent GPU work still refuses.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ from llm_behavior_ci.config import (
     StreamSettings,
     new_run_identity,
 )
-from llm_behavior_ci.records import EpisodeResult, PairedResult
+from llm_behavior_ci.records import EpisodeResult, PairedResult, TokenLogprob
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
     PairExecution,
@@ -47,6 +52,7 @@ from llm_behavior_ci.runtime.episode import (
     pair_execution,
     run_pair,
 )
+from llm_behavior_ci.runtime.scoring import ScoringError, score_top_k
 from llm_behavior_ci.stats.chi_square import ChiSquareError, ChiSquareResult, chi_square_homogeneity
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 from llm_behavior_ci.tasks.streams import StreamError, TaskArrival, generate_stream
@@ -59,12 +65,43 @@ class GpuBusy(RuntimeError):
 
 
 @dataclass(frozen=True)
+class GpuProcess:
+    """One compute process reported on the first GPU."""
+
+    pid: int
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class AllowedGpuProcess:
+    """Caller-named allowance for one expected baseline compute process.
+
+    At least one of ``pid`` or ``name`` must be set. A name match is exact
+    equality with the reported process name, not a substring.
+    """
+
+    pid: int | None = None
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.pid is None and (self.name is None or self.name == ""):
+            raise EpisodeRejected("allowed GPU process needs a pid or a name")
+        if self.pid is not None and (
+            isinstance(self.pid, bool) or not isinstance(self.pid, int) or self.pid < 1
+        ):
+            raise EpisodeRejected("allowed GPU pid must be a positive integer")
+        if self.name is not None and not isinstance(self.name, str):
+            raise EpisodeRejected("allowed GPU process name must be a string")
+
+
+@dataclass(frozen=True)
 class GpuSnapshot:
     """One reading of the first GPU reported by the probe."""
 
     memory_used_mib: int
     memory_total_mib: int
     process_count: int
+    processes: tuple[GpuProcess, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,7 +111,9 @@ class ExecutionCost:
     ``hardware_observed`` is true only for an ``nvidia-smi`` reading.
     A probe can fill memory and wall time for a dry run, and
     ``hardware_observed`` stays false. An unobserved capture leaves the
-    numeric fields as ``None`` rather than zero.
+    numeric fields as ``None`` rather than zero. When hardware is
+    observed, ``initial`` and ``final`` keep the raw snapshots, including
+    process count and which processes matched the caller allowance.
     """
 
     hardware_observed: bool
@@ -82,6 +121,9 @@ class ExecutionCost:
     memory_total_mib: int | None
     wall_seconds: float | None
     source: str
+    initial: GpuSnapshot | None = None
+    final: GpuSnapshot | None = None
+    allowed_processes: tuple[GpuProcess, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,14 +159,32 @@ class PlanScoringInputs:
     """Plan text and top-k tables, with no score and no threshold applied.
 
     Each step is a tuple of positions, and each position is a tuple of
-    ``(token_id, logprob)`` pairs. These are the inputs a later truncated
-    scorer would align. They are not full-vocabulary log probabilities.
+    ``(token_id, logprob)`` pairs. These are independently generated plan
+    variation inputs, not the teacher-forced A/A floor. They are not
+    full-vocabulary log probabilities.
     """
 
     reference_plan_text: str | None
     candidate_plan_text: str | None
     reference_steps: tuple[tuple[tuple[tuple[int, float], ...], ...], ...]
     candidate_steps: tuple[tuple[tuple[tuple[int, float], ...], ...], ...]
+
+
+@dataclass(frozen=True)
+class TeacherForcedPlanKL:
+    """Teacher-forced top-k plan KL on one frozen reference plan.
+
+    Both A sides score the same ``frozen_plan_text``. ``mean_kl_nats`` is
+    top-k at the configuration's ``max_logprobs``, not a full-vocabulary
+    claim. Fields stay empty when teacher-force is unavailable. No
+    threshold or pass/fail is applied.
+    """
+
+    frozen_plan_text: str | None = None
+    mean_kl_nats: float | None = None
+    position_kl_nats: tuple[float, ...] | None = None
+    reference_top_k: tuple[tuple[tuple[int, float], ...], ...] | None = None
+    candidate_top_k: tuple[tuple[tuple[int, float], ...], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +200,7 @@ class AAPairRecord:
     candidate_requirement_fraction: float | None
     trajectory: TrajectoryDivergence
     plan_scoring_inputs: PlanScoringInputs | None
+    teacher_forced_plan_kl: TeacherForcedPlanKL | None = None
 
 
 @dataclass(frozen=True)
@@ -280,6 +341,113 @@ def plan_scoring_inputs(pair: PairedResult) -> PlanScoringInputs | None:
     )
 
 
+def _matched_messages(
+    agent: object,
+    context: object,
+    config: RunConfiguration,
+) -> list[dict[str, str]] | None:
+    begin = getattr(agent, "begin", None)
+    if not callable(begin):
+        return None
+    begin(context, config)
+    messages_fn = getattr(agent, "messages", None)
+    if not callable(messages_fn):
+        return None
+    built = messages_fn()
+    if (
+        isinstance(built, list)
+        and built
+        and all(isinstance(item, dict) for item in built)
+    ):
+        return [
+            {"role": str(item["role"]), "content": str(item["content"])}
+            for item in built
+        ]
+    return None
+
+
+def _top_k_tables(
+    positions: Sequence[Sequence[TokenLogprob]],
+) -> tuple[tuple[tuple[int, float], ...], ...]:
+    return tuple(
+        tuple((item.token_id, item.logprob) for item in position)
+        for position in positions
+    )
+
+
+def _logprob_arrays(
+    positions: Sequence[Sequence[TokenLogprob]],
+) -> tuple[tuple[float, ...], ...]:
+    return tuple(tuple(item.logprob for item in position) for position in positions)
+
+
+def teacher_forced_plan_kl(
+    *,
+    runtime: RuntimeDependencies,
+    task_id: str,
+    configuration: RunConfiguration,
+    frozen_plan_text: str,
+) -> TeacherForcedPlanKL:
+    """Teacher-force one frozen plan under both identical A sides.
+
+    Reuses the offline-gate pattern: same messages, same plan text, score
+    with ``score_top_k``. Missing teacher-force leaves KL fields empty
+    rather than falling back to independently generated plans.
+    """
+
+    teacher_force = getattr(runtime.agent, "teacher_force_plan", None)
+    if not callable(teacher_force):
+        return TeacherForcedPlanKL()
+    session = runtime.session_factory(task_id)
+    try:
+        context = session.context()
+        messages = _matched_messages(runtime.agent, context, configuration)
+        if messages is None:
+            return TeacherForcedPlanKL()
+        runtime.agent.begin(context, configuration)
+        try:
+            reference_positions = teacher_force(
+                messages=messages,
+                plan_text=frozen_plan_text,
+            )
+        except Exception as error:
+            if "unsupported" in str(error).lower():
+                return TeacherForcedPlanKL()
+            raise
+        runtime.agent.begin(context, configuration)
+        try:
+            candidate_positions = teacher_force(
+                messages=messages,
+                plan_text=frozen_plan_text,
+            )
+        except Exception as error:
+            if "unsupported" in str(error).lower():
+                return TeacherForcedPlanKL()
+            raise
+    finally:
+        session.close()
+    if not isinstance(reference_positions, tuple) or not isinstance(
+        candidate_positions, tuple
+    ):
+        return TeacherForcedPlanKL(frozen_plan_text=frozen_plan_text)
+    if not reference_positions or not candidate_positions:
+        return TeacherForcedPlanKL(frozen_plan_text=frozen_plan_text)
+    try:
+        scored = score_top_k(
+            _logprob_arrays(reference_positions),
+            _logprob_arrays(candidate_positions),
+        )
+    except ScoringError:
+        return TeacherForcedPlanKL(frozen_plan_text=frozen_plan_text)
+    return TeacherForcedPlanKL(
+        frozen_plan_text=frozen_plan_text,
+        mean_kl_nats=scored.mean_kl_nats,
+        position_kl_nats=scored.position_kl_nats,
+        reference_top_k=_top_k_tables(reference_positions),
+        candidate_top_k=_top_k_tables(candidate_positions),
+    )
+
+
 def _fraction(episode: EpisodeResult) -> float | None:
     outcome = episode.evaluator_outcome
     if outcome is None:
@@ -294,7 +462,13 @@ def _disagreement(pair: PairedResult) -> bool | None:
     return difference.success_difference != 0
 
 
-def _record(item: ScheduledInput, mode: str, pair: PairedResult) -> AAPairRecord:
+def _record(
+    item: ScheduledInput,
+    mode: str,
+    pair: PairedResult,
+    *,
+    forced_kl: TeacherForcedPlanKL | None = None,
+) -> AAPairRecord:
     return AAPairRecord(
         schedule=item,
         mode=mode,
@@ -305,6 +479,7 @@ def _record(item: ScheduledInput, mode: str, pair: PairedResult) -> AAPairRecord
         candidate_requirement_fraction=_fraction(pair.candidate),
         trajectory=trajectory_divergence(pair),
         plan_scoring_inputs=plan_scoring_inputs(pair),
+        teacher_forced_plan_kl=forced_kl,
     )
 
 
@@ -351,9 +526,10 @@ def _run_smi(args: list[str]) -> str:
 def parse_gpu_snapshot(memory: str, processes: str) -> GpuSnapshot:
     """Parse the first GPU from ``nvidia-smi`` CSV text.
 
-    Memory is ``used, total`` in MiB, nounits. A blank process list is
-    idle. Non-numeric process lines are ignored. Incomplete text raises
-    ``RuntimeUnavailable`` instead of returning zeros.
+    Memory is ``used, total`` in MiB, nounits. Process lines are ``pid`` or
+    ``pid, process_name``. A blank process list is idle. Non-numeric process
+    lines are ignored. Incomplete text raises ``RuntimeUnavailable`` instead
+    of returning zeros.
     """
 
     lines = [line.strip() for line in memory.splitlines() if line.strip()]
@@ -369,14 +545,24 @@ def parse_gpu_snapshot(memory: str, processes: str) -> GpuSnapshot:
         raise RuntimeUnavailable("nvidia-smi memory reading is incomplete") from error
     if used < 0 or total <= 0:
         raise RuntimeUnavailable("nvidia-smi memory reading is incomplete")
-    process_count = 0
+    parsed: list[GpuProcess] = []
     for line in processes.splitlines():
-        if line.strip().isdigit():
-            process_count += 1
+        text = line.strip()
+        if not text:
+            continue
+        columns = [part.strip() for part in text.split(",")]
+        if not columns or not columns[0].isdigit():
+            continue
+        pid = int(columns[0])
+        name: str | None = None
+        if len(columns) >= 2 and columns[1] and not columns[1].isdigit():
+            name = columns[1]
+        parsed.append(GpuProcess(pid=pid, name=name))
     return GpuSnapshot(
         memory_used_mib=used,
         memory_total_mib=total,
-        process_count=process_count,
+        process_count=len(parsed),
+        processes=tuple(parsed),
     )
 
 
@@ -397,11 +583,45 @@ def read_nvidia_smi_snapshot() -> GpuSnapshot:
     processes = _run_smi(
         [
             "nvidia-smi",
-            "--query-compute-apps=pid",
+            "--query-compute-apps=pid,process_name",
             "--format=csv,noheader",
         ]
     )
     return parse_gpu_snapshot(memory, processes)
+
+
+def _process_matches(process: GpuProcess, allowed: AllowedGpuProcess) -> bool:
+    if allowed.pid is not None and allowed.name is not None:
+        return process.pid == allowed.pid and process.name == allowed.name
+    if allowed.pid is not None:
+        return process.pid == allowed.pid
+    return process.name is not None and process.name == allowed.name
+
+
+def assert_gpu_processes_allowed(
+    snapshot: GpuSnapshot,
+    allowed: Sequence[AllowedGpuProcess] = (),
+) -> tuple[GpuProcess, ...]:
+    """Raise ``GpuBusy`` unless every compute process is explicitly allowed.
+
+    An idle GPU (zero processes) always proceeds. With no allowance, any
+    compute process refuses. Allowed does not mean idle: matched processes
+    are returned and the snapshot's process count is unchanged. A count
+    without process identities cannot be matched and refuses.
+    """
+
+    if snapshot.process_count == 0:
+        return ()
+    if not allowed or not snapshot.processes:
+        raise GpuBusy("GPU already has compute processes")
+    if len(snapshot.processes) != snapshot.process_count:
+        raise GpuBusy("GPU already has compute processes")
+    matched: list[GpuProcess] = []
+    for process in snapshot.processes:
+        if not any(_process_matches(process, spec) for spec in allowed):
+            raise GpuBusy("GPU already has compute processes")
+        matched.append(process)
+    return tuple(matched)
 
 
 def _snapshot(probe: Callable[[], GpuSnapshot] | None) -> tuple[GpuSnapshot, str]:
@@ -433,6 +653,8 @@ def _cost(
     after: GpuSnapshot,
     wall_seconds: float,
     source: str,
+    *,
+    allowed_processes: tuple[GpuProcess, ...] = (),
 ) -> ExecutionCost:
     return ExecutionCost(
         hardware_observed=source == "nvidia-smi",
@@ -440,6 +662,9 @@ def _cost(
         memory_total_mib=before.memory_total_mib,
         wall_seconds=wall_seconds,
         source=source,
+        initial=before,
+        final=after,
+        allowed_processes=allowed_processes,
     )
 
 
@@ -454,14 +679,16 @@ def capture_aa(
     runtime_factory: Callable[[str], RuntimeDependencies],
     observe_hardware: bool,
     gpu_probe: Callable[[], GpuSnapshot] | None = None,
+    allowed_gpu_processes: Sequence[AllowedGpuProcess] = (),
 ) -> AACaptureResult:
     """Pair one configuration with itself on a supplied stream.
 
     ``runtime_factory`` receives the mode and must return a fresh runtime
     for that pair. Reference and candidate runs are distinct identities of
     this same configuration. ``observe_hardware`` false leaves cost numbers
-    unset. When it is true, a GPU that already has compute processes raises
-    ``GpuBusy`` before any episode starts.
+    unset and does not shell out to ``nvidia-smi``. When it is true, every
+    compute process must be covered by ``allowed_gpu_processes`` or the
+    capture raises ``GpuBusy`` before any episode starts.
     """
 
     if not isinstance(configuration, RunConfiguration):
@@ -473,12 +700,16 @@ def capture_aa(
     chosen = _modes(modes)
     worker_count = _positive(concurrency, "concurrency")
     schedule = repeated_schedule(arrivals, repetitions=repetitions)
+    allowed = tuple(allowed_gpu_processes)
+    for item in allowed:
+        if not isinstance(item, AllowedGpuProcess):
+            raise EpisodeRejected("allowed GPU processes must be AllowedGpuProcess")
     before: GpuSnapshot | None = None
     source = "not_observed"
+    matched_allowed: tuple[GpuProcess, ...] = ()
     if observe_hardware:
         before, source = _snapshot(gpu_probe)
-        if before.process_count > 0:
-            raise GpuBusy("GPU already has compute processes")
+        matched_allowed = assert_gpu_processes_allowed(before, allowed)
     reference_run = new_run_identity(configuration)
     candidate_run = new_run_identity(configuration)
     jobs: list[tuple[int, ScheduledInput, ModeName]] = []
@@ -499,7 +730,19 @@ def capture_aa(
             mode=mode,
             scenario_id=item.scenario_id,
         )
-        slots[index] = _record(item, mode, pair)
+        forced_kl: TeacherForcedPlanKL | None = None
+        if mode == "plan":
+            frozen = pair.reference.plan_text
+            if frozen is None or not str(frozen).strip():
+                forced_kl = TeacherForcedPlanKL()
+            else:
+                forced_kl = teacher_forced_plan_kl(
+                    runtime=runtime,
+                    task_id=item.task_id,
+                    configuration=configuration,
+                    frozen_plan_text=frozen,
+                )
+        slots[index] = _record(item, mode, pair, forced_kl=forced_kl)
 
     started = time.perf_counter()
     if worker_count == 1:
@@ -520,7 +763,13 @@ def capture_aa(
         after, after_source = _snapshot(gpu_probe)
         if after_source != source:
             raise RuntimeUnavailable("GPU probe source changed during capture")
-        cost = _cost(before, after, wall_seconds, source)
+        cost = _cost(
+            before,
+            after,
+            wall_seconds,
+            source,
+            allowed_processes=matched_allowed,
+        )
     records = tuple(record for record in slots if record is not None)
     if len(records) != len(slots):
         raise EpisodeRejected("capture dropped a paired episode")
@@ -677,6 +926,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--vllm-base-url", required=True)
     parser.add_argument("--observe-hardware", action="store_true")
+    parser.add_argument(
+        "--allow-gpu-pid",
+        action="append",
+        type=int,
+        default=[],
+        dest="allow_gpu_pids",
+    )
+    parser.add_argument(
+        "--allow-gpu-process-name",
+        action="append",
+        default=[],
+        dest="allow_gpu_process_names",
+    )
     parser.add_argument("--results-root", default=None)
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
@@ -701,10 +963,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise EpisodeRejected(
                 "capture output cannot be written as a public result"
             )
+        allowed = tuple(
+            [AllowedGpuProcess(pid=pid) for pid in args.allow_gpu_pids]
+            + [
+                AllowedGpuProcess(name=name)
+                for name in args.allow_gpu_process_names
+            ]
+        )
         arrivals = tuple(generate_stream(task_set, settings))
         snapshot = read_nvidia_smi_snapshot()
-        if snapshot.process_count > 0:
-            raise GpuBusy("GPU already has compute processes")
+        assert_gpu_processes_allowed(snapshot, allowed)
         result = capture_aa(
             configuration,
             arrivals,
@@ -714,6 +982,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             modes=modes,
             runtime_factory=live_runtime_factory(args.vllm_base_url),
             observe_hardware=args.observe_hardware,
+            allowed_gpu_processes=allowed,
         )
         write_local_capture(result, output_path, results_root=results_root)
     except (
