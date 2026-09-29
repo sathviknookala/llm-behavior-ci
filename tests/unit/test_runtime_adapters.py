@@ -241,6 +241,28 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(ok.output_text, "Execution successful.")
         self.assertIsNone(ok.error_message)
 
+    def test_live_execute_prints_a_single_call_so_stdout_keeps_the_body(self) -> None:
+        seen: list[str] = []
+
+        def execute(action: str) -> str:
+            seen.append(action)
+            return '{"access_token": "token"}\n'
+
+        world = FakeWorld()
+        world.execute = execute
+        session = LiveAppWorldSession("task-1", opener=lambda task_id: world)
+        result = session.execute("apis.simple_note.login(username='a', password='b')")
+        self.assertEqual(
+            seen,
+            ["print(apis.simple_note.login(username='a', password='b'))"],
+        )
+        self.assertEqual(result.output_text, '{"access_token": "token"}\n')
+        self.assertIsNone(result.error_message)
+        session.execute("print(apis.supervisor.show_profile())")
+        self.assertEqual(seen[-1], "print(apis.supervisor.show_profile())")
+        session.execute("name = apis.supervisor.show_profile()")
+        self.assertEqual(seen[-1], "name = apis.supervisor.show_profile()")
+
     def test_live_evaluate_uses_num_tests_not_the_recorded_pair_count(self) -> None:
         world = FakeWorld()
         world.evaluate = lambda: SimpleNamespace(

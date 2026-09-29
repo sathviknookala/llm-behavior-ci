@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Callable, Protocol
@@ -135,6 +136,32 @@ _EXECUTION_FAILED = "Execution failed."
 _NO_CODE = "No code available to execute."
 
 
+def _code_for_execute(action: str) -> str:
+    """Print a single call so AppWorld's stdout capture keeps the return value.
+
+    AppWorld records stdout and substitutes ``Execution successful.`` when
+    that stream is empty. A bare ``apis.<app>.<api>(...)`` expression
+    therefore drops the response body, including tokens and records the
+    next turn needs. ``print`` of one dict or list is AppWorld's own
+    JSON printer. Anything that is not a single call is left unchanged.
+    """
+
+    stripped = action.strip()
+    try:
+        tree = ast.parse(stripped, mode="exec")
+    except SyntaxError:
+        return action
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Expr):
+        return action
+    value = tree.body[0].value
+    if not isinstance(value, ast.Call):
+        return action
+    func = value.func
+    if isinstance(func, ast.Name) and func.id == "print":
+        return action
+    return f"print({stripped})"
+
+
 def _execute_output_is_error(value: str) -> bool:
     stripped = value.lstrip()
     return stripped.startswith(_EXECUTION_FAILED) or stripped.startswith(_NO_CODE)
@@ -144,8 +171,11 @@ class LiveAppWorldSession:
     """AppWorld session adapter that imports AppWorld only when a world is opened.
 
     ``context`` reads the task instruction and renders API docs without
-    executing. ``execute`` treats AppWorld's returned ``Execution failed.``
-    text as a recoverable tool error; a raised exception is the same.
+    executing. ``execute`` prints a single call expression before handing
+    it to AppWorld, so the return value is on stdout instead of being
+    replaced by ``Execution successful.``. It treats AppWorld's returned
+    ``Execution failed.`` text as a recoverable tool error; a raised
+    exception is the same.
     ``evaluate`` reads ``pass_count`` and ``num_tests`` from the
     ``TestTracker``. ``close`` is idempotent. The live world has no
     ``initial_state_identity`` method.
@@ -176,7 +206,7 @@ class LiveAppWorldSession:
 
     def execute(self, action: str) -> ToolResult:
         try:
-            value = self._world.execute(action)
+            value = self._world.execute(_code_for_execute(action))
         except Exception as error:
             return ToolResult(
                 output_text=None,

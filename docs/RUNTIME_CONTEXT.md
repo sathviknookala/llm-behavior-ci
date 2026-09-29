@@ -139,3 +139,22 @@ The run used working-tree code on top of `a26eef9`. The script's configuration h
 `apis.supervisor.complete_task` was not called, so `evaluate()` did not run. Of the 39 tool steps, 12 returned an output and 27 were `Execution failed.` API errors. 39 of 40 model outputs started with `apis.`. The limit is the production `agent.step_limit` of 40.
 
 Earlier attempts in the same session stopped at `invalid_action` when a prose turn was fatal. This run is after that turn is recorded and skipped, and after a failed shell call is fed back as its last line rather than the traceback. The shell accepts keyword arguments only. Opening a world freezes `datetime` and `perf_counter`; episode timestamps use `runtime/clock.py` so they stay on the real clock.
+
+## Smoke tasks 0–2
+
+On 2026-09-29 the same production configuration was run on `train_smoke` indices 0, 1, and 2. Logs stayed under `data/processed/`. They are not `results/` artifacts. No task text, action, or observation is copied here.
+
+The first index-0 run above is the one whose 27 `Execution failed.` steps were classified. Twelve of its tool steps returned `Execution successful.` AppWorld records stdout and uses that sentence when stdout is empty. A bare `apis.<app>.<api>(...)` expression does not print its return value, and the parser rejects a `print(...)` wrapper because that is two calls. `LiveAppWorldSession.execute` now prints a single call expression before handing it to AppWorld. A direct check of `apis.supervisor.show_profile()` returned `Execution successful.` without that wrap and a JSON object with the profile keys with it.
+
+Indices 1 and 2, before that wrap, and all three indices after it, still stopped at `step_limit` with no `complete_task` and no evaluator outcome. The configuration hash for these six runs is `3ec22b933490026f011a40d2f59f171126d7c671bb701493132dddebbafa9a19`.
+
+| Task index | Wrap | Termination | Model steps | Tool steps | Tool outputs | Tool errors | `complete_task` | Evaluator | Model latency (s) | Wall (s) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | no | `step_limit` | 40 | 39 | 12 | 27 | no | no | 91.585 | 92.476 |
+| 1 | no | `step_limit` | 40 | 40 | 0 | 40 | no | no | 81.063 | 81.920 |
+| 2 | no | `step_limit` | 40 | 40 | 0 | 40 | no | no | 109.860 | 110.827 |
+| 0 | yes | `step_limit` | 40 | 39 | 1 | 38 | no | no | 92.110 | 93.016 |
+| 1 | yes | `step_limit` | 40 | 40 | 0 | 40 | no | no | 82.549 | 83.388 |
+| 2 | yes | `step_limit` | 40 | 40 | 0 | 40 | no | no | 110.855 | 111.825 |
+
+None of these episodes called `apis.supervisor.complete_task` or `evaluate()`. The index-0 failures are credential and mailbox state, not missing parameter names or a parser mismatch. Indices 1 and 2 are login credential rejections and unauthorized calls, with no successful tool output for the print wrap to change. Compact API lines already include the supervisor password API. Restoring parameter descriptions was not required for these failures.
