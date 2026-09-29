@@ -1,12 +1,12 @@
 # Data
 
-Read before downloading anything or accepting terms. Nothing in this file has been downloaded or installed. Accepting a license or gated-access terms requires asking Sathvik first.
+Read before downloading anything or accepting terms. AppWorld is the only item installed, recorded under **AppWorld install record** below. Accepting a license or gated-access terms requires asking Sathvik first.
 
 ## Environment
 
 | Item | Role | License as recorded | Source | Status |
 |---|---|---|---|---|
-| AppWorld | The task environment: tasks, per-task database state, 457 APIs across 9 apps, the execution shell, and the evaluator | Public portion Apache 2.0. Protected portion (task, app, and API-specific code and data, including API docs, solutions, and evaluation tests) ships in encrypted `.bundle` files under Apache 2.0 plus a requirement that any public redistribution of it, or of derivatives, be encrypted. Training models and serving their outputs are stated not to be redistribution. Requires Python 3.11+ | github.com/StonyBrookNLP/appworld ; arxiv.org/abs/2407.18901 | not installed |
+| AppWorld | The task environment: tasks, per-task database state, 457 APIs across 9 apps, the execution shell, and the evaluator | Public portion Apache 2.0. Protected portion (task, app, and API-specific code and data, including API docs, solutions, and evaluation tests) ships in encrypted `.bundle` files under Apache 2.0 plus a requirement that any public redistribution of it, or of derivatives, be encrypted. Training models and serving their outputs are stated not to be redistribution. Requires Python 3.11+ | github.com/StonyBrookNLP/appworld ; arxiv.org/abs/2407.18901 | installed 2026-09-29 (record below) |
 
 License and facts were read from the repository README, `LICENSE`, and `pyproject.toml` on 2026-09-27. Re-read them at the pinned version before install and correct this file if they differ.
 
@@ -83,3 +83,13 @@ The arXiv metadata, HuffPost News Category, Wild-Time, CivilComments, and WildCh
 1. Ask Sathvik to accept the terms.
 2. Confirm the license line in this file against the source, and correct it if needed.
 3. Record the install date, the exact package and data version, and where `APPWORLD_ROOT` lives on disk. Environment bytes, resolved task sets, and logs do not belong in git.
+
+### AppWorld install record
+
+- **Terms.** Accepted by Sathvik on 2026-09-29, including the rule that nothing extracted or derived from the `.bundle` files is posted online in plain text or images.
+- **License check.** The installed package metadata reads `License: Apache-2.0`. The encrypted-redistribution requirement on the protected portion was not re-read at this version; it stays as recorded above.
+- **Package.** `appworld==0.1.3.post1`, installed 2026-09-29 from `requirements.txt` into `.venv-service/` (Python 3.12, created with `uv`). `.venv-service/` is listed in `.git/info/exclude`. The older repo `.venv/` (Python 3.13) also contains `appworld==0.1.3.post1` beside `vllm==0.30.0` and `torch`; it is a mixed environment and is not the service environment.
+- **Bundles.** `appworld install` unpacked the encrypted app bundle into the service venv's `appworld` package and the tests bundle into `~/.appworld/tests`, outside the repo.
+- **Data.** `appworld download data --root data/raw/appworld` on 2026-09-29 wrote data version `0.1.0` to `data/raw/appworld/data/`. `data/raw/**` is in `.git/info/exclude`.
+- **`APPWORLD_ROOT`.** `data/raw/appworld/`, relative to the repo root. It is not set persistently; pass `APPWORLD_ROOT=$PWD/data/raw/appworld` on each command.
+- **Standalone check.** On 2026-09-29, `AppWorld(task_id=...)` on one `train` task loaded, `evaluate()` returned a `TestTracker`, and `close()` succeeded, outside this package's code. Only hashes, lengths, and the pass flag were printed; no task text, API docs, or evaluator details. AppWorld writes that run's experiment output under `data/raw/appworld/experiments/`.
