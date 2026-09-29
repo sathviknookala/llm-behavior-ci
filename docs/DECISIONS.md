@@ -132,13 +132,13 @@ No code, data, or numbers from outside employment enter this repo. Before any pu
 
 ## D18 — Agent runtime
 
-**Status:** LOCKED as smolagents for the model and action interfaces, with the episode loop in this repo (Sathvik 2026-09-27; amended 2026-09-29). Action interface OPEN.
+**Status:** LOCKED as smolagents for the model and action interfaces, with the episode loop in this repo (Sathvik 2026-09-27; amended 2026-09-29). Action interface LOCKED as `code` (Sathvik 2026-09-29).
 
 `runtime/episode.py` `run_episode` owns the agent loop: it builds each turn's messages, enforces `agent.step_limit`, parses the model's action, executes it, feeds the observation back, and records every `ModelStep` and `ToolStep` as it happens. smolagents supplies the two interfaces that loop calls. `runtime/agent.py` `SmolagentsVLLMAgent` subclasses `smolagents.Model`, and each turn's model call goes through `generate` against the configuration's vLLM server. `build_appworld_executor` returns a `smolagents` `PythonExecutor`-shaped `AppWorldActionExecutor` or a `Tool`-shaped `AppWorldExecuteTool`, chosen by `config.agent.action_interface`. Neither `CodeAgent` nor `ToolCallingAgent` is constructed, and `smolagents.LocalPythonExecutor` never executes an action. Every mutation goes through `AppWorldSession.execute`.
 
 The loop stays in this repo because the lifecycle depends on what it records: per-step persistence, termination reasons, plan-only mode, and teacher-forced log-probabilities. smolagents' `run` owns its own memory, prompt templates, output parsing, and `final_answer` handling, and would have to be re-instrumented to produce the same records. Both action interfaces currently send the same `CALL <app> <api>` text defined in `runtime/prompts.py` and parsed by `parse_model_output`; that format is this repo's, not smolagents'.
 
-When stage 1 starts, choose the action interface and record the reason. Adopting `CodeAgent` (Python actions in AppWorld's shell, which is how AppWorld tasks are designed to be solved) or `ToolCallingAgent` (AppWorld APIs as tools, which puts many tool schemas in context) as the loop is a change to this decision, and needs a live AppWorld catalog and an installed smolagents to test. On CPU, smolagents is not installed, so `SmolagentsVLLMAgent` and the executors run on their plain-object fallback bases with the same control flow.
+The baseline action interface is `code` (`configs/models/qwen3_4b_production.json`). It matches how AppWorld tasks are designed to be solved and keeps AppWorld's large API catalog out of the context as structured tool schemas. This selects `AppWorldActionExecutor`; it does not adopt `CodeAgent`. Adopting `CodeAgent` (Python actions in AppWorld's shell, which is how AppWorld tasks are designed to be solved) or `ToolCallingAgent` (AppWorld APIs as tools, which puts many tool schemas in context) as the loop is a change to this decision, and needs a live AppWorld catalog and an installed smolagents to test. On CPU, smolagents is not installed, so `SmolagentsVLLMAgent` and the executors run on their plain-object fallback bases with the same control flow.
 
 ## D19 — Evaluation lifecycle
 
@@ -148,9 +148,9 @@ Three tiers, in order: Tier 1, the offline CI regression gate on plan traces ove
 
 ## D20 — Code-execution boundary
 
-**Status:** OPEN — Sathvik
+**Status:** LOCKED as in-process AppWorld (Sathvik 2026-09-29)
 
-Model-generated actions run on his machine. AppWorld's in-process shell restricts destructive modules by default; `appworld serve` can also run the environment in Docker. Choose before the first agent episode runs, and record which.
+Model-generated actions run on his machine, in AppWorld's in-process shell, which restricts destructive modules by default. The path is `run_episode` → `LiveAppWorldSession` → `AppWorld(task_id)` → `world.execute` → `world.evaluate`. AppWorld's Docker or `appworld serve` mode is not used: it adds RPC, lifecycle, networking, and state management without changing the statistical experiment. Revisit only if the in-process executor causes an actual security or reliability problem.
 
 ## D21 — Canary served-result rule
 
