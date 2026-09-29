@@ -127,6 +127,10 @@ class BareCliExitTests(unittest.TestCase):
         completed = _bare("scripts/evaluation/compare_plan_kl.py")
         self.assertEqual(completed.returncode, 2)
 
+    def test_smoke_live_episode_exits_2(self) -> None:
+        completed = _bare("scripts/evaluation/smoke_live_episode.py")
+        self.assertEqual(completed.returncode, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
