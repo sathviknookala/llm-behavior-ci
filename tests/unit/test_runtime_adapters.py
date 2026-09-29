@@ -18,6 +18,7 @@ from llm_behavior_ci.runtime.agent import (
     bind_appworld_action_executor,
     build_appworld_executor,
     check_model_identity,
+    parse_logprobs,
     parse_model_output,
     reject_local_python_executor,
     resolve_action_interface,
@@ -118,7 +119,8 @@ def _completion_body(text: str = "STOP") -> dict[str, object]:
                 "logprobs": {
                     "content": [
                         {
-                            "token_id": 7,
+                            "token": "token_id:7",
+                            "bytes": [55],
                             "logprob": -0.5,
                             "top_logprobs": [],
                         }
@@ -208,10 +210,11 @@ class RuntimeAdapterTests(unittest.TestCase):
         payload = agent.completion_payload(agent.messages())
         self.assertEqual(payload["temperature"], 0.0)
         self.assertEqual(payload["seed"], 17)
-        extra = payload["extra_body"]
-        self.assertEqual(extra["top_k"], 20)
-        self.assertEqual(extra["min_p"], 0.0)
-        self.assertFalse(extra["chat_template_kwargs"]["enable_thinking"])
+        self.assertNotIn("extra_body", payload)
+        self.assertEqual(payload["top_k"], 20)
+        self.assertEqual(payload["min_p"], 0.0)
+        self.assertIs(payload["return_tokens_as_token_ids"], True)
+        self.assertFalse(payload["chat_template_kwargs"]["enable_thinking"])
         system = payload["messages"][0]["content"]
         self.assertIn("You are an AppWorld tool-using agent.", system)
         self.assertIn("Prompt registry id: prompt-v1", system)
@@ -284,31 +287,58 @@ class RuntimeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeUnavailable, "unsupported action_interface"):
             resolve_action_interface("shell")
 
-    def test_unsupported_serving_flags_are_rejected(self) -> None:
-        config = replace(
-            _config(),
-            model=replace(
-                _config().model,
-                serving=replace(_config().model.serving, batch_invariant=True),
-            ),
+    def test_serving_flags_are_left_to_the_launch_spec(self) -> None:
+        serving = replace(
+            _config().model.serving,
+            batch_invariant=True,
+            enforce_eager=True,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
         )
-        with self.assertRaisesRegex(
-            RuntimeUnavailable,
-            "serving.batch_invariant cannot be applied via chat completions",
-        ):
-            validate_chat_request(config)
+        config = replace(_config(), model=replace(_config().model, serving=serving))
+        validate_chat_request(config)
         agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
-        with self.assertRaisesRegex(RuntimeUnavailable, "batch_invariant"):
-            agent.begin(_context(), config)
-        eager = replace(
-            _config(),
-            model=replace(
-                _config().model,
-                serving=replace(_config().model.serving, enforce_eager=True),
+        agent.begin(_context(), config)
+        payload = agent.completion_payload(agent.messages())
+        self.assertNotIn("batch_invariant", payload)
+        self.assertNotIn("enable_chunked_prefill", payload)
+
+    def test_parse_logprobs_reads_vllm_token_id_strings(self) -> None:
+        choice = {
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "token_id:7",
+                        "bytes": [55],
+                        "logprob": -0.5,
+                        "top_logprobs": [
+                            {"token": "token_id:7", "bytes": [55], "logprob": -0.5},
+                            {"token": "token_id:9", "bytes": [57], "logprob": -1.5},
+                        ],
+                    }
+                ]
+            }
+        }
+        self.assertEqual(
+            parse_logprobs(choice),
+            (
+                (
+                    TokenLogprob(token_id=7, logprob=-0.5, rank=0),
+                    TokenLogprob(token_id=9, logprob=-1.5, rank=1),
+                ),
             ),
         )
-        with self.assertRaisesRegex(RuntimeUnavailable, "enforce_eager"):
-            validate_chat_request(eager)
+
+    def test_parse_logprobs_rejects_decoded_token_strings(self) -> None:
+        choice = {
+            "logprobs": {
+                "content": [
+                    {"token": "ok", "bytes": [111, 107], "logprob": -0.5, "top_logprobs": []}
+                ]
+            }
+        }
+        with self.assertRaisesRegex(RuntimeUnavailable, "token_id:<id>"):
+            parse_logprobs(choice)
 
     def test_model_identity_check_reports_unchecked_fields(self) -> None:
         config = _config()
@@ -376,13 +406,17 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertIs(prefix_body["add_generation_prompt"], True)
         self.assertEqual(prefix_body["messages"][-1]["role"], "user")
         body = posted[1][1]
-        self.assertEqual(body["max_tokens"], 0)
+        self.assertEqual(body["max_tokens"], 1)
         self.assertEqual(body["messages"][-1]["role"], "assistant")
         self.assertEqual(
             body["messages"][-1]["content"], "1. open the calendar\n2. book the slot"
         )
         self.assertNotEqual(body["max_tokens"], _config().agent.sampling.max_tokens)
-        self.assertIs(body["extra_body"]["return_token_ids"], True)
+        self.assertNotIn("extra_body", body)
+        self.assertIs(body["return_token_ids"], True)
+        self.assertIs(body["add_generation_prompt"], False)
+        self.assertEqual(body["prompt_logprobs"], _config().model.serving.max_logprobs)
+        self.assertFalse(body["chat_template_kwargs"]["enable_thinking"])
         self.assertEqual(
             logprobs,
             ((TokenLogprob(token_id=3, logprob=-0.25, rank=0),),),

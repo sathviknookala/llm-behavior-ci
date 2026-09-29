@@ -41,12 +41,7 @@ except ImportError:
 
 _CALL = re.compile(r"^CALL ([^ \n]+) ([^ \n]+)\n([\s\S]+)$")
 
-_REQUEST_UNSUPPORTED_SERVING_FLAGS = (
-    "batch_invariant",
-    "enforce_eager",
-    "enable_prefix_caching",
-    "enable_chunked_prefill",
-)
+_TOKEN_ID_PREFIX = "token_id:"
 
 _UNCHECKED_IDENTITY_FIELDS = (
     "weights_digest",
@@ -109,6 +104,32 @@ def parse_model_output(text: str) -> tuple[str | None, str | None, str | None]:
     return text, None, None
 
 
+def _logprob_token_id(entry: object) -> int:
+    """The token id of one vLLM chat logprob entry.
+
+    vLLM's chat logprob entries carry ``token``, ``bytes``, and ``logprob``
+    but no id field. ``completion_payload`` sets
+    ``return_tokens_as_token_ids``, which makes ``token`` the string
+    ``token_id:<id>``; any other shape fails closed.
+    """
+
+    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+    if not isinstance(entry, Mapping):
+        raise RuntimeUnavailable("token_id is missing")
+    token = entry.get("token")
+    if not isinstance(token, str) or not token.startswith(_TOKEN_ID_PREFIX):
+        raise RuntimeUnavailable(
+            "token_id is missing: logprob token is not a token_id:<id> string"
+        )
+    digits = token[len(_TOKEN_ID_PREFIX):]
+    if not digits.isdigit():
+        raise RuntimeUnavailable(
+            "token_id is missing: logprob token is not a token_id:<id> string"
+        )
+    return int(digits)
+
+
 def parse_logprobs(choice: Mapping[object, object]) -> tuple[tuple[TokenLogprob, ...], ...]:
     from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 
@@ -120,9 +141,7 @@ def parse_logprobs(choice: Mapping[object, object]) -> tuple[tuple[TokenLogprob,
         raise RuntimeUnavailable("token_id is missing")
     positions: list[tuple[TokenLogprob, ...]] = []
     for item in content:
-        if not isinstance(item, Mapping) or "token_id" not in item:
-            raise RuntimeUnavailable("token_id is missing")
-        chosen_id = int(item["token_id"])
+        chosen_id = _logprob_token_id(item)
         chosen_logprob = float(item["logprob"])
         alternatives = [
             TokenLogprob(token_id=chosen_id, logprob=chosen_logprob, rank=0)
@@ -133,9 +152,7 @@ def parse_logprobs(choice: Mapping[object, object]) -> tuple[tuple[TokenLogprob,
         if not isinstance(top, list):
             raise RuntimeUnavailable("token_id is missing")
         for alternative in top:
-            if not isinstance(alternative, Mapping) or "token_id" not in alternative:
-                raise RuntimeUnavailable("token_id is missing")
-            token_id = int(alternative["token_id"])
+            token_id = _logprob_token_id(alternative)
             if token_id in seen:
                 continue
             seen.add(token_id)
@@ -175,19 +192,15 @@ def reject_local_python_executor() -> None:
 
 
 def validate_chat_request(config: RunConfiguration) -> None:
-    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+    """Check the parts of a configuration a chat request itself carries.
+
+    Serving flags (``model.serving``) are applied when the server is
+    launched from ``runtime.launch_spec.build_vllm_launch_spec``, not per
+    request, so they are not checked here; ``check_model_identity`` lists
+    them as unchecked against the running server.
+    """
 
     resolve_action_interface(config.agent.action_interface)
-    serving = config.model.serving
-    for name in _REQUEST_UNSUPPORTED_SERVING_FLAGS:
-        if bool(getattr(serving, name)):
-            raise RuntimeUnavailable(
-                f"serving.{name} cannot be applied via chat completions"
-            )
-    if serving.tensor_parallel_size != 1:
-        raise RuntimeUnavailable(
-            "serving.tensor_parallel_size cannot be applied via chat completions"
-        )
 
 
 def check_model_identity(
@@ -474,6 +487,14 @@ class SmolagentsVLLMAgent(_SmolModel):
     def completion_payload(
         self, messages: list[dict[str, str]]
     ) -> dict[str, object]:
+        """The raw vLLM chat-completions body for one agent turn.
+
+        The body is posted as JSON, not through an OpenAI client, so vLLM's
+        extension fields (``top_k``, ``min_p``, ``chat_template_kwargs``,
+        ``return_tokens_as_token_ids``) sit at the top level; vLLM ignores a
+        literal ``extra_body`` key.
+        """
+
         state = self._state()
         validate_chat_request(state.config)
         sampling = state.config.agent.sampling
@@ -486,12 +507,11 @@ class SmolagentsVLLMAgent(_SmolModel):
             "logprobs": True,
             "top_logprobs": state.config.model.serving.max_logprobs,
             "messages": messages,
-            "extra_body": {
-                "top_k": sampling.top_k,
-                "min_p": sampling.min_p,
-                "chat_template_kwargs": {
-                    "enable_thinking": state.config.agent.prompt.thinking_enabled
-                },
+            "top_k": sampling.top_k,
+            "min_p": sampling.min_p,
+            "return_tokens_as_token_ids": True,
+            "chat_template_kwargs": {
+                "enable_thinking": state.config.agent.prompt.thinking_enabled
             },
         }
 
@@ -501,6 +521,14 @@ class SmolagentsVLLMAgent(_SmolModel):
         messages: list[dict[str, str]],
         plan_text: str,
     ) -> dict[str, object]:
+        """The raw vLLM body that scores a frozen plan as prompt tokens.
+
+        ``max_tokens`` is 1 because vLLM rejects 0; the one generated token
+        is not read. The scored positions come from ``prompt_logprobs`` and
+        ``prompt_token_ids``, requested with the other vLLM extension
+        fields at the top level.
+        """
+
         state = self._state()
         validate_chat_request(state.config)
         if plan_text == "":
@@ -515,20 +543,16 @@ class SmolagentsVLLMAgent(_SmolModel):
             "model": served_model_id(state.config),
             "temperature": sampling.temperature,
             "top_p": sampling.top_p,
-            "max_tokens": 0,
+            "max_tokens": 1,
             "seed": sampling.seed,
-            "logprobs": True,
-            "top_logprobs": state.config.model.serving.max_logprobs,
             "messages": forced_messages,
-            "extra_body": {
-                "top_k": sampling.top_k,
-                "min_p": sampling.min_p,
-                "prompt_logprobs": state.config.model.serving.max_logprobs,
-                "return_token_ids": True,
-                "add_generation_prompt": False,
-                "chat_template_kwargs": {
-                    "enable_thinking": state.config.agent.prompt.thinking_enabled
-                },
+            "top_k": sampling.top_k,
+            "min_p": sampling.min_p,
+            "prompt_logprobs": state.config.model.serving.max_logprobs,
+            "return_token_ids": True,
+            "add_generation_prompt": False,
+            "chat_template_kwargs": {
+                "enable_thinking": state.config.agent.prompt.thinking_enabled
             },
         }
 
