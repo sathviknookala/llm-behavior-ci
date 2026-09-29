@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from llm_behavior_ci.config import ModelConfiguration
 
 BATCH_INVARIANT_ENV = "VLLM_BATCH_INVARIANT"
+FLASHINFER_SAMPLER_ENV = "VLLM_USE_FLASHINFER_SAMPLER"
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,10 @@ def build_vllm_launch_spec(model: ModelConfiguration) -> VLLMLaunchSpec:
     ``"none"``. ``--enable-lora``/``--lora-modules`` are present only when
     ``model.lora`` is set, naming the adapter's revision-qualified
     repository as the served LoRA module. ``VLLM_BATCH_INVARIANT=1`` is
-    present in ``env`` only when ``serving.batch_invariant`` is true. Every
+    present in ``env`` only when ``serving.batch_invariant`` is true.
+    ``VLLM_USE_FLASHINFER_SAMPLER`` is always present, ``1`` for the
+    ``flashinfer`` sampler backend and ``0`` for ``native``, so the top-k/top-p
+    sampler never falls back to vLLM's default. Every
     other serving flag this function emits is unconditional, so the healthy
     reference configuration (no quantization, no LoRA, batch invariance
     off) always produces the same spec modulo those three optional pieces.
@@ -103,4 +107,10 @@ def build_vllm_launch_spec(model: ModelConfiguration) -> VLLMLaunchSpec:
     env: list[tuple[str, str]] = []
     if serving.batch_invariant:
         env.append((BATCH_INVARIANT_ENV, "1"))
+    env.append(
+        (
+            FLASHINFER_SAMPLER_ENV,
+            "1" if serving.sampler_backend == "flashinfer" else "0",
+        )
+    )
     return VLLMLaunchSpec(argv=tuple(argv), env=tuple(env))

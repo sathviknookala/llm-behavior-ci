@@ -12,6 +12,7 @@ from llm_behavior_ci.config import (
 )
 from llm_behavior_ci.runtime.launch_spec import (
     BATCH_INVARIANT_ENV,
+    FLASHINFER_SAMPLER_ENV,
     build_vllm_launch_spec,
 )
 
@@ -42,6 +43,7 @@ def _model(**overrides: object) -> ModelConfiguration:
             tensor_parallel_size=1,
             max_logprobs=20,
             batch_invariant=False,
+            sampler_backend="native",
         ),
     )
     return replace(base, **overrides) if overrides else base
@@ -54,7 +56,7 @@ class LaunchSpecTests(unittest.TestCase):
         self.assertNotIn("--quantization", spec.argv)
         self.assertNotIn("--enable-lora", spec.argv)
         self.assertNotIn("--enforce-eager", spec.argv)
-        self.assertEqual(spec.env, ())
+        self.assertEqual(spec.env, ((FLASHINFER_SAMPLER_ENV, "0"),))
 
     def test_quantization_method_reaches_the_launch_spec(self) -> None:
         quantized = _model(quantization=QuantizationSettings(method="fp8"))
@@ -69,12 +71,23 @@ class LaunchSpecTests(unittest.TestCase):
         serving = replace(_model().serving, batch_invariant=True)
         invariant = _model(serving=serving)
         spec = build_vllm_launch_spec(invariant)
-        self.assertEqual(spec.env, ((BATCH_INVARIANT_ENV, "1"),))
+        self.assertEqual(
+            spec.env,
+            ((BATCH_INVARIANT_ENV, "1"), (FLASHINFER_SAMPLER_ENV, "0")),
+        )
         self.assertNotIn("--batch-invariant", spec.argv)
 
         healthy = build_vllm_launch_spec(_model())
-        self.assertEqual(healthy.env, ())
+        self.assertEqual(healthy.env, ((FLASHINFER_SAMPLER_ENV, "0"),))
         self.assertEqual(spec.argv, healthy.argv)
+
+    def test_sampler_backend_sets_the_flashinfer_env_value_only(self) -> None:
+        serving = replace(_model().serving, sampler_backend="flashinfer")
+        flashinfer = build_vllm_launch_spec(_model(serving=serving))
+        native = build_vllm_launch_spec(_model())
+        self.assertEqual(flashinfer.env, ((FLASHINFER_SAMPLER_ENV, "1"),))
+        self.assertEqual(native.env, ((FLASHINFER_SAMPLER_ENV, "0"),))
+        self.assertEqual(flashinfer.argv, native.argv)
 
     def test_lora_adds_enable_lora_and_names_the_adapter(self) -> None:
         lora = LoRASettings(repository="org/adapter", revision=_LORA_REVISION)

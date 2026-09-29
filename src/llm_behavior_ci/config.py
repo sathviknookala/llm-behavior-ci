@@ -35,6 +35,7 @@ model.serving.enforce_eager
 model.serving.tensor_parallel_size
 model.serving.max_logprobs
 model.serving.batch_invariant
+model.serving.sampler_backend
 model.lora.repository
 model.lora.revision
 agent.smolagents_version
@@ -121,6 +122,7 @@ ACTION_INTERFACES = frozenset({"code", "tool_calling"})
 QUANTIZATION_METHODS = frozenset({"none", "fp8", "nvfp4"})
 MODEL_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 KV_CACHE_DTYPES = frozenset({"bfloat16", "float16", "fp8"})
+SAMPLER_BACKENDS = frozenset({"flashinfer", "native"})
 KL_FIDELITY_MODES = frozenset({"full", "top_k"})
 HASHED_FIELDS = frozenset(
     {
@@ -142,6 +144,7 @@ HASHED_FIELDS = frozenset(
         "model.serving.tensor_parallel_size",
         "model.serving.max_logprobs",
         "model.serving.batch_invariant",
+        "model.serving.sampler_backend",
         "model.lora.repository",
         "model.lora.revision",
         "agent.smolagents_version",
@@ -501,6 +504,7 @@ class VLLMBehaviorSettings:
     tensor_parallel_size: int
     max_logprobs: int
     batch_invariant: bool
+    sampler_backend: str
 
     def __post_init__(self) -> None:
         _choice(self.dtype, MODEL_DTYPES, "dtype")
@@ -515,6 +519,7 @@ class VLLMBehaviorSettings:
         _positive(self.tensor_parallel_size, "tensor_parallel_size")
         _positive(self.max_logprobs, "max_logprobs")
         _flag(self.batch_invariant, "batch_invariant")
+        _choice(self.sampler_backend, SAMPLER_BACKENDS, "sampler_backend")
 
     def to_dict(self) -> dict[str, object]:
         return _plain_dict(self, VLLMBehaviorSettings)

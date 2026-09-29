@@ -61,6 +61,7 @@ _REPLACEMENTS = {
     "model.serving.tensor_parallel_size": 2,
     "model.serving.max_logprobs": 21,
     "model.serving.batch_invariant": True,
+    "model.serving.sampler_backend": "flashinfer",
     "model.lora.repository": "org/adapter-other",
     "model.lora.revision": _OTHER_LORA_REVISION,
     "agent.smolagents_version": "1.22.1",
@@ -120,6 +121,7 @@ def _payload() -> dict[str, object]:
                 "tensor_parallel_size": 1,
                 "max_logprobs": 20,
                 "batch_invariant": False,
+                "sampler_backend": "native",
             },
             "lora": {
                 "repository": "org/adapter-base",
@@ -355,6 +357,7 @@ class ConfigurationTests(unittest.TestCase):
             "uppercase quantization": ("model.quantization.method", "FP8"),
             "auto dtype": ("model.serving.dtype", "auto"),
             "auto kv cache": ("model.serving.kv_cache_dtype", "auto"),
+            "unknown sampler": ("model.serving.sampler_backend", "triton"),
         }
         for label, (path, value) in cases.items():
             with self.subTest(case=label):

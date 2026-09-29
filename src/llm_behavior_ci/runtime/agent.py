@@ -56,6 +56,7 @@ _UNCHECKED_IDENTITY_FIELDS = (
     "model.serving.enforce_eager",
     "model.serving.tensor_parallel_size",
     "model.serving.batch_invariant",
+    "model.serving.sampler_backend",
     "model.quantization.method",
     "model.vllm_version",
     "model.lora.repository",

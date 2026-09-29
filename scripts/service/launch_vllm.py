@@ -12,7 +12,6 @@ from llm_behavior_ci.config import ConfigError, ModelConfiguration
 from llm_behavior_ci.runtime.launch_spec import build_vllm_launch_spec
 
 PTXAS_BLACKWELL_ENV = "TRITON_PTXAS_BLACKWELL_PATH"
-FLASHINFER_SAMPLER_ENV = "VLLM_USE_FLASHINFER_SAMPLER"
 
 
 def cuda_12_ptxas() -> Path | None:
@@ -30,7 +29,7 @@ def cuda_12_ptxas() -> Path | None:
 
 
 def machine_env(ptxas: Path) -> tuple[tuple[str, str], ...]:
-    return ((PTXAS_BLACKWELL_ENV, str(ptxas)), (FLASHINFER_SAMPLER_ENV, "0"))
+    return ((PTXAS_BLACKWELL_ENV, str(ptxas)),)
 
 
 def launch_command(

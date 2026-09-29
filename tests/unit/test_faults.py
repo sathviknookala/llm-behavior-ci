@@ -104,6 +104,7 @@ def _payload(task_set: TaskSet | None = None) -> dict[str, object]:
                 "tensor_parallel_size": 1,
                 "max_logprobs": 20,
                 "batch_invariant": False,
+                "sampler_backend": "native",
             },
         },
         "agent": {

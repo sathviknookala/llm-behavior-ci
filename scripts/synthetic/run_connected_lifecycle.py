@@ -296,6 +296,7 @@ def _config(task_set: TaskSet, *, run_seed: int = 7) -> RunConfiguration:
                     "tensor_parallel_size": 1,
                     "max_logprobs": 20,
                     "batch_invariant": False,
+                    "sampler_backend": "native",
                 },
             },
             "agent": {

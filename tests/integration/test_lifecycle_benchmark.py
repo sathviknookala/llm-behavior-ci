@@ -103,6 +103,7 @@ def _payload(*, split: str, task_set: TaskSet) -> dict[str, object]:
                 "tensor_parallel_size": 1,
                 "max_logprobs": 20,
                 "batch_invariant": False,
+                "sampler_backend": "native",
             },
         },
         "agent": {

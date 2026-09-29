@@ -24,7 +24,8 @@
       "enforce_eager": false,
       "tensor_parallel_size": 1,
       "max_logprobs": 20,
-      "batch_invariant": false
+      "batch_invariant": false,
+      "sampler_backend": "native"
     }
   },
   "agent": {
