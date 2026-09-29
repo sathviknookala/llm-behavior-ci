@@ -16,7 +16,7 @@ Time is not a constraint. Log GPU-hours per run anyway. They are part of the cos
 
 ## Stack
 
-The target stack boundary is Python 3.11+ (AppWorld's floor), vLLM for serving, smolagents for the agent loop, AppWorld for tasks, tools, state, and evaluation, FastAPI for the gateway, Hugging Face Transformers for full-vocabulary teacher-forced scoring, Postgres or DuckDB over Parquet for logs (`DECISIONS.md` D10), Prometheus, optional Grafana (`DECISIONS.md` D11), Docker Compose, and GitHub Actions. The current CPU suite is written with the standard-library `unittest` runner; pytest is pinned but unused.
+The target stack boundary is Python 3.11+ (AppWorld's floor), vLLM for serving, smolagents for the model and action interfaces (the episode loop is `run_episode`, `DECISIONS.md` D18), AppWorld for tasks, tools, state, and evaluation, FastAPI for the gateway, Hugging Face Transformers for full-vocabulary teacher-forced scoring, Postgres or DuckDB over Parquet for logs (`DECISIONS.md` D10), Prometheus, optional Grafana (`DECISIONS.md` D11), Docker Compose, and GitHub Actions. The current CPU suite is written with the standard-library `unittest` runner; pytest is pinned but unused.
 
 No custom CUDA or Triton kernels. No Kubernetes in the core. No custom simulated environment or tool set unless AppWorld integration requires it.
 

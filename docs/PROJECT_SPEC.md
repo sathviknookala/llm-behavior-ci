@@ -25,7 +25,7 @@ seeded AppWorld task stream (simulated users)
 |---|---|---|
 | Qwen model | upstream | The policy under test. The default is `DECISIONS.md` D7 |
 | vLLM | upstream | Serves each configuration's model with an OpenAI-compatible API, top-k log-probabilities, teacher-forced prompt log-probabilities, and `/metrics` |
-| smolagents | upstream | The agent loop: builds model calls, parses actions, and hands them to AppWorld for execution. It does not execute actions itself |
+| smolagents | upstream | The model and action interfaces the episode loop calls: `smolagents.Model` for each turn's vLLM call and the `PythonExecutor`/`Tool` shapes that hand actions to AppWorld. The loop itself is this repo's `run_episode` (`DECISIONS.md` D18). It does not execute actions itself |
 | AppWorld | upstream | Task instructions, per-task initial database state, the app APIs, state mutations, and the evaluator. It is the only source of task outcomes |
 | Gateway | this repo | Accepts task requests, resolves the production or candidate configuration, starts one AppWorld world per episode, runs the agent, pairs canary episodes, executes rollback, and logs every step |
 | Configuration registry | this repo | Versioned production and candidate configurations: model revision, quantization, serving flags, prompt, plan-trace format, agent-runtime settings. Each has a hash that travels in every log row |
