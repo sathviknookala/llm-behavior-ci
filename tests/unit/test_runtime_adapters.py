@@ -118,6 +118,7 @@ def _completion_body(text: str = "STOP") -> dict[str, object]:
         "choices": [
             {
                 "message": {"content": text},
+                "token_ids": [7],
                 "logprobs": {
                     "content": [
                         {
@@ -307,6 +308,7 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_parse_logprobs_reads_vllm_token_id_strings(self) -> None:
         choice = {
+            "token_ids": [7],
             "logprobs": {
                 "content": [
                     {

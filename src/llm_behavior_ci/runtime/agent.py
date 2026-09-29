@@ -155,6 +155,18 @@ def parse_logprobs(choice: Mapping[object, object]) -> tuple[tuple[TokenLogprob,
             )
             rank += 1
         positions.append(tuple(alternatives))
+    token_ids = choice.get("token_ids")
+    if not isinstance(token_ids, list):
+        raise RuntimeUnavailable("token_ids is missing")
+    if len(token_ids) != len(content):
+        raise RuntimeUnavailable(
+            "token_ids and logprobs.content length differ"
+        )
+    for index, position in enumerate(positions):
+        if int(token_ids[index]) != position[0].token_id:
+            raise RuntimeUnavailable(
+                f"rank-0 token_id does not match token_ids at position {index}"
+            )
     return tuple(positions)
 
 
@@ -481,8 +493,8 @@ class SmolagentsVLLMAgent(_SmolModel):
 
         The body is posted as JSON, not through an OpenAI client, so vLLM's
         extension fields (``top_k``, ``min_p``, ``chat_template_kwargs``,
-        ``return_tokens_as_token_ids``) sit at the top level; vLLM ignores a
-        literal ``extra_body`` key.
+        ``return_tokens_as_token_ids``, ``return_token_ids``) sit at the top
+        level; vLLM ignores a literal ``extra_body`` key.
         """
 
         state = self._state()
@@ -500,6 +512,7 @@ class SmolagentsVLLMAgent(_SmolModel):
             "top_k": sampling.top_k,
             "min_p": sampling.min_p,
             "return_tokens_as_token_ids": True,
+            "return_token_ids": True,
             "chat_template_kwargs": {
                 "enable_thinking": state.config.agent.prompt.thinking_enabled
             },
