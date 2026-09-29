@@ -1,0 +1,9 @@
+{
+  "appworld_version": "0.1.3.post1",
+  "split": "train",
+  "selection_rule": "deterministic_sample",
+  "selection_seed": 17,
+  "task_count": 90,
+  "task_set_hash": "4817cce24cd197fbd70b4faee310361a8e9d62b867af3f6a791daed59059dfc9",
+  "scenario_count": 30
+}
