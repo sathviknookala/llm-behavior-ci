@@ -33,6 +33,7 @@ from pathlib import Path
 
 from llm_behavior_ci.config import (
     CanarySettings,
+    ConfigError,
     DistributionalMonitorSettings,
     GateSettings,
     MonitorSettings,
@@ -328,7 +329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 0
-    except ProtocolError as error:
+    except (ProtocolError, ConfigError, KeyError, TypeError, ValueError) as error:
         print(str(error) or "protocol lock failed", file=sys.stderr)
         return 1
 
