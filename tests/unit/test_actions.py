@@ -84,6 +84,21 @@ class ActionParserTests(unittest.TestCase):
         self.assertIn("apis.supervisor.complete_task(...)", text)
         self.assertIn("Pass every argument by keyword.", text)
         self.assertIn("Do not repeat a call that just failed.", text)
+        self.assertIn(
+            "When an app requires authentication, obtain credentials through "
+            "the documented AppWorld and supervisor APIs.",
+            text,
+        )
+        self.assertIn(
+            "Do not guess usernames, passwords, access tokens, IDs, or other "
+            "credentials.",
+            text,
+        )
+        self.assertIn(
+            "Reuse credential and token values returned by earlier API calls "
+            "when a later call requires them.",
+            text,
+        )
         self.assertNotIn("CALL <app> <api>", text)
         self.assertNotIn("STOP", text)
         legacy = render_system_text(
@@ -94,6 +109,7 @@ class ActionParserTests(unittest.TestCase):
             mode="execute",
         )
         self.assertIn("CALL <app> <api>", legacy)
+        self.assertNotIn("Do not guess usernames", legacy)
 
 
 if __name__ == "__main__":

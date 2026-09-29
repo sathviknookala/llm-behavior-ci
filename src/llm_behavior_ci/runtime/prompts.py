@@ -40,6 +40,12 @@ _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
             "Follow the task instruction and the API documentation.\n"
             "Mutate state only through AppWorld-executed actions.\n"
             "Do not invent APIs that are absent from the documentation.\n"
+            "When an app requires authentication, obtain credentials through "
+            "the documented AppWorld and supervisor APIs.\n"
+            "Do not guess usernames, passwords, access tokens, IDs, or other "
+            "credentials.\n"
+            "Reuse credential and token values returned by earlier API calls "
+            "when a later call requires them.\n"
         ),
     ),
 }
