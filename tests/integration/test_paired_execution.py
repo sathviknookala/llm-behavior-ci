@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import unittest
+import unittest.mock
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,11 @@ from llm_behavior_ci.config import RunConfiguration, StreamSettings, new_run_ide
 from llm_behavior_ci.records import RecordError, assert_public_payload
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.aa_capture import (
+    AllowedGpuProcess,
+    GpuBusy,
+    GpuProcess,
     GpuSnapshot,
+    assert_gpu_processes_allowed,
     capture_aa,
     format_summary,
     main,
@@ -867,7 +872,12 @@ class AACaptureTests(unittest.TestCase):
             plan.plan_scoring_inputs.reference_steps[0][0][0],
             (7, -0.2),
         )
+        self.assertIsNotNone(plan.teacher_forced_plan_kl)
+        assert plan.teacher_forced_plan_kl is not None
+        self.assertIsNone(plan.teacher_forced_plan_kl.mean_kl_nats)
+        self.assertIsNone(plan.teacher_forced_plan_kl.frozen_plan_text)
         self.assertIsNone(execute.plan_scoring_inputs)
+        self.assertIsNone(execute.teacher_forced_plan_kl)
         self.assertTrue(execute.evaluator_disagreement)
         self.assertEqual(execute.reference_requirement_fraction, 1.0)
         self.assertEqual(execute.candidate_requirement_fraction, 0.0)
@@ -972,9 +982,22 @@ class AACaptureTests(unittest.TestCase):
         self.assertEqual(idle.memory_used_mib, 100)
         self.assertEqual(idle.memory_total_mib, 24576)
         self.assertEqual(idle.process_count, 0)
+        self.assertEqual(idle.processes, ())
         busy = parse_gpu_snapshot("100, 24576\n200, 24576\n", "42\n99\n")
         self.assertEqual(busy.memory_used_mib, 100)
         self.assertEqual(busy.process_count, 2)
+        self.assertEqual(
+            busy.processes,
+            (GpuProcess(pid=42), GpuProcess(pid=99)),
+        )
+        named = parse_gpu_snapshot(
+            "20000, 24576\n",
+            "3897887, VLLM::EngineCore\n",
+        )
+        self.assertEqual(
+            named.processes,
+            (GpuProcess(pid=3897887, name="VLLM::EngineCore"),),
+        )
         with self.assertRaises(RuntimeUnavailable):
             parse_gpu_snapshot("", "")
         with self.assertRaises(RuntimeUnavailable):
@@ -995,6 +1018,7 @@ class AACaptureTests(unittest.TestCase):
                 memory_used_mib=20000,
                 memory_total_mib=24576,
                 process_count=1,
+                processes=(GpuProcess(pid=42, name="other"),),
             )
 
         with self.assertRaisesRegex(RuntimeError, "compute processes"):
@@ -1022,6 +1046,264 @@ class AACaptureTests(unittest.TestCase):
                 observe_hardware=False,
             )
         self.assertEqual(started["n"], 0)
+
+    def test_expected_gpu_process_allowance(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+        baseline = GpuProcess(pid=3897887, name="VLLM::EngineCore")
+        snapshots = [
+            GpuSnapshot(
+                memory_used_mib=19922,
+                memory_total_mib=24576,
+                process_count=1,
+                processes=(baseline,),
+            ),
+            GpuSnapshot(
+                memory_used_mib=19950,
+                memory_total_mib=24576,
+                process_count=1,
+                processes=(baseline,),
+            ),
+        ]
+        calls = {"n": 0}
+
+        def probe() -> GpuSnapshot:
+            index = min(calls["n"], len(snapshots) - 1)
+            calls["n"] += 1
+            return snapshots[index]
+
+        by_pid = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False),
+            observe_hardware=True,
+            gpu_probe=probe,
+            allowed_gpu_processes=(AllowedGpuProcess(pid=3897887),),
+        )
+        self.assertFalse(by_pid.cost.hardware_observed)
+        self.assertEqual(by_pid.cost.source, "probe")
+        self.assertEqual(by_pid.cost.initial, snapshots[0])
+        self.assertEqual(by_pid.cost.final, snapshots[1])
+        self.assertEqual(by_pid.cost.initial.process_count, 1)
+        self.assertEqual(by_pid.cost.allowed_processes, (baseline,))
+        self.assertNotEqual(by_pid.cost.initial.process_count, 0)
+
+        calls["n"] = 0
+        by_name = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False),
+            observe_hardware=True,
+            gpu_probe=probe,
+            allowed_gpu_processes=(AllowedGpuProcess(name="VLLM::EngineCore"),),
+        )
+        self.assertEqual(by_name.cost.allowed_processes, (baseline,))
+        self.assertEqual(by_name.cost.initial.process_count, 1)
+
+        with self.assertRaises(GpuBusy):
+            assert_gpu_processes_allowed(
+                GpuSnapshot(
+                    memory_used_mib=19922,
+                    memory_total_mib=24576,
+                    process_count=2,
+                    processes=(
+                        baseline,
+                        GpuProcess(pid=99, name="unexpected"),
+                    ),
+                ),
+                (AllowedGpuProcess(pid=3897887),),
+            )
+        with self.assertRaises(GpuBusy):
+            assert_gpu_processes_allowed(
+                GpuSnapshot(
+                    memory_used_mib=19922,
+                    memory_total_mib=24576,
+                    process_count=1,
+                    processes=(baseline,),
+                ),
+                (),
+            )
+        self.assertEqual(
+            assert_gpu_processes_allowed(
+                GpuSnapshot(
+                    memory_used_mib=100,
+                    memory_total_mib=24576,
+                    process_count=0,
+                ),
+                (),
+            ),
+            (),
+        )
+        with self.assertRaises(GpuBusy):
+            assert_gpu_processes_allowed(
+                GpuSnapshot(
+                    memory_used_mib=19922,
+                    memory_total_mib=24576,
+                    process_count=1,
+                    processes=(GpuProcess(pid=1, name="python"),),
+                ),
+                (AllowedGpuProcess(name="VLLM::EngineCore"),),
+            )
+
+    def test_hardware_observed_only_for_nvidia_smi_source(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+        idle = GpuSnapshot(memory_used_mib=100, memory_total_mib=24576, process_count=0)
+        calls = {"n": 0}
+
+        def probe() -> GpuSnapshot:
+            calls["n"] += 1
+            return idle
+
+        probed = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("execute",),
+            runtime_factory=self._factory(diverge=False),
+            observe_hardware=True,
+            gpu_probe=probe,
+        )
+        self.assertFalse(probed.cost.hardware_observed)
+        self.assertEqual(probed.cost.source, "probe")
+        self.assertIsNotNone(probed.cost.initial)
+        self.assertIsNotNone(probed.cost.final)
+
+        from llm_behavior_ci.runtime import aa_capture as module
+
+        with unittest.mock.patch.object(
+            module,
+            "read_nvidia_smi_snapshot",
+            side_effect=[idle, idle],
+        ):
+            observed = capture_aa(
+                config,
+                arrivals,
+                task_set_hash=task_set.task_set_hash,
+                repetitions=1,
+                concurrency=1,
+                modes=("execute",),
+                runtime_factory=self._factory(diverge=False),
+                observe_hardware=True,
+            )
+        self.assertTrue(observed.cost.hardware_observed)
+        self.assertEqual(observed.cost.source, "nvidia-smi")
+        self.assertEqual(observed.cost.initial, idle)
+        self.assertEqual(observed.cost.final, idle)
+
+    def test_teacher_forced_plan_kl_uses_shared_frozen_plan(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+        forced_plans: list[str] = []
+
+        class TeacherForceAgent(PairAgent):
+            def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
+                del tool_output
+                return [{"role": "user", "content": "emit a plan"}]
+
+            def teacher_force_plan(
+                self,
+                *,
+                messages: list[dict[str, str]],
+                plan_text: str,
+            ) -> tuple[tuple[TokenLogprob, ...], ...]:
+                del messages
+                forced_plans.append(plan_text)
+                if len(forced_plans) == 1:
+                    return (
+                        (
+                            TokenLogprob(token_id=1, logprob=-0.1, rank=0),
+                            TokenLogprob(token_id=2, logprob=-2.3, rank=1),
+                        ),
+                    )
+                return (
+                    (
+                        TokenLogprob(token_id=1, logprob=-0.4, rank=0),
+                        TokenLogprob(token_id=2, logprob=-1.1, rank=1),
+                    ),
+                )
+
+        def factory(mode: str) -> RuntimeDependencies:
+            clock = Clock()
+            return RuntimeDependencies(
+                session_factory=lambda task_id: World(task_id, f"state:{task_id}"),
+                agent=TeacherForceAgent(clock, mode=mode, diverge=True),
+                clock=clock,
+            )
+
+        result = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("plan",),
+            runtime_factory=factory,
+            observe_hardware=False,
+        )
+        record = result.records[0]
+        self.assertIsNotNone(record.plan_scoring_inputs)
+        assert record.plan_scoring_inputs is not None
+        self.assertEqual(
+            record.plan_scoring_inputs.reference_plan_text,
+            "1. reference step",
+        )
+        self.assertEqual(
+            record.plan_scoring_inputs.candidate_plan_text,
+            "1. candidate step",
+        )
+        self.assertNotEqual(
+            record.plan_scoring_inputs.reference_plan_text,
+            record.plan_scoring_inputs.candidate_plan_text,
+        )
+        self.assertEqual(forced_plans, ["1. reference step", "1. reference step"])
+        self.assertIsNotNone(record.teacher_forced_plan_kl)
+        assert record.teacher_forced_plan_kl is not None
+        self.assertEqual(
+            record.teacher_forced_plan_kl.frozen_plan_text,
+            "1. reference step",
+        )
+        self.assertIsNotNone(record.teacher_forced_plan_kl.mean_kl_nats)
+        self.assertIsNotNone(record.teacher_forced_plan_kl.position_kl_nats)
+        self.assertIsNotNone(record.teacher_forced_plan_kl.reference_top_k)
+        self.assertIsNotNone(record.teacher_forced_plan_kl.candidate_top_k)
+        summary = format_summary(result)
+        self.assertNotIn("1. reference step", summary)
+        self.assertNotIn("frozen_plan_text", summary)
+
+    def test_teacher_forced_plan_kl_missing_without_teacher_force(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
+        config = _stream_config(task_set)
+        result = capture_aa(
+            config,
+            arrivals,
+            task_set_hash=task_set.task_set_hash,
+            repetitions=1,
+            concurrency=1,
+            modes=("plan",),
+            runtime_factory=self._factory(diverge=True),
+            observe_hardware=False,
+        )
+        record = result.records[0]
+        self.assertIsNotNone(record.teacher_forced_plan_kl)
+        assert record.teacher_forced_plan_kl is not None
+        self.assertIsNone(record.teacher_forced_plan_kl.mean_kl_nats)
+        self.assertIsNone(record.teacher_forced_plan_kl.frozen_plan_text)
+        self.assertIsNone(record.teacher_forced_plan_kl.reference_top_k)
 
     def test_local_capture_is_not_a_public_result(self) -> None:
         task_set = _task_set()
