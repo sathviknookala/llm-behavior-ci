@@ -24,6 +24,11 @@ from llm_behavior_ci.runtime.episode import (
     evaluator_difference,
     run_pair,
 )
+from llm_behavior_ci.runtime.prompts import (
+    UnknownPromptVersion,
+    resolve_plan_format_template,
+    resolve_prompt_template,
+)
 from llm_behavior_ci.stats.bootstrap import clustered_paired_bootstrap
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 
@@ -283,6 +288,17 @@ def live_fault_available(fault: FaultSpec) -> LiveFaultAvailability:
             available=False,
             reason=_LIVE_UNAVAILABLE_REASONS[fault.control],
         )
+    for patch in fault.patches:
+        if patch.path == "agent.prompt.prompt_version":
+            try:
+                resolve_prompt_template(str(patch.value))
+            except UnknownPromptVersion as error:
+                return LiveFaultAvailability(available=False, reason=str(error))
+        elif patch.path == "agent.prompt.plan_format_version":
+            try:
+                resolve_plan_format_template(str(patch.value))
+            except UnknownPromptVersion as error:
+                return LiveFaultAvailability(available=False, reason=str(error))
     return LiveFaultAvailability(available=True, reason=None)
 
 

@@ -749,6 +749,9 @@ class FaultCatalogTests(unittest.TestCase):
         docs_live = live_fault_available(by_id["api_documentation_one_app"])
         self.assertTrue(docs_live.available)
         self.assertIsNone(docs_live.reason)
+        prompt_live = live_fault_available(by_id["prompt_remove_api_guidance"])
+        self.assertTrue(prompt_live.available)
+        self.assertIsNone(prompt_live.reason)
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             code = main(["--catalog", str(_CATALOG)])
@@ -758,6 +761,43 @@ class FaultCatalogTests(unittest.TestCase):
         self.assertIn("lora_off_distribution:1\tlora\tlive_unavailable", text)
         self.assertIn("api_documentation_one_app:1\tapi_documentation\tlive", text)
         self.assertIn("sampling_temperature_one:1\tsampling\tlive", text)
+
+    def test_unregistered_prompt_version_fault_is_unavailable(self) -> None:
+        fault = FaultSpec(
+            fault_id="prompt_unknown_version",
+            version="1",
+            kind="prompt",
+            patches=(
+                FaultPatch(
+                    path="agent.prompt.prompt_version",
+                    value="prompt-does-not-exist",
+                ),
+            ),
+        )
+        availability = live_fault_available(fault)
+        self.assertFalse(availability.available)
+        self.assertIsNotNone(availability.reason)
+
+    def test_prompt_remove_api_guidance_changes_rendered_system_text(self) -> None:
+        from llm_behavior_ci.runtime.prompts import render_system_text
+
+        baseline = render_system_text(
+            prompt_version="prompt-v1",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="execute",
+        )
+        stripped = render_system_text(
+            prompt_version="prompt-no-api-guidance",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="execute",
+        )
+        self.assertNotEqual(baseline, stripped)
+        self.assertIn("API documentation", baseline)
+        self.assertNotIn("API documentation", stripped)
 
 
 if __name__ == "__main__":

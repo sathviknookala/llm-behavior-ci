@@ -25,6 +25,14 @@ _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
             "Do not invent APIs that are absent from the documentation.\n"
         ),
     ),
+    "prompt-no-api-guidance": PromptTemplate(
+        version="prompt-no-api-guidance",
+        system_body=(
+            "You are an AppWorld tool-using agent.\n"
+            "Follow the task instruction.\n"
+            "Mutate state only through AppWorld-executed actions.\n"
+        ),
+    ),
 }
 
 _PLAN_FORMAT_REGISTRY: dict[str, PlanFormatTemplate] = {
