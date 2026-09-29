@@ -607,45 +607,90 @@ class SmolagentsVLLMAgent(_SmolModel):
             api_name=api_name,
         )
 
+    def plan_prefix_payload(
+        self,
+        *,
+        messages: list[dict[str, str]],
+    ) -> dict[str, object]:
+        """Build the ``/tokenize`` request for the prompt that precedes the plan.
+
+        The prefix is the conversation plus the assistant generation header,
+        rendered with the same chat-template arguments as the forced request,
+        so its tokens are the positions that come before the first plan token.
+        """
+
+        state = self._state()
+        return {
+            "model": served_model_id(state.config),
+            "messages": list(messages),
+            "add_generation_prompt": True,
+            "chat_template_kwargs": {
+                "enable_thinking": state.config.agent.prompt.thinking_enabled
+            },
+        }
+
     def teacher_force_plan(
         self,
         *,
         messages: list[dict[str, str]],
         plan_text: str,
     ) -> tuple[tuple[TokenLogprob, ...], ...]:
+        """Score only the forced plan tokens, not the shared prompt before them.
+
+        Tokenizes the prompt without the plan, requires the forced request's
+        ``prompt_token_ids`` to start with exactly those tokens, and returns
+        positions from that boundary on: the plan tokens and the chat
+        template's end-of-turn tokens after them. A prefix mismatch fails
+        closed, because the plan boundary would be unknown.
+        """
+
         from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 
         payload = self.teacher_force_payload(messages=messages, plan_text=plan_text)
+        prefix = self._post(self.plan_prefix_payload(messages=messages), path="/tokenize")
+        prefix_tokens = prefix.get("tokens")
+        if (
+            not isinstance(prefix_tokens, list)
+            or not prefix_tokens
+            or not all(isinstance(token, int) for token in prefix_tokens)
+        ):
+            raise RuntimeUnavailable(
+                "endpoint did not return prompt tokens for the plan prefix"
+            )
         raw = self._post(payload)
-        choices = raw.get("choices")
-        if not isinstance(choices, list) or not choices:
+        prompt_logprobs = raw.get("prompt_logprobs")
+        prompt_token_ids = raw.get("prompt_token_ids")
+        if not isinstance(prompt_logprobs, list):
             raise RuntimeUnavailable(
-                "teacher-forced plan logprobs are unavailable from the endpoint"
+                "endpoint did not return prompt logprobs for the frozen plan"
             )
-        choice = choices[0]
-        if not isinstance(choice, Mapping):
+        if not isinstance(prompt_token_ids, list):
             raise RuntimeUnavailable(
-                "teacher-forced plan logprobs are unavailable from the endpoint"
+                "endpoint did not return prompt_token_ids; the forced token at "
+                "each position cannot be identified"
             )
-        if choice.get("logprobs") is None and "prompt_logprobs" not in raw:
+        boundary = len(prefix_tokens)
+        if (
+            len(prompt_token_ids) <= boundary
+            or [int(token) for token in prompt_token_ids[:boundary]] != prefix_tokens
+        ):
             raise RuntimeUnavailable(
-                "endpoint did not return prompt or echo logprobs for the frozen plan"
+                "forced prompt does not start with the plan prefix tokens; "
+                "the plan boundary cannot be located"
             )
-        if "prompt_logprobs" in raw:
-            prompt_logprobs = raw["prompt_logprobs"]
-            if not isinstance(prompt_logprobs, list):
-                raise RuntimeUnavailable(
-                    "endpoint did not return prompt or echo logprobs for the frozen plan"
-                )
-            return _parse_prompt_logprobs(prompt_logprobs, raw.get("prompt_token_ids"))
-        return parse_logprobs(choice)
+        return _parse_prompt_logprobs(prompt_logprobs, prompt_token_ids, start=boundary)
 
-    def _post(self, payload: dict[str, object]) -> dict[str, object]:
+    def _post(
+        self,
+        payload: dict[str, object],
+        *,
+        path: str = "/v1/chat/completions",
+    ) -> dict[str, object]:
         from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
-            f"{self._base_url}/v1/chat/completions",
+            f"{self._base_url}{path}",
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -660,6 +705,8 @@ class SmolagentsVLLMAgent(_SmolModel):
 def _parse_prompt_logprobs(
     prompt_logprobs: list[object],
     prompt_token_ids: object,
+    *,
+    start: int = 0,
 ) -> tuple[tuple[TokenLogprob, ...], ...]:
     """Parse vLLM's ``prompt_logprobs`` into per-position ``TokenLogprob`` tuples.
 
@@ -671,7 +718,8 @@ def _parse_prompt_logprobs(
     alternatives are ordered by ascending token id, a canonical,
     model-independent order so that two teacher-forced calls over the
     same support compare as aligned regardless of how each model ranks
-    its own probabilities.
+    its own probabilities. Positions before ``start`` are validated but not
+    returned; position 0 is the only one allowed to carry no logprobs.
     """
 
     from llm_behavior_ci.runtime.episode import RuntimeUnavailable
@@ -690,7 +738,11 @@ def _parse_prompt_logprobs(
         zip(prompt_logprobs, prompt_token_ids)
     ):
         if item is None:
-            continue
+            if index == 0:
+                continue
+            raise RuntimeUnavailable(
+                f"endpoint returned no prompt logprobs at position {index}"
+            )
         if not isinstance(item, Mapping):
             raise RuntimeUnavailable(
                 "endpoint did not return prompt or echo logprobs for the frozen plan"
@@ -708,6 +760,8 @@ def _parse_prompt_logprobs(
             raise RuntimeUnavailable(
                 f"forced token is missing from returned logprobs at position {index}"
             )
+        if index < start:
+            continue
         alternatives = [
             TokenLogprob(
                 token_id=forced_token_id,

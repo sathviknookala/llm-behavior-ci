@@ -327,89 +327,126 @@ class RuntimeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeUnavailable, "served model id"):
             check_model_identity(config, {"id": "other/model", "root": "other/model"})
 
-    def test_teacher_force_plan_posts_frozen_plan_not_max_tokens_generation(
+    def _teacher_force(
         self,
-    ) -> None:
+        forced: dict[str, object],
+        prefix_tokens: object,
+        posted: list[tuple[str, dict[str, object]]] | None = None,
+    ) -> tuple[tuple[TokenLogprob, ...], ...]:
         agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
         agent.begin(_context(), _config())
-        posted: list[dict[str, object]] = []
 
         def fake_urlopen(request, timeout=None):
             del timeout
             payload = json.loads(request.data.decode("utf-8"))
-            posted.append(payload)
-            return _FakeResponse(
-                {
-                    "choices": [
-                        {
-                            "message": {"content": ""},
-                            "logprobs": {
-                                "content": [
-                                    {
-                                        "token_id": 3,
-                                        "logprob": -0.25,
-                                        "top_logprobs": [],
-                                    }
-                                ]
-                            },
-                        }
-                    ]
-                }
+            if posted is not None:
+                posted.append((request.full_url, payload))
+            if request.full_url.endswith("/tokenize"):
+                return _FakeResponse({"tokens": prefix_tokens, "count": 0})
+            return _FakeResponse(forced)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            return agent.teacher_force_plan(
+                messages=[
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "plan please"},
+                ],
+                plan_text="1. open the calendar\n2. book the slot",
             )
 
-        messages = [
-            {"role": "system", "content": "system"},
-            {"role": "user", "content": "plan please"},
-        ]
-        plan_text = "1. open the calendar\n2. book the slot"
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            logprobs = agent.teacher_force_plan(
-                messages=messages,
-                plan_text=plan_text,
-            )
-        self.assertEqual(len(posted), 1)
-        body = posted[0]
+    def test_teacher_force_plan_posts_frozen_plan_not_max_tokens_generation(
+        self,
+    ) -> None:
+        posted: list[tuple[str, dict[str, object]]] = []
+        logprobs = self._teacher_force(
+            {
+                "choices": [{"message": {"content": ""}, "logprobs": None}],
+                "prompt_token_ids": [11, 3],
+                "prompt_logprobs": [None, {"3": {"logprob": -0.25}}],
+            },
+            [11],
+            posted,
+        )
+        urls = [url for url, _ in posted]
+        self.assertEqual(
+            urls,
+            ["http://127.0.0.1:9/tokenize", "http://127.0.0.1:9/v1/chat/completions"],
+        )
+        prefix_body = posted[0][1]
+        self.assertIs(prefix_body["add_generation_prompt"], True)
+        self.assertEqual(prefix_body["messages"][-1]["role"], "user")
+        body = posted[1][1]
         self.assertEqual(body["max_tokens"], 0)
         self.assertEqual(body["messages"][-1]["role"], "assistant")
-        self.assertEqual(body["messages"][-1]["content"], plan_text)
+        self.assertEqual(
+            body["messages"][-1]["content"], "1. open the calendar\n2. book the slot"
+        )
         self.assertNotEqual(body["max_tokens"], _config().agent.sampling.max_tokens)
+        self.assertIs(body["extra_body"]["return_token_ids"], True)
         self.assertEqual(
             logprobs,
             ((TokenLogprob(token_id=3, logprob=-0.25, rank=0),),),
         )
-        self.assertIs(body["extra_body"]["return_token_ids"], True)
+
+    def test_teacher_force_plan_returns_only_positions_after_the_prompt_prefix(
+        self,
+    ) -> None:
+        logprobs = self._teacher_force(
+            {
+                "choices": [{"message": {"content": ""}, "logprobs": None}],
+                "prompt_token_ids": [11, 12, 13, 7, 8],
+                "prompt_logprobs": [
+                    None,
+                    {"12": {"logprob": -1.0}},
+                    {"13": {"logprob": -2.0}},
+                    {"7": {"logprob": -0.3}},
+                    {"8": {"logprob": -0.6}},
+                ],
+            },
+            [11, 12, 13],
+        )
+        self.assertEqual(
+            logprobs,
+            (
+                (TokenLogprob(token_id=7, logprob=-0.3, rank=0),),
+                (TokenLogprob(token_id=8, logprob=-0.6, rank=0),),
+            ),
+        )
+
+    def test_teacher_force_plan_prefix_mismatch_is_runtime_unavailable(self) -> None:
+        forced = {
+            "choices": [{"message": {"content": ""}, "logprobs": None}],
+            "prompt_token_ids": [11, 12, 7],
+            "prompt_logprobs": [None, {"12": {"logprob": -1.0}}, {"7": {"logprob": -0.3}}],
+        }
+        with self.assertRaisesRegex(RuntimeUnavailable, "plan boundary"):
+            self._teacher_force(forced, [11, 99])
+        with self.assertRaisesRegex(RuntimeUnavailable, "plan boundary"):
+            self._teacher_force(forced, [11, 12, 7])
+        with self.assertRaisesRegex(RuntimeUnavailable, "plan prefix"):
+            self._teacher_force(forced, [])
 
     def test_teacher_force_plan_uses_prompt_token_ids_to_identify_the_forced_token(
         self,
     ) -> None:
-        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
-        agent.begin(_context(), _config())
-
-        def fake_urlopen(request, timeout=None):
-            del request, timeout
-            return _FakeResponse(
-                {
-                    "choices": [{"message": {"content": ""}, "logprobs": None}],
-                    "prompt_token_ids": [11, 3, 9],
-                    "prompt_logprobs": [
-                        None,
-                        {
-                            "3": {"logprob": -0.25, "rank": 2},
-                            "5": {"logprob": -0.1, "rank": 1},
-                            "1": {"logprob": -3.0, "rank": 3},
-                        },
-                        {
-                            "9": {"logprob": -0.4, "rank": 1},
-                        },
-                    ],
-                }
-            )
-
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            logprobs = agent.teacher_force_plan(
-                messages=[{"role": "user", "content": "plan"}],
-                plan_text="1. open the calendar",
-            )
+        logprobs = self._teacher_force(
+            {
+                "choices": [{"message": {"content": ""}, "logprobs": None}],
+                "prompt_token_ids": [11, 3, 9],
+                "prompt_logprobs": [
+                    None,
+                    {
+                        "3": {"logprob": -0.25, "rank": 2},
+                        "5": {"logprob": -0.1, "rank": 1},
+                        "1": {"logprob": -3.0, "rank": 3},
+                    },
+                    {
+                        "9": {"logprob": -0.4, "rank": 1},
+                    },
+                ],
+            },
+            [11],
+        )
         self.assertEqual(
             logprobs,
             (
@@ -425,53 +462,40 @@ class RuntimeAdapterTests(unittest.TestCase):
     def test_teacher_force_plan_without_prompt_token_ids_is_runtime_unavailable(
         self,
     ) -> None:
-        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
-        agent.begin(_context(), _config())
-
-        def fake_urlopen(request, timeout=None):
-            del request, timeout
-            return _FakeResponse(
+        with self.assertRaises(RuntimeUnavailable):
+            self._teacher_force(
                 {
                     "choices": [{"message": {"content": ""}, "logprobs": None}],
-                    "prompt_logprobs": [
-                        None,
-                        {"3": {"logprob": -0.25, "rank": 1}},
-                    ],
-                }
+                    "prompt_logprobs": [None, {"3": {"logprob": -0.25, "rank": 1}}],
+                },
+                [11],
             )
-
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            with self.assertRaises(RuntimeUnavailable):
-                agent.teacher_force_plan(
-                    messages=[{"role": "user", "content": "plan"}],
-                    plan_text="1. open the calendar",
-                )
 
     def test_teacher_force_plan_missing_forced_token_is_runtime_unavailable(
         self,
     ) -> None:
-        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
-        agent.begin(_context(), _config())
-
-        def fake_urlopen(request, timeout=None):
-            del request, timeout
-            return _FakeResponse(
+        with self.assertRaises(RuntimeUnavailable):
+            self._teacher_force(
                 {
                     "choices": [{"message": {"content": ""}, "logprobs": None}],
                     "prompt_token_ids": [11, 3],
-                    "prompt_logprobs": [
-                        None,
-                        {"5": {"logprob": -0.1, "rank": 1}},
-                    ],
-                }
+                    "prompt_logprobs": [None, {"5": {"logprob": -0.1, "rank": 1}}],
+                },
+                [11],
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            with self.assertRaises(RuntimeUnavailable):
-                agent.teacher_force_plan(
-                    messages=[{"role": "user", "content": "plan"}],
-                    plan_text="1. open the calendar",
-                )
+    def test_teacher_force_plan_none_position_after_zero_is_runtime_unavailable(
+        self,
+    ) -> None:
+        with self.assertRaises(RuntimeUnavailable):
+            self._teacher_force(
+                {
+                    "choices": [{"message": {"content": ""}, "logprobs": None}],
+                    "prompt_token_ids": [11, 3, 9],
+                    "prompt_logprobs": [None, None, {"9": {"logprob": -0.4, "rank": 1}}],
+                },
+                [11],
+            )
 
     def test_concurrent_begins_isolate_history(self) -> None:
         agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
