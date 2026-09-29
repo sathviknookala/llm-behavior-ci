@@ -25,6 +25,24 @@ from llm_behavior_ci.experiments.faults import (
     load_fault_catalog,
     measure_harm,
 )
+from llm_behavior_ci.experiments.benchmark import (
+    BenchmarkError,
+    BenchmarkProgress,
+    BenchmarkResult,
+    CanaryTierOutcome,
+    GateTierOutcome,
+    MonitorTierOutcome,
+    ReplicateOutcome,
+    run_lifecycle_benchmark,
+)
+from llm_behavior_ci.experiments.replay import (
+    ReplayError,
+    ReplayResult,
+    ReplaySchedule,
+    monitoring_detector_factories,
+    replay_detectors,
+    replay_result_public_dict,
+)
 from llm_behavior_ci.experiments.validation import (
     AAContext,
     AADependenceReport,
@@ -55,6 +73,10 @@ from llm_behavior_ci.experiments.validation import (
 
 __all__ = [
     "AAContext",
+    "BenchmarkError",
+    "BenchmarkProgress",
+    "BenchmarkResult",
+    "CanaryTierOutcome",
     "AADependenceReport",
     "AAStudyRow",
     "BaselineOutcome",
@@ -62,6 +84,7 @@ __all__ = [
     "FaultError",
     "FaultPatch",
     "FaultSpec",
+    "GateTierOutcome",
     "HarmLabel",
     "HarmStudyReport",
     "KLApproximationReport",
@@ -69,10 +92,15 @@ __all__ = [
     "ImplementedMethod",
     "MethodSpec",
     "MethodValidationStatus",
+    "MonitorTierOutcome",
     "ProtocolError",
     "ProtocolLock",
     "ProtocolSettings",
     "ReferenceCase",
+    "ReplayError",
+    "ReplayResult",
+    "ReplaySchedule",
+    "ReplicateOutcome",
     "StudyBudget",
     "ValidationError",
     "ValidationReport",
@@ -92,7 +120,11 @@ __all__ = [
     "measure_harm",
     "method_spec",
     "minimum_checks",
+    "monitoring_detector_factories",
     "reference_library_status",
+    "replay_detectors",
+    "replay_result_public_dict",
     "require_protocol_lock",
+    "run_lifecycle_benchmark",
     "validate_method",
 ]

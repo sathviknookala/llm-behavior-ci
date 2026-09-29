@@ -6,11 +6,14 @@
 
 `evaluation/validate_method.py` validates one method from a JSON spec. `evaluation/compare_plan_kl.py` scores a supplied full-vocabulary sample at an explicit top-k. `evaluation/assess_harm_study.py` reports harm-study feasibility from explicit margin, variance, sample sizes, and optional evaluator outcomes. `evaluation/characterize_harm.py` applies a versioned fault diff and can freeze a dev harm label from execute-mode pairs. Each writes outside `results/` or refuses that path, and does not read `nvidia-smi` or start AppWorld or vLLM. A passing local run is not a committed null check, truncation floor, power result, or frozen harm label. A caller-supplied margin is not a protocol harm margin.
 
-The other subdirectories are still placeholders:
+`evaluation/lock_protocol.py` records caller-supplied settings. With no arguments it exits 2. A lock is not pre-registration.
 
-- `data/`: AppWorld install checks, deterministic task-set selection, and manifest entry points.
-- `service/`: gateway, vLLM, and configuration lifecycle entry points.
-- `replay/`: task-stream launchers.
-- `benchmark/`: pre-registered benchmark launchers and analysis.
+`service/serve.py` starts the FastAPI gateway. With missing required arguments it exits 2 and refuses a store path under a directory named `results`. There is no live AppWorld episode, load run, Compose stack, or vLLM environment.
 
-No service, replay, or benchmark launcher exists yet. The harm-study and validity commands plan from supplied inputs. They do not measure an AppWorld baseline or a live truncation floor.
+`benchmark/run_lifecycle_benchmark.py` runs `run_lifecycle_benchmark` for caller-supplied faults and a caller-supplied `ProtocolLock`. With no arguments it exits 2. It requires `--protocol`, one or more `--fault`, `--train-tasks`, `--test-normal-tasks`, `--baselines`, `--checkpoint`, optional `--export`, and env `LLM_BEHAVIOR_CI_RUNTIME` as `module:function` returning `RuntimeDependencies`. Checkpoint and export paths under a directory named `results` are refused. It prints `{"status": ...}` and exits 0 only when status is `completed`, else 1 on a handled failure. The GitHub workflow does not check this script. A harness run on injected tasks is not the frozen `test_normal` benchmark. `BenchmarkResult.gpu_memory_mib` and `gpu_hours` stay None.
+
+`replay/replay_detectors.py` runs `replay_detectors` on one frozen observation sequence. With no arguments it exits 2. It requires `--observations`, `--schedule`, `--factories`, and `--output`. Any of those paths under a directory named `results` is refused. It writes a public JSON document and does not start an agent. The GitHub workflow does not check this script.
+
+`data/` is still a placeholder for AppWorld install checks, deterministic task-set selection, and manifest entry points.
+
+The harm-study and validity commands plan from supplied inputs. They do not measure an AppWorld baseline or a live truncation floor.

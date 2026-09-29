@@ -1,0 +1,1671 @@
+"""Lifecycle benchmark over the production gate, canary, and monitor.
+
+Thresholds and stopping rules come from the protocol lock. Task ids, frozen
+baselines, and checkpoints are caller-supplied and are not protocol fields.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from llm_behavior_ci.config import (
+    CanarySettings,
+    GateSettings,
+    MonitorSettings,
+    RunConfiguration,
+    StreamSettings,
+    new_run_identity,
+    run_configuration_hash,
+)
+from llm_behavior_ci.experiments.faults import FaultError, FaultSpec, HarmLabel, apply_fault
+from llm_behavior_ci.experiments.protocol import (
+    ProtocolError,
+    ProtocolLock,
+    admit_test_normal,
+    bind_protocol,
+)
+from llm_behavior_ci.export import AggregateResults, ExportError, export_public_results
+from llm_behavior_ci.lifecycle.canary import CanaryController, CanaryDecision
+from llm_behavior_ci.lifecycle.monitoring import (
+    FrozenReference,
+    ProductionMonitor,
+    TaskMetadata,
+    observation_from_episode,
+)
+from llm_behavior_ci.lifecycle.offline_gate import GateDecision, GateExecutionError, run_offline_gate
+from llm_behavior_ci.records import (
+    AggregateRecord,
+    LifecycleDecision,
+    MonitorObservation,
+    PairedResult,
+    StatisticalEvidence,
+)
+from llm_behavior_ci.runtime.episode import (
+    PairExecution,
+    RuntimeDependencies,
+    pair_execution,
+    restore_pair_execution,
+    run_episode,
+    run_pair,
+)
+from llm_behavior_ci.tasks.selection import TaskSet
+from llm_behavior_ci.tasks.streams import generate_stream
+
+
+class BenchmarkError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class BenchmarkProgress:
+    """Resume cursor without task identity."""
+
+    fault_version: str
+    replicate_seed: int
+    tier: str
+    stream_index: int
+
+    def __post_init__(self) -> None:
+        if self.tier not in {"gate", "canary", "monitor"}:
+            raise BenchmarkError("tier must be gate, canary, or monitor")
+        if not isinstance(self.stream_index, int) or isinstance(self.stream_index, bool):
+            raise BenchmarkError("stream_index must be an integer")
+        if self.stream_index < 0:
+            raise BenchmarkError("stream_index must be nonnegative")
+
+
+@dataclass(frozen=True)
+class GateTierOutcome:
+    status: str
+    reason: str | None
+    outcome: str | None
+    classification: str | None
+    compute_seconds: float | None
+    public_decision: LifecycleDecision | None
+    statistics: tuple[StatisticalEvidence, ...]
+
+
+@dataclass(frozen=True)
+class CanaryTierOutcome:
+    status: str
+    reason: str | None
+    rollback_delay_episodes: int | None
+    candidate_episodes_served: int | None
+    candidate_episodes_failed: int | None
+    served_before_rollback: int | None
+    in_flight_at_rollback: int | None
+    compute_seconds: float | None
+    public_decision: LifecycleDecision | None
+
+
+@dataclass(frozen=True)
+class MonitorTierOutcome:
+    status: str
+    reason: str | None
+    delay_episodes: int | None
+    miss: bool
+    false_alarm: bool
+    compute_seconds: float | None
+
+
+@dataclass(frozen=True)
+class ReplicateOutcome:
+    fault_version: str
+    replicate_seed: int
+    harmful: bool
+    gate: GateTierOutcome
+    canary: CanaryTierOutcome
+    monitor: MonitorTierOutcome
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    status: str
+    replicates: tuple[ReplicateOutcome, ...]
+    gate_catch_count: int
+    gate_false_block_count: int
+    mean_canary_rollback_delay: float | None
+    candidate_episodes_served: int
+    candidate_episodes_failed: int
+    mean_monitor_delay: float | None
+    monitor_miss_count: int
+    monitor_false_alarm_count: int
+    canary_not_reached_count: int
+    monitor_not_reached_count: int
+    compute_seconds: float
+    gpu_memory_mib: float | None
+    gpu_hours: float | None
+
+
+@dataclass(frozen=True)
+class _CanaryGateView:
+    """Duck-typed PASS gate for canary start with test_normal hashes.
+
+    Offline-gate hashes are train hashes; CanaryController.start requires the
+    controller configuration hashes. The PASS outcome is preserved from the
+    train gate; hashes are taken from the admitted test_normal configs.
+    """
+
+    outcome: str
+    reason_codes: tuple[str, ...]
+    reference_configuration_hash: str
+    candidate_configuration_hash: str
+    task_set_hash: str
+    reference_protocol_hash: str | None
+    candidate_protocol_hash: str | None
+
+
+def _under_results(path: Path) -> bool:
+    for parent in path.resolve().parents:
+        if parent.name == "results":
+            return True
+    return False
+
+
+def _refuse_results_path(path: Path, label: str) -> None:
+    if _under_results(Path(path)):
+        raise BenchmarkError(f"{label} must not be under results")
+
+
+def _require_mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise BenchmarkError(f"{name} must be an object")
+    return value
+
+
+def _seeds_from_lock(protocol: ProtocolLock) -> tuple[int, ...]:
+    raw = protocol.payload.get("seeds")
+    if isinstance(raw, bool) or not isinstance(raw, (list, tuple)) or not raw:
+        raise BenchmarkError("protocol seeds must be a non-empty sequence of integers")
+    seeds: list[int] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise BenchmarkError("protocol seeds must be a non-empty sequence of integers")
+        seeds.append(item)
+    return tuple(seeds)
+
+
+def _settings_from_lock(
+    protocol: ProtocolLock,
+) -> tuple[GateSettings, CanarySettings, MonitorSettings, StreamSettings]:
+    try:
+        gate = GateSettings.from_dict(protocol.payload["gate"])
+        canary = CanarySettings.from_dict(protocol.payload["canary"])
+        monitor = MonitorSettings.from_dict(protocol.payload["monitor"])
+        stream = StreamSettings.from_dict(protocol.payload["stream"])
+    except Exception as error:
+        raise BenchmarkError("protocol lock settings are invalid") from error
+    return gate, canary, monitor, stream
+
+
+def _templates_by_split(
+    protocol: ProtocolLock,
+) -> tuple[RunConfiguration, RunConfiguration]:
+    train: list[RunConfiguration] = []
+    test_normal: list[RunConfiguration] = []
+    for configuration in protocol.configurations:
+        if configuration.task.split == "train":
+            train.append(configuration)
+        elif configuration.task.split == "test_normal":
+            test_normal.append(configuration)
+    if len(train) != 1:
+        raise BenchmarkError("protocol lock requires exactly one train configuration")
+    if len(test_normal) != 1:
+        raise BenchmarkError(
+            "protocol lock requires exactly one test_normal configuration"
+        )
+    return train[0], test_normal[0]
+
+
+def _harm_label_for(protocol: ProtocolLock, fault_version: str) -> HarmLabel:
+    raw = protocol.payload.get("harm_labels")
+    if not isinstance(raw, list):
+        raise BenchmarkError("protocol harm_labels must be a list")
+    for item in raw:
+        mapping = _require_mapping(item, "harm label")
+        if mapping.get("fault_version") != fault_version:
+            continue
+        try:
+            return HarmLabel(
+                fault_version=str(mapping["fault_version"]),
+                base_configuration_hash=str(mapping["base_configuration_hash"]),
+                candidate_configuration_hash=str(
+                    mapping["candidate_configuration_hash"]
+                ),
+                task_set_hash=str(mapping["task_set_hash"]),
+                effect_estimate=float(mapping["effect_estimate"]),
+                interval_low=float(mapping["interval_low"]),
+                interval_high=float(mapping["interval_high"]),
+                margin=float(mapping["margin"]),
+                harmful=bool(mapping["harmful"]),
+                split=str(mapping["split"]),
+                confidence_level=float(mapping["confidence_level"]),
+                resamples=int(mapping["resamples"]),
+                seed=int(mapping["seed"]),
+            )
+        except (FaultError, KeyError, TypeError, ValueError) as error:
+            raise BenchmarkError("harm label is invalid") from error
+    raise BenchmarkError(f"missing harm label for {fault_version}")
+
+
+def _stream_for_seed(base: StreamSettings, seed: int) -> StreamSettings:
+    return StreamSettings(
+        split=base.split,
+        selection_rule=base.selection_rule,
+        selection_seed=base.selection_seed,
+        task_set_hash=base.task_set_hash,
+        stream_seed=seed,
+        arrival_rate_per_second=base.arrival_rate_per_second,
+        concurrency=base.concurrency,
+        with_replacement=base.with_replacement,
+        task_mix_rule=base.task_mix_rule,
+    )
+
+
+def _validate_task_bindings(
+    *,
+    train_template: RunConfiguration,
+    test_normal_template: RunConfiguration,
+    train_tasks: TaskSet,
+    test_normal_tasks: TaskSet,
+    stream: StreamSettings,
+) -> None:
+    if train_template.task.task_set_hash != train_tasks.task_set_hash:
+        raise BenchmarkError("train task_set_hash does not match train_tasks")
+    if test_normal_template.task.task_set_hash != test_normal_tasks.task_set_hash:
+        raise BenchmarkError(
+            "test_normal task_set_hash does not match test_normal_tasks"
+        )
+    if stream.split != test_normal_tasks.split:
+        raise BenchmarkError("stream split must match test_normal_tasks")
+    if stream.selection_rule != test_normal_tasks.selection_rule:
+        raise BenchmarkError("stream selection_rule must match test_normal_tasks")
+    if stream.selection_seed != test_normal_tasks.selection_seed:
+        raise BenchmarkError("stream selection_seed must match test_normal_tasks")
+    if stream.task_set_hash != test_normal_tasks.task_set_hash:
+        raise BenchmarkError("stream task_set_hash must match test_normal_tasks")
+
+
+def _not_representable_gate() -> GateTierOutcome:
+    return GateTierOutcome(
+        status="not_representable",
+        reason=None,
+        outcome=None,
+        classification=None,
+        compute_seconds=None,
+        public_decision=None,
+        statistics=(),
+    )
+
+
+def _not_representable_canary() -> CanaryTierOutcome:
+    return CanaryTierOutcome(
+        status="not_representable",
+        reason=None,
+        rollback_delay_episodes=None,
+        candidate_episodes_served=None,
+        candidate_episodes_failed=None,
+        served_before_rollback=None,
+        in_flight_at_rollback=None,
+        compute_seconds=None,
+        public_decision=None,
+    )
+
+
+def _not_representable_monitor() -> MonitorTierOutcome:
+    return MonitorTierOutcome(
+        status="not_representable",
+        reason=None,
+        delay_episodes=None,
+        miss=False,
+        false_alarm=False,
+        compute_seconds=None,
+    )
+
+
+def _not_reached_canary(reason: str) -> CanaryTierOutcome:
+    return CanaryTierOutcome(
+        status="not_reached",
+        reason=reason,
+        rollback_delay_episodes=None,
+        candidate_episodes_served=None,
+        candidate_episodes_failed=None,
+        served_before_rollback=None,
+        in_flight_at_rollback=None,
+        compute_seconds=None,
+        public_decision=None,
+    )
+
+
+def _not_reached_monitor(reason: str) -> MonitorTierOutcome:
+    return MonitorTierOutcome(
+        status="not_reached",
+        reason=reason,
+        delay_episodes=None,
+        miss=False,
+        false_alarm=False,
+        compute_seconds=None,
+    )
+
+
+def _gate_classification(outcome: str, harmful: bool) -> str | None:
+    if outcome != "BLOCK":
+        return None
+    if harmful:
+        return "catch"
+    return "false_block"
+
+
+def _gate_decision_to_dict(decision: GateDecision) -> dict[str, object]:
+    return {
+        "outcome": decision.outcome,
+        "reason_codes": list(decision.reason_codes),
+        "reference_configuration_hash": decision.reference_configuration_hash,
+        "candidate_configuration_hash": decision.candidate_configuration_hash,
+        "task_set_hash": decision.task_set_hash,
+        "reference_protocol_hash": decision.reference_protocol_hash,
+        "candidate_protocol_hash": decision.candidate_protocol_hash,
+        "thresholds": decision.thresholds.to_dict(),
+        "statistics": [item.to_dict() for item in decision.statistics],
+        "public_decision": (
+            decision.public_decision.to_dict()
+            if decision.public_decision is not None
+            else None
+        ),
+    }
+
+
+def _gate_decision_from_dict(payload: Mapping[str, object]) -> GateDecision:
+    statistics_raw = payload.get("statistics")
+    if not isinstance(statistics_raw, list):
+        raise BenchmarkError("checkpoint gate statistics are invalid")
+    statistics = tuple(StatisticalEvidence.from_dict(item) for item in statistics_raw)
+    public_raw = payload.get("public_decision")
+    public_decision = (
+        None if public_raw is None else LifecycleDecision.from_dict(public_raw)
+    )
+    reason_codes = payload.get("reason_codes")
+    if not isinstance(reason_codes, list):
+        raise BenchmarkError("checkpoint gate reason_codes are invalid")
+    return GateDecision(
+        outcome=str(payload["outcome"]),
+        reason_codes=tuple(str(item) for item in reason_codes),
+        reference_configuration_hash=str(payload["reference_configuration_hash"]),
+        candidate_configuration_hash=str(payload["candidate_configuration_hash"]),
+        task_set_hash=str(payload["task_set_hash"]),
+        reference_protocol_hash=(
+            None
+            if payload.get("reference_protocol_hash") is None
+            else str(payload["reference_protocol_hash"])
+        ),
+        candidate_protocol_hash=(
+            None
+            if payload.get("candidate_protocol_hash") is None
+            else str(payload["candidate_protocol_hash"])
+        ),
+        thresholds=GateSettings.from_dict(payload["thresholds"]),
+        statistics=statistics,
+        public_decision=public_decision,
+    )
+
+
+def _pair_execution_to_dict(record: PairExecution) -> dict[str, object]:
+    return {
+        "pair_id": record.pair_id,
+        "execution_order": list(record.execution_order),
+        "reference_episode_id": record.reference_episode_id,
+        "candidate_episode_id": record.candidate_episode_id,
+        "reference_seed": record.reference_seed,
+        "candidate_seed": record.candidate_seed,
+        "reference_run_seed": record.reference_run_seed,
+        "candidate_run_seed": record.candidate_run_seed,
+        "initial_state_identity": record.initial_state_identity,
+    }
+
+
+def _pair_execution_from_dict(payload: Mapping[str, object]) -> PairExecution:
+    order = payload.get("execution_order")
+    if not isinstance(order, list) or len(order) != 2:
+        raise BenchmarkError("checkpoint pair execution order is invalid")
+    return PairExecution(
+        pair_id=str(payload["pair_id"]),
+        execution_order=(str(order[0]), str(order[1])),
+        reference_episode_id=str(payload["reference_episode_id"]),
+        candidate_episode_id=str(payload["candidate_episode_id"]),
+        reference_seed=int(payload["reference_seed"]),
+        candidate_seed=int(payload["candidate_seed"]),
+        reference_run_seed=int(payload["reference_run_seed"]),
+        candidate_run_seed=int(payload["candidate_run_seed"]),
+        initial_state_identity=str(payload["initial_state_identity"]),
+    )
+
+
+def _lifecycle_decision_to_dict(
+    decision: LifecycleDecision | None,
+) -> dict[str, object] | None:
+    if decision is None:
+        return None
+    return decision.to_dict()
+
+
+def _lifecycle_decision_from_dict(payload: object) -> LifecycleDecision | None:
+    if payload is None:
+        return None
+    return LifecycleDecision.from_dict(payload)
+
+
+def _load_checkpoint(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"replicates": {}}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise BenchmarkError("checkpoint is not readable JSON") from error
+    if not isinstance(document, dict):
+        raise BenchmarkError("checkpoint must be an object")
+    replicates = document.get("replicates")
+    if replicates is None:
+        document["replicates"] = {}
+        return document
+    if not isinstance(replicates, dict):
+        raise BenchmarkError("checkpoint replicates must be an object")
+    return document
+
+
+def _write_checkpoint(path: Path, document: Mapping[str, object]) -> None:
+    _refuse_results_path(path, "checkpoint_path")
+    if not path.parent.is_dir():
+        raise BenchmarkError("checkpoint parent directory does not exist")
+    temporary = path.parent / (path.name + ".tmp")
+    try:
+        text = json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+            default=str,
+        )
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BenchmarkError:
+        raise
+    except Exception as error:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+        raise BenchmarkError("checkpoint write failed") from error
+
+
+def _replicate_key(fault_version: str, seed: int) -> str:
+    return f"{fault_version}|{seed}"
+
+
+def _gate_outcome_from_decision(
+    decision: GateDecision,
+    *,
+    harmful: bool,
+    compute_seconds: float,
+) -> GateTierOutcome:
+    return GateTierOutcome(
+        status="completed",
+        reason=None,
+        outcome=decision.outcome,
+        classification=_gate_classification(decision.outcome, harmful),
+        compute_seconds=compute_seconds,
+        public_decision=decision.public_decision,
+        statistics=decision.statistics,
+    )
+
+
+def _canary_outcome_from_decision(
+    decision: CanaryDecision,
+    *,
+    compute_seconds: float,
+) -> CanaryTierOutcome:
+    snapshot = decision.snapshot
+    if decision.action == "promote":
+        return CanaryTierOutcome(
+            status="promoted",
+            reason=None,
+            rollback_delay_episodes=None,
+            candidate_episodes_served=snapshot.candidate_episodes_served,
+            candidate_episodes_failed=snapshot.candidate_episodes_failed,
+            served_before_rollback=None,
+            in_flight_at_rollback=None,
+            compute_seconds=compute_seconds,
+            public_decision=decision.public_decision,
+        )
+    if decision.action == "rollback":
+        return CanaryTierOutcome(
+            status="completed",
+            reason=None,
+            rollback_delay_episodes=snapshot.candidate_episodes_served,
+            candidate_episodes_served=snapshot.candidate_episodes_served,
+            candidate_episodes_failed=snapshot.candidate_episodes_failed,
+            served_before_rollback=snapshot.served_before_rollback,
+            in_flight_at_rollback=snapshot.in_flight_at_rollback,
+            compute_seconds=compute_seconds,
+            public_decision=decision.public_decision,
+        )
+    raise BenchmarkError("canary finished without rollback or promote")
+
+
+def _serialize_canary_outcome(outcome: CanaryTierOutcome) -> dict[str, object]:
+    return {
+        "status": outcome.status,
+        "reason": outcome.reason,
+        "rollback_delay_episodes": outcome.rollback_delay_episodes,
+        "candidate_episodes_served": outcome.candidate_episodes_served,
+        "candidate_episodes_failed": outcome.candidate_episodes_failed,
+        "served_before_rollback": outcome.served_before_rollback,
+        "in_flight_at_rollback": outcome.in_flight_at_rollback,
+        "compute_seconds": outcome.compute_seconds,
+        "public_decision": _lifecycle_decision_to_dict(outcome.public_decision),
+    }
+
+
+def _serialize_monitor_outcome(outcome: MonitorTierOutcome) -> dict[str, object]:
+    return {
+        "status": outcome.status,
+        "reason": outcome.reason,
+        "delay_episodes": outcome.delay_episodes,
+        "miss": outcome.miss,
+        "false_alarm": outcome.false_alarm,
+        "compute_seconds": outcome.compute_seconds,
+    }
+
+
+def _serialize_replicate(outcome: ReplicateOutcome) -> dict[str, object]:
+    return {
+        "fault_version": outcome.fault_version,
+        "replicate_seed": outcome.replicate_seed,
+        "harmful": outcome.harmful,
+        "gate": {
+            "status": outcome.gate.status,
+            "reason": outcome.gate.reason,
+            "outcome": outcome.gate.outcome,
+            "classification": outcome.gate.classification,
+            "compute_seconds": outcome.gate.compute_seconds,
+            "public_decision": _lifecycle_decision_to_dict(
+                outcome.gate.public_decision
+            ),
+            "statistics": [item.to_dict() for item in outcome.gate.statistics],
+        },
+        "canary": _serialize_canary_outcome(outcome.canary),
+        "monitor": _serialize_monitor_outcome(outcome.monitor),
+    }
+
+
+def _deserialize_replicate(payload: Mapping[str, object]) -> ReplicateOutcome:
+    gate = _require_mapping(payload["gate"], "gate outcome")
+    canary = _require_mapping(payload["canary"], "canary outcome")
+    monitor = _require_mapping(payload["monitor"], "monitor outcome")
+    statistics_raw = gate.get("statistics")
+    if not isinstance(statistics_raw, list):
+        statistics_raw = []
+    return ReplicateOutcome(
+        fault_version=str(payload["fault_version"]),
+        replicate_seed=int(payload["replicate_seed"]),
+        harmful=bool(payload["harmful"]),
+        gate=GateTierOutcome(
+            status=str(gate["status"]),
+            reason=None if gate.get("reason") is None else str(gate["reason"]),
+            outcome=None if gate.get("outcome") is None else str(gate["outcome"]),
+            classification=(
+                None
+                if gate.get("classification") is None
+                else str(gate["classification"])
+            ),
+            compute_seconds=(
+                None
+                if gate.get("compute_seconds") is None
+                else float(gate["compute_seconds"])
+            ),
+            public_decision=_lifecycle_decision_from_dict(gate.get("public_decision")),
+            statistics=tuple(
+                StatisticalEvidence.from_dict(item) for item in statistics_raw
+            ),
+        ),
+        canary=CanaryTierOutcome(
+            status=str(canary["status"]),
+            reason=None if canary.get("reason") is None else str(canary["reason"]),
+            rollback_delay_episodes=canary.get("rollback_delay_episodes"),
+            candidate_episodes_served=canary.get("candidate_episodes_served"),
+            candidate_episodes_failed=canary.get("candidate_episodes_failed"),
+            served_before_rollback=canary.get("served_before_rollback"),
+            in_flight_at_rollback=canary.get("in_flight_at_rollback"),
+            compute_seconds=(
+                None
+                if canary.get("compute_seconds") is None
+                else float(canary["compute_seconds"])
+            ),
+            public_decision=_lifecycle_decision_from_dict(
+                canary.get("public_decision")
+            ),
+        ),
+        monitor=MonitorTierOutcome(
+            status=str(monitor["status"]),
+            reason=None if monitor.get("reason") is None else str(monitor["reason"]),
+            delay_episodes=monitor.get("delay_episodes"),
+            miss=bool(monitor.get("miss", False)),
+            false_alarm=bool(monitor.get("false_alarm", False)),
+            compute_seconds=(
+                None
+                if monitor.get("compute_seconds") is None
+                else float(monitor["compute_seconds"])
+            ),
+        ),
+    )
+
+
+def _monitor_horizon(settings: MonitorSettings) -> int:
+    return max(rule.horizon_episodes for rule in settings.stopping_rules)
+
+
+def _is_complete_replicate(item: ReplicateOutcome) -> bool:
+    if item.gate.status == "not_representable":
+        return True
+    if item.gate.status != "completed":
+        return False
+    if item.canary.status == "not_reached":
+        return item.monitor.status == "not_reached"
+    if item.canary.status == "completed":
+        return item.monitor.status == "not_reached"
+    if item.canary.status == "promoted":
+        return item.monitor.status == "completed"
+    return False
+
+
+def _aggregate(replicates: Sequence[ReplicateOutcome], *, status: str) -> BenchmarkResult:
+    scored = [item for item in replicates if _is_complete_replicate(item)]
+    gate_catch = 0
+    gate_false_block = 0
+    rollback_delays: list[int] = []
+    served = 0
+    failed = 0
+    monitor_delays: list[int] = []
+    misses = 0
+    false_alarms = 0
+    canary_not_reached = 0
+    monitor_not_reached = 0
+    compute = 0.0
+
+    for item in scored:
+        if item.gate.classification == "catch":
+            gate_catch += 1
+        elif item.gate.classification == "false_block":
+            gate_false_block += 1
+        if item.canary.status == "not_reached":
+            canary_not_reached += 1
+        if item.monitor.status == "not_reached":
+            monitor_not_reached += 1
+        if item.canary.status in {"completed", "promoted"}:
+            if item.canary.candidate_episodes_served is not None:
+                served += item.canary.candidate_episodes_served
+            if item.canary.candidate_episodes_failed is not None:
+                failed += item.canary.candidate_episodes_failed
+        if (
+            item.canary.status == "completed"
+            and item.canary.rollback_delay_episodes is not None
+        ):
+            rollback_delays.append(item.canary.rollback_delay_episodes)
+        if item.monitor.status == "completed":
+            if item.monitor.delay_episodes is not None:
+                monitor_delays.append(item.monitor.delay_episodes)
+            if item.monitor.miss:
+                misses += 1
+            if item.monitor.false_alarm:
+                false_alarms += 1
+        for tier in (item.gate, item.canary, item.monitor):
+            if tier.compute_seconds is not None:
+                compute += tier.compute_seconds
+
+    return BenchmarkResult(
+        status=status,
+        replicates=tuple(replicates),
+        gate_catch_count=gate_catch,
+        gate_false_block_count=gate_false_block,
+        mean_canary_rollback_delay=(
+            sum(rollback_delays) / len(rollback_delays) if rollback_delays else None
+        ),
+        candidate_episodes_served=served,
+        candidate_episodes_failed=failed,
+        mean_monitor_delay=(
+            sum(monitor_delays) / len(monitor_delays) if monitor_delays else None
+        ),
+        monitor_miss_count=misses,
+        monitor_false_alarm_count=false_alarms,
+        canary_not_reached_count=canary_not_reached,
+        monitor_not_reached_count=monitor_not_reached,
+        compute_seconds=compute,
+        gpu_memory_mib=None,
+        gpu_hours=None,
+    )
+
+
+def _export_aggregates(
+    result: BenchmarkResult,
+    *,
+    train_bound: RunConfiguration,
+    test_normal_bound: RunConfiguration,
+    train_tasks: TaskSet,
+    test_normal_tasks: TaskSet,
+) -> AggregateResults:
+    train_hash = run_configuration_hash(train_bound)
+    test_hash = run_configuration_hash(test_normal_bound)
+    aggregates: list[AggregateRecord] = []
+
+    def add(
+        *,
+        split: str,
+        configuration_hash: str,
+        task_set_hash: str,
+        metric: str,
+        value: float,
+        episode_count: int,
+        task_count: int,
+        scenario_count: int,
+    ) -> None:
+        if episode_count < 1:
+            return
+        aggregates.append(
+            AggregateRecord(
+                split=split,
+                configuration_hash=configuration_hash,
+                task_set_hash=task_set_hash,
+                scenario_count=scenario_count,
+                task_count=task_count,
+                episode_count=episode_count,
+                metric=metric,
+                value=value,
+            )
+        )
+
+    scored = [item for item in result.replicates if _is_complete_replicate(item)]
+    completed_n = len(scored)
+    if completed_n > 0:
+        add(
+            split="train",
+            configuration_hash=train_hash,
+            task_set_hash=train_tasks.task_set_hash,
+            metric="gate_catch_count",
+            value=float(result.gate_catch_count),
+            episode_count=completed_n,
+            task_count=train_tasks.task_count,
+            scenario_count=train_tasks.scenario_count,
+        )
+        add(
+            split="train",
+            configuration_hash=train_hash,
+            task_set_hash=train_tasks.task_set_hash,
+            metric="gate_false_block_count",
+            value=float(result.gate_false_block_count),
+            episode_count=completed_n,
+            task_count=train_tasks.task_count,
+            scenario_count=train_tasks.scenario_count,
+        )
+    if result.canary_not_reached_count > 0:
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="canary_not_reached_count",
+            value=float(result.canary_not_reached_count),
+            episode_count=result.canary_not_reached_count,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+    if result.monitor_not_reached_count > 0:
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="monitor_not_reached_count",
+            value=float(result.monitor_not_reached_count),
+            episode_count=result.monitor_not_reached_count,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+    if result.candidate_episodes_served > 0:
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="candidate_episodes_served",
+            value=float(result.candidate_episodes_served),
+            episode_count=result.candidate_episodes_served,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+    if result.candidate_episodes_failed > 0:
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="candidate_episodes_failed",
+            value=float(result.candidate_episodes_failed),
+            episode_count=result.candidate_episodes_failed,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+    if result.mean_canary_rollback_delay is not None:
+        rollback_n = sum(
+            1
+            for item in scored
+            if item.canary.status == "completed"
+            and item.canary.rollback_delay_episodes is not None
+        )
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="canary_rollback_delay_episodes",
+            value=float(result.mean_canary_rollback_delay),
+            episode_count=rollback_n,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+    if result.mean_monitor_delay is not None:
+        alert_n = sum(
+            1
+            for item in scored
+            if item.monitor.status == "completed"
+            and item.monitor.delay_episodes is not None
+        )
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="monitor_delay_episodes",
+            value=float(result.mean_monitor_delay),
+            episode_count=alert_n,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+    monitor_done = sum(1 for item in scored if item.monitor.status == "completed")
+    if monitor_done > 0:
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="monitor_miss_count",
+            value=float(result.monitor_miss_count),
+            episode_count=monitor_done,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="monitor_false_alarm_count",
+            value=float(result.monitor_false_alarm_count),
+            episode_count=monitor_done,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+    if result.compute_seconds > 0.0 and completed_n > 0:
+        add(
+            split="test_normal",
+            configuration_hash=test_hash,
+            task_set_hash=test_normal_tasks.task_set_hash,
+            metric="compute_seconds",
+            value=float(result.compute_seconds),
+            episode_count=completed_n,
+            task_count=test_normal_tasks.task_count,
+            scenario_count=test_normal_tasks.scenario_count,
+        )
+
+    evidence: list[StatisticalEvidence] = []
+    decisions: list[LifecycleDecision] = []
+    for item in scored:
+        if item.gate.public_decision is not None:
+            decisions.append(item.gate.public_decision)
+        for stat in item.gate.statistics:
+            if stat.sample_size >= 1:
+                evidence.append(stat)
+        if item.canary.public_decision is not None:
+            decisions.append(item.canary.public_decision)
+            for stat in item.canary.public_decision.evidence:
+                if stat.sample_size >= 1:
+                    evidence.append(stat)
+
+    return AggregateResults(
+        aggregates=tuple(aggregates),
+        evidence=tuple(evidence),
+        decisions=tuple(decisions),
+    )
+
+
+def _bind_and_admit_test_normal(
+    protocol: ProtocolLock,
+    template: RunConfiguration,
+    task_set: TaskSet,
+    fault: FaultSpec,
+) -> tuple[RunConfiguration, RunConfiguration]:
+    """Bind and admit the locked template, then apply the declared fault.
+
+    ``admit_test_normal`` rejects a configuration that is not a lock
+    template. The faulted candidate therefore cannot be admitted. The
+    lock's dev harm label for ``fault.fault_version`` is the authorization
+    for that candidate.
+    """
+
+    try:
+        reference = bind_protocol(template, protocol)
+        admit_test_normal(
+            protocol, reference, task_set_hash=task_set.task_set_hash
+        )
+        candidate = apply_fault(reference, fault)
+    except (ProtocolError, FaultError) as error:
+        raise BenchmarkError(str(error)) from error
+    return reference, candidate
+
+
+def run_lifecycle_benchmark(
+    protocol: ProtocolLock,
+    faults: Sequence[FaultSpec],
+    *,
+    runtime: RuntimeDependencies,
+    train_tasks: TaskSet,
+    test_normal_tasks: TaskSet,
+    reference_baselines: FrozenReference,
+    checkpoint_path: Path,
+    export_path: Path | None = None,
+    should_interrupt: Callable[[BenchmarkProgress], bool] | None = None,
+) -> BenchmarkResult:
+    """Run the three-tier lifecycle benchmark for each fault and lock seed."""
+
+    if not isinstance(protocol, ProtocolLock):
+        raise BenchmarkError("run_lifecycle_benchmark requires a protocol lock")
+    if not isinstance(runtime, RuntimeDependencies):
+        raise BenchmarkError("run_lifecycle_benchmark requires runtime dependencies")
+    if not isinstance(train_tasks, TaskSet) or not isinstance(
+        test_normal_tasks, TaskSet
+    ):
+        raise BenchmarkError("task sets must be TaskSet instances")
+    if not isinstance(reference_baselines, FrozenReference):
+        raise BenchmarkError("reference_baselines must be FrozenReference")
+    checkpoint = Path(checkpoint_path)
+    _refuse_results_path(checkpoint, "checkpoint_path")
+    if export_path is not None:
+        _refuse_results_path(Path(export_path), "export_path")
+
+    gate_settings, canary_settings, monitor_settings, stream_settings = (
+        _settings_from_lock(protocol)
+    )
+    if (
+        reference_baselines.configuration_hash
+        != monitor_settings.reference_configuration_hash
+    ):
+        raise BenchmarkError(
+            "reference_baselines.configuration_hash must equal the lock monitor hash"
+        )
+
+    train_template, test_normal_template = _templates_by_split(protocol)
+    _validate_task_bindings(
+        train_template=train_template,
+        test_normal_template=test_normal_template,
+        train_tasks=train_tasks,
+        test_normal_tasks=test_normal_tasks,
+        stream=stream_settings,
+    )
+
+    seeds = _seeds_from_lock(protocol)
+    document = _load_checkpoint(checkpoint)
+    replicates_doc: dict[str, Any] = document.setdefault("replicates", {})
+    outcomes: list[ReplicateOutcome] = []
+    interrupted = False
+    train_bound_for_export = bind_protocol(train_template, protocol)
+    test_normal_bound_for_export = bind_protocol(test_normal_template, protocol)
+
+    for fault in faults:
+        if not isinstance(fault, FaultSpec):
+            raise BenchmarkError("faults must contain FaultSpec")
+        label = _harm_label_for(protocol, fault.fault_version)
+        for seed in seeds:
+            if interrupted:
+                break
+            key = _replicate_key(fault.fault_version, seed)
+            stored = replicates_doc.get(key)
+            if not isinstance(stored, dict):
+                stored = {}
+                replicates_doc[key] = stored
+
+            finished = stored.get("outcome")
+            if isinstance(finished, dict):
+                outcomes.append(_deserialize_replicate(finished))
+                continue
+
+            if not fault.representable:
+                outcome = ReplicateOutcome(
+                    fault_version=fault.fault_version,
+                    replicate_seed=seed,
+                    harmful=label.harmful,
+                    gate=_not_representable_gate(),
+                    canary=_not_representable_canary(),
+                    monitor=_not_representable_monitor(),
+                )
+                outcomes.append(outcome)
+                stored["outcome"] = _serialize_replicate(outcome)
+                _write_checkpoint(checkpoint, document)
+                continue
+
+            progress = BenchmarkProgress(
+                fault_version=fault.fault_version,
+                replicate_seed=seed,
+                tier="gate",
+                stream_index=0,
+            )
+            if should_interrupt is not None and should_interrupt(progress):
+                interrupted = True
+                _write_checkpoint(checkpoint, document)
+                break
+
+            gate_outcome, gate_decision = _run_or_resume_gate(
+                protocol=protocol,
+                fault=fault,
+                train_template=train_template,
+                train_tasks=train_tasks,
+                gate_settings=gate_settings,
+                runtime=runtime,
+                harmful=label.harmful,
+                stored=stored,
+                checkpoint=checkpoint,
+                document=document,
+            )
+            _write_checkpoint(checkpoint, document)
+            if should_interrupt is not None and should_interrupt(progress):
+                interrupted = True
+                break
+
+            if gate_decision.outcome != "PASS":
+                replicate = ReplicateOutcome(
+                    fault_version=fault.fault_version,
+                    replicate_seed=seed,
+                    harmful=label.harmful,
+                    gate=gate_outcome,
+                    canary=_not_reached_canary("gate_block"),
+                    monitor=_not_reached_monitor("gate_block"),
+                )
+                outcomes.append(replicate)
+                stored["outcome"] = _serialize_replicate(replicate)
+                _write_checkpoint(checkpoint, document)
+                continue
+
+            progress = BenchmarkProgress(
+                fault_version=fault.fault_version,
+                replicate_seed=seed,
+                tier="canary",
+                stream_index=0,
+            )
+            if should_interrupt is not None and should_interrupt(progress):
+                interrupted = True
+                _write_checkpoint(checkpoint, document)
+                break
+
+            canary_result = _run_or_resume_canary(
+                protocol=protocol,
+                fault=fault,
+                test_normal_template=test_normal_template,
+                test_normal_tasks=test_normal_tasks,
+                canary_settings=canary_settings,
+                stream_settings=stream_settings,
+                runtime=runtime,
+                seed=seed,
+                stored=stored,
+                checkpoint=checkpoint,
+                document=document,
+                should_interrupt=should_interrupt,
+                fault_version=fault.fault_version,
+            )
+            if canary_result["interrupted"]:
+                interrupted = True
+                outcomes.append(
+                    ReplicateOutcome(
+                        fault_version=fault.fault_version,
+                        replicate_seed=seed,
+                        harmful=label.harmful,
+                        gate=gate_outcome,
+                        canary=canary_result["outcome"],
+                        monitor=MonitorTierOutcome(
+                            status="interrupted",
+                            reason=None,
+                            delay_episodes=None,
+                            miss=False,
+                            false_alarm=False,
+                            compute_seconds=None,
+                        ),
+                    )
+                )
+                break
+
+            canary_outcome: CanaryTierOutcome = canary_result["outcome"]
+            if canary_outcome.status != "promoted":
+                replicate = ReplicateOutcome(
+                    fault_version=fault.fault_version,
+                    replicate_seed=seed,
+                    harmful=label.harmful,
+                    gate=gate_outcome,
+                    canary=canary_outcome,
+                    monitor=_not_reached_monitor("canary_rollback"),
+                )
+                outcomes.append(replicate)
+                stored["outcome"] = _serialize_replicate(replicate)
+                _write_checkpoint(checkpoint, document)
+                continue
+
+            progress = BenchmarkProgress(
+                fault_version=fault.fault_version,
+                replicate_seed=seed,
+                tier="monitor",
+                stream_index=0,
+            )
+            if should_interrupt is not None and should_interrupt(progress):
+                interrupted = True
+                _write_checkpoint(checkpoint, document)
+                outcomes.append(
+                    ReplicateOutcome(
+                        fault_version=fault.fault_version,
+                        replicate_seed=seed,
+                        harmful=label.harmful,
+                        gate=gate_outcome,
+                        canary=canary_outcome,
+                        monitor=MonitorTierOutcome(
+                            status="interrupted",
+                            reason=None,
+                            delay_episodes=None,
+                            miss=False,
+                            false_alarm=False,
+                            compute_seconds=None,
+                        ),
+                    )
+                )
+                break
+
+            monitor_result = _run_or_resume_monitor(
+                protocol=protocol,
+                fault=fault,
+                test_normal_template=test_normal_template,
+                test_normal_tasks=test_normal_tasks,
+                monitor_settings=monitor_settings,
+                stream_settings=stream_settings,
+                reference_baselines=reference_baselines,
+                runtime=runtime,
+                seed=seed,
+                harmful=label.harmful,
+                stored=stored,
+                checkpoint=checkpoint,
+                document=document,
+                should_interrupt=should_interrupt,
+                fault_version=fault.fault_version,
+            )
+            if monitor_result["interrupted"]:
+                interrupted = True
+                outcomes.append(
+                    ReplicateOutcome(
+                        fault_version=fault.fault_version,
+                        replicate_seed=seed,
+                        harmful=label.harmful,
+                        gate=gate_outcome,
+                        canary=canary_outcome,
+                        monitor=monitor_result["outcome"],
+                    )
+                )
+                break
+
+            replicate = ReplicateOutcome(
+                fault_version=fault.fault_version,
+                replicate_seed=seed,
+                harmful=label.harmful,
+                gate=gate_outcome,
+                canary=canary_outcome,
+                monitor=monitor_result["outcome"],
+            )
+            outcomes.append(replicate)
+            stored["outcome"] = _serialize_replicate(replicate)
+            _write_checkpoint(checkpoint, document)
+
+    status = "interrupted" if interrupted else "completed"
+    result = _aggregate(outcomes, status=status)
+    if status == "completed" and export_path is not None:
+        try:
+            export_public_results(
+                _export_aggregates(
+                    result,
+                    train_bound=train_bound_for_export,
+                    test_normal_bound=test_normal_bound_for_export,
+                    train_tasks=train_tasks,
+                    test_normal_tasks=test_normal_tasks,
+                ),
+                output_path=Path(export_path),
+            )
+        except ExportError as error:
+            raise BenchmarkError("public export failed") from error
+    return result
+
+
+def _run_or_resume_gate(
+    *,
+    protocol: ProtocolLock,
+    fault: FaultSpec,
+    train_template: RunConfiguration,
+    train_tasks: TaskSet,
+    gate_settings: GateSettings,
+    runtime: RuntimeDependencies,
+    harmful: bool,
+    stored: dict[str, Any],
+    checkpoint: Path,
+    document: dict[str, Any],
+) -> tuple[GateTierOutcome, GateDecision]:
+    gate_blob = stored.get("gate")
+    if isinstance(gate_blob, dict) and "decision" in gate_blob:
+        decision = _gate_decision_from_dict(
+            _require_mapping(gate_blob["decision"], "gate decision")
+        )
+        compute_seconds = float(gate_blob.get("compute_seconds", 0.0))
+        return (
+            _gate_outcome_from_decision(
+                decision, harmful=harmful, compute_seconds=compute_seconds
+            ),
+            decision,
+        )
+
+    try:
+        reference = bind_protocol(train_template, protocol)
+        candidate = apply_fault(reference, fault)
+    except (ProtocolError, FaultError) as error:
+        raise BenchmarkError(str(error)) from error
+
+    started = time.perf_counter()
+    try:
+        decision = run_offline_gate(
+            reference,
+            candidate,
+            train_tasks,
+            settings=gate_settings,
+            runtime=runtime,
+        )
+    except GateExecutionError as error:
+        raise BenchmarkError(str(error)) from error
+    compute_seconds = time.perf_counter() - started
+    stored["gate"] = {
+        "decision": _gate_decision_to_dict(decision),
+        "compute_seconds": compute_seconds,
+    }
+    _write_checkpoint(checkpoint, document)
+    return (
+        _gate_outcome_from_decision(
+            decision, harmful=harmful, compute_seconds=compute_seconds
+        ),
+        decision,
+    )
+
+
+def _run_or_resume_canary(
+    *,
+    protocol: ProtocolLock,
+    fault: FaultSpec,
+    test_normal_template: RunConfiguration,
+    test_normal_tasks: TaskSet,
+    canary_settings: CanarySettings,
+    stream_settings: StreamSettings,
+    runtime: RuntimeDependencies,
+    seed: int,
+    stored: dict[str, Any],
+    checkpoint: Path,
+    document: dict[str, Any],
+    should_interrupt: Callable[[BenchmarkProgress], bool] | None,
+    fault_version: str,
+) -> dict[str, Any]:
+    reference, candidate = _bind_and_admit_test_normal(
+        protocol, test_normal_template, test_normal_tasks, fault
+    )
+
+    canary_blob = stored.setdefault("canary", {})
+    if not isinstance(canary_blob, dict):
+        raise BenchmarkError("checkpoint canary section is invalid")
+    items_raw = canary_blob.get("items")
+    if not isinstance(items_raw, list):
+        items_raw = []
+        canary_blob["items"] = items_raw
+
+    if isinstance(canary_blob.get("final"), dict):
+        final = canary_blob["final"]
+        outcome = CanaryTierOutcome(
+            status=str(final["status"]),
+            reason=final.get("reason"),
+            rollback_delay_episodes=final.get("rollback_delay_episodes"),
+            candidate_episodes_served=final.get("candidate_episodes_served"),
+            candidate_episodes_failed=final.get("candidate_episodes_failed"),
+            served_before_rollback=final.get("served_before_rollback"),
+            in_flight_at_rollback=final.get("in_flight_at_rollback"),
+            compute_seconds=(
+                None
+                if final.get("compute_seconds") is None
+                else float(final["compute_seconds"])
+            ),
+            public_decision=_lifecycle_decision_from_dict(
+                final.get("public_decision")
+            ),
+        )
+        return {"interrupted": False, "outcome": outcome}
+
+    controller = CanaryController(
+        reference,
+        candidate,
+        settings=canary_settings,
+        clock=runtime.clock,
+    )
+    controller.start(
+        _CanaryGateView(
+            outcome="PASS",
+            reason_codes=(),
+            reference_configuration_hash=run_configuration_hash(reference),
+            candidate_configuration_hash=run_configuration_hash(candidate),
+            task_set_hash=reference.task.task_set_hash,
+            reference_protocol_hash=reference.protocol_hash,
+            candidate_protocol_hash=candidate.protocol_hash,
+        )
+    )
+
+    started = time.perf_counter()
+    compute_base = float(canary_blob.get("compute_seconds", 0.0))
+    stored_indexes = {
+        int(item["stream_index"])
+        for item in items_raw
+        if isinstance(item, dict) and "stream_index" in item
+    }
+    for item in sorted(items_raw, key=lambda row: int(row["stream_index"])):
+        if not isinstance(item, dict):
+            raise BenchmarkError("checkpoint canary item is invalid")
+        pair = PairedResult.from_dict(item["pair"])
+        execution = _pair_execution_from_dict(
+            _require_mapping(item["pair_execution"], "pair_execution")
+        )
+        restore_pair_execution(execution)
+        controller.begin_candidate_episode()
+        decision = controller.observe(pair)
+        if decision.action in {"rollback", "promote"}:
+            compute_seconds = compute_base + (time.perf_counter() - started)
+            outcome = _canary_outcome_from_decision(
+                decision, compute_seconds=compute_seconds
+            )
+            canary_blob["final"] = _serialize_canary_outcome(outcome)
+            canary_blob["compute_seconds"] = compute_seconds
+            _write_checkpoint(checkpoint, document)
+            return {"interrupted": False, "outcome": outcome}
+
+    reference_run = new_run_identity(reference)
+    candidate_run = new_run_identity(candidate)
+    if "reference_run" in canary_blob and "candidate_run" in canary_blob:
+        from llm_behavior_ci.config import RunIdentity
+
+        reference_run = RunIdentity.from_dict(canary_blob["reference_run"])
+        candidate_run = RunIdentity.from_dict(canary_blob["candidate_run"])
+    else:
+        canary_blob["reference_run"] = reference_run.to_dict()
+        canary_blob["candidate_run"] = candidate_run.to_dict()
+        _write_checkpoint(checkpoint, document)
+
+    stream = _stream_for_seed(stream_settings, seed)
+    horizon = canary_settings.stopping_rule.horizon_episodes
+
+    for arrival in generate_stream(test_normal_tasks, stream):
+        if arrival.index >= horizon:
+            break
+        if arrival.index in stored_indexes:
+            continue
+        progress = BenchmarkProgress(
+            fault_version=fault_version,
+            replicate_seed=seed,
+            tier="canary",
+            stream_index=arrival.index,
+        )
+        if should_interrupt is not None and should_interrupt(progress):
+            canary_blob["compute_seconds"] = compute_base + (
+                time.perf_counter() - started
+            )
+            _write_checkpoint(checkpoint, document)
+            snap = controller.snapshot()
+            return {
+                "interrupted": True,
+                "outcome": CanaryTierOutcome(
+                    status="interrupted",
+                    reason=None,
+                    rollback_delay_episodes=None,
+                    candidate_episodes_served=snap.candidate_episodes_served,
+                    candidate_episodes_failed=snap.candidate_episodes_failed,
+                    served_before_rollback=None,
+                    in_flight_at_rollback=None,
+                    compute_seconds=float(canary_blob["compute_seconds"]),
+                    public_decision=None,
+                ),
+            }
+
+        controller.begin_candidate_episode()
+        pair = run_pair(
+            arrival.task_id,
+            reference,
+            candidate,
+            reference_run=reference_run,
+            candidate_run=candidate_run,
+            runtime=runtime,
+            mode="execute",
+            scenario_id=arrival.scenario_id,
+        )
+        decision = controller.observe(pair)
+        execution = pair_execution(pair)
+        items_raw.append(
+            {
+                "stream_index": arrival.index,
+                "pair": pair.to_dict(),
+                "pair_execution": _pair_execution_to_dict(execution),
+                "action": decision.action,
+            }
+        )
+        canary_blob["compute_seconds"] = compute_base + (
+            time.perf_counter() - started
+        )
+        _write_checkpoint(checkpoint, document)
+        if decision.action in {"rollback", "promote"}:
+            compute_seconds = float(canary_blob["compute_seconds"])
+            outcome = _canary_outcome_from_decision(
+                decision, compute_seconds=compute_seconds
+            )
+            canary_blob["final"] = _serialize_canary_outcome(outcome)
+            _write_checkpoint(checkpoint, document)
+            return {"interrupted": False, "outcome": outcome}
+
+    raise BenchmarkError("canary stream ended without rollback or promote")
+
+
+def _run_or_resume_monitor(
+    *,
+    protocol: ProtocolLock,
+    fault: FaultSpec,
+    test_normal_template: RunConfiguration,
+    test_normal_tasks: TaskSet,
+    monitor_settings: MonitorSettings,
+    stream_settings: StreamSettings,
+    reference_baselines: FrozenReference,
+    runtime: RuntimeDependencies,
+    seed: int,
+    harmful: bool,
+    stored: dict[str, Any],
+    checkpoint: Path,
+    document: dict[str, Any],
+    should_interrupt: Callable[[BenchmarkProgress], bool] | None,
+    fault_version: str,
+) -> dict[str, Any]:
+    _reference, candidate = _bind_and_admit_test_normal(
+        protocol, test_normal_template, test_normal_tasks, fault
+    )
+
+    monitor_blob = stored.setdefault("monitor", {})
+    if not isinstance(monitor_blob, dict):
+        raise BenchmarkError("checkpoint monitor section is invalid")
+    if isinstance(monitor_blob.get("final"), dict):
+        final = monitor_blob["final"]
+        return {
+            "interrupted": False,
+            "outcome": MonitorTierOutcome(
+                status=str(final["status"]),
+                reason=final.get("reason"),
+                delay_episodes=final.get("delay_episodes"),
+                miss=bool(final.get("miss", False)),
+                false_alarm=bool(final.get("false_alarm", False)),
+                compute_seconds=(
+                    None
+                    if final.get("compute_seconds") is None
+                    else float(final["compute_seconds"])
+                ),
+            ),
+        }
+
+    items_raw = monitor_blob.get("items")
+    if not isinstance(items_raw, list):
+        items_raw = []
+        monitor_blob["items"] = items_raw
+
+    monitor = ProductionMonitor(
+        monitor_settings,
+        reference_baselines,
+        clock=runtime.clock,
+        dedup_seconds=0.0,
+    )
+    started = time.perf_counter()
+    compute_base = float(monitor_blob.get("compute_seconds", 0.0))
+    first_alert_index: int | None = monitor_blob.get("first_alert_index")
+    if first_alert_index is not None:
+        first_alert_index = int(first_alert_index)
+    alerted = first_alert_index is not None
+    stored_indexes = {
+        int(item["stream_index"])
+        for item in items_raw
+        if isinstance(item, dict) and "stream_index" in item
+    }
+
+    for item in sorted(items_raw, key=lambda row: int(row["stream_index"])):
+        if not isinstance(item, dict):
+            raise BenchmarkError("checkpoint monitor item is invalid")
+        observations = item.get("observations")
+        if not isinstance(observations, list):
+            raise BenchmarkError("checkpoint monitor observations are invalid")
+        for observation_payload in observations:
+            observation = MonitorObservation.from_dict(observation_payload)
+            alerts = monitor.update(observation)
+            if alerts and first_alert_index is None:
+                first_alert_index = int(item["stream_index"])
+                alerted = True
+
+    from llm_behavior_ci.config import RunIdentity
+
+    if "run" in monitor_blob:
+        run = RunIdentity.from_dict(monitor_blob["run"])
+    else:
+        run = new_run_identity(candidate)
+        monitor_blob["run"] = run.to_dict()
+        _write_checkpoint(checkpoint, document)
+
+    stream = _stream_for_seed(stream_settings, seed)
+    horizon = _monitor_horizon(monitor_settings)
+
+    for arrival in generate_stream(test_normal_tasks, stream):
+        if arrival.index >= horizon:
+            break
+        if arrival.index in stored_indexes:
+            continue
+        progress = BenchmarkProgress(
+            fault_version=fault_version,
+            replicate_seed=seed,
+            tier="monitor",
+            stream_index=arrival.index,
+        )
+        if should_interrupt is not None and should_interrupt(progress):
+            monitor_blob["compute_seconds"] = compute_base + (
+                time.perf_counter() - started
+            )
+            if first_alert_index is not None:
+                monitor_blob["first_alert_index"] = first_alert_index
+            _write_checkpoint(checkpoint, document)
+            return {
+                "interrupted": True,
+                "outcome": MonitorTierOutcome(
+                    status="interrupted",
+                    reason=None,
+                    delay_episodes=(
+                        None
+                        if first_alert_index is None
+                        else first_alert_index + 1
+                    ),
+                    miss=False,
+                    false_alarm=False,
+                    compute_seconds=float(monitor_blob["compute_seconds"]),
+                ),
+            }
+
+        episode = run_episode(
+            arrival.task_id,
+            candidate,
+            "execute",
+            run=run,
+            runtime=runtime,
+            scenario_id=arrival.scenario_id,
+        )
+        observation_payloads: list[dict[str, object]] = []
+        new_alerts = False
+        for signal in monitor_settings.signals:
+            observation = observation_from_episode(
+                episode,
+                task_metadata=TaskMetadata(
+                    signal=signal,
+                    completion_index=arrival.index,
+                ),
+            )
+            alerts = monitor.update(observation)
+            observation_payloads.append(observation.to_dict())
+            if alerts:
+                new_alerts = True
+        if new_alerts and first_alert_index is None:
+            first_alert_index = arrival.index
+            alerted = True
+        items_raw.append(
+            {
+                "stream_index": arrival.index,
+                "observations": observation_payloads,
+            }
+        )
+        if first_alert_index is not None:
+            monitor_blob["first_alert_index"] = first_alert_index
+        monitor_blob["compute_seconds"] = compute_base + (
+            time.perf_counter() - started
+        )
+        _write_checkpoint(checkpoint, document)
+
+    compute_seconds = compute_base + (time.perf_counter() - started)
+    delay = None if first_alert_index is None else first_alert_index + 1
+    miss = bool(harmful and not alerted)
+    false_alarm = bool((not harmful) and alerted)
+    outcome = MonitorTierOutcome(
+        status="completed",
+        reason=None,
+        delay_episodes=delay,
+        miss=miss,
+        false_alarm=false_alarm,
+        compute_seconds=compute_seconds,
+    )
+    monitor_blob["final"] = _serialize_monitor_outcome(outcome)
+    monitor_blob["compute_seconds"] = compute_seconds
+    _write_checkpoint(checkpoint, document)
+    return {"interrupted": False, "outcome": outcome}

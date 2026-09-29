@@ -52,7 +52,7 @@ Python, FastAPI, vLLM, Transformers, smolagents, AppWorld, Postgres or DuckDB ov
 
 **Still open inside the boundary:** Postgres versus DuckDB (D10); Grafana versus a static page (D11).
 
-**Current implementation note (2026-09-27):** This is the target boundary, not an installed-stack inventory. The CPU suite currently uses `unittest`; pytest is pinned but unused. `requirements.txt` does not yet include smolagents or Transformers, and no gateway, Compose stack, or vLLM environment exists.
+**Current implementation note (2026-09-28):** This is the target boundary, not an installed-stack inventory. The CPU suite currently uses `unittest`; pytest is pinned but unused. `requirements.txt` does not yet include smolagents or Transformers. `service.py` `create_app` and `scripts/service/serve.py` exist; Docker Compose and the vLLM environment do not.
 
 ## D7 — Default model
 
@@ -158,4 +158,4 @@ In each Tier 2 canary pair, the candidate's episode is the served result and pro
 
 **Why:** A canary's cost is what a bad candidate served. If production's episode were served, that cost would always be zero.
 
-`run_pair` currently calls the reference episode and then the candidate. That call order is recorded and is not this served-result rule. `CanaryController` counts candidate episodes as served and can roll back from `CanarySettings`, but no gateway serves an episode.
+`run_pair` currently calls the reference episode and then the candidate on one runtime, so a paired episode cannot use two base URLs. That call order is recorded and is not this served-result rule. `CanaryController` counts candidate episodes as served and can roll back from `CanarySettings`. `service.py` `create_app` is a FastAPI gateway; HTTP `POST /deployment/rollback` sets admission only and does not roll `CanaryController` back. That is not this served-result rule.

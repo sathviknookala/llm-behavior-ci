@@ -387,6 +387,23 @@ def pair_execution(pair: PairedResult) -> PairExecution:
     return record
 
 
+def restore_pair_execution(record: PairExecution) -> None:
+    """Store a checkpointed pair execution so ``pair_execution`` can read it.
+
+    Resume replays stored pairs through ``CanaryController.observe`` without
+    calling ``run_pair`` again. A different record already stored for the
+    same pair id is rejected.
+    """
+
+    if not isinstance(record, PairExecution):
+        raise EpisodeRejected("pair execution record is required")
+    with _PAIR_LOCK:
+        existing = _PAIR_EXECUTIONS.get(record.pair_id)
+        if existing is not None and existing != record:
+            raise EpisodeRejected("pair execution was already recorded")
+        _PAIR_EXECUTIONS[record.pair_id] = record
+
+
 def evaluator_difference(pair: PairedResult) -> EvaluatorDifference | None:
     """Return evaluator differences only when both outcomes exist.
 

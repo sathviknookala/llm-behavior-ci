@@ -12,6 +12,7 @@ from llm_behavior_ci.runtime.episode import (
     RuntimeDependencies,
     evaluator_difference,
     pair_execution,
+    restore_pair_execution,
     run_episode,
     run_pair,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "VLLMAgent",
     "evaluator_difference",
     "pair_execution",
+    "restore_pair_execution",
     "run_episode",
     "run_pair",
     "score_full",
