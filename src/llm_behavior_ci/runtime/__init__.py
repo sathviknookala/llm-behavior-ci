@@ -25,6 +25,7 @@ from llm_behavior_ci.runtime.episode import (
     evaluator_difference,
     pair_execution,
     restore_pair_execution,
+    run_do_nothing_episode,
     run_episode,
     run_pair,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "resolve_plan_format_template",
     "resolve_prompt_template",
     "restore_pair_execution",
+    "run_do_nothing_episode",
     "run_episode",
     "run_pair",
     "score_full",

@@ -37,7 +37,9 @@ from llm_behavior_ci.runtime.appworld import (
     ToolResult,
 )
 
-_COMPLETED = frozenset({"plan_emitted", "agent_stopped", "appworld_completed"})
+_COMPLETED = frozenset(
+    {"plan_emitted", "agent_stopped", "appworld_completed", "do_nothing"}
+)
 
 
 class EpisodeRejected(ValueError):
@@ -431,6 +433,53 @@ def run_episode(
                     episode_errors=(),
                 )
             tool_output = _observation(result)
+    finally:
+        session.close()
+
+
+def run_do_nothing_episode(
+    task_id: str,
+    config: RunConfiguration,
+    *,
+    run: RunIdentity,
+    runtime: RuntimeDependencies,
+    pair_id: str | None = None,
+    on_start: Callable[[EpisodeIdentity, RunIdentity], None] | None = None,
+    scenario_id: str | None = None,
+) -> EpisodeResult:
+    """Evaluate one execute episode without model or tool steps.
+
+    Opens the same AppWorld session factory ``run_episode`` uses, leaves the
+    initial world untouched, calls ``session.evaluate()``, and finishes through
+    the shared record path. There is no agent turn, no ``apis.*`` call, and no
+    ``complete_task``. Plan mode is rejected. AppWorld or evaluate failures
+    stay unevaluated, matching ``run_episode``.
+    """
+
+    _reject(task_id, config, "execute", run)
+    identity = new_episode_identity(run, pair_id=pair_id)
+    if on_start is not None:
+        on_start(identity, run)
+    session = runtime.session_factory(task_id)
+    try:
+        started_at = runtime.clock()
+        evaluation = session.evaluate()
+        return _finish(
+            identity=identity,
+            run=run,
+            task_id=task_id,
+            config=config,
+            scenario_id=scenario_id,
+            mode="execute",
+            started_at=started_at,
+            clock=runtime.clock,
+            model_steps=[],
+            tool_steps=[],
+            plan_text=None,
+            evaluator_outcome=_outcome(evaluation),
+            termination_reason="do_nothing",
+            episode_errors=(),
+        )
     finally:
         session.close()
 

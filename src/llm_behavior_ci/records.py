@@ -42,7 +42,7 @@ MODES = frozenset({"plan", "execute"})
 EPISODE_STATUSES = frozenset({"completed", "failed"})
 PAIR_ROLES = frozenset({"reference", "candidate"})
 COMPLETED_TERMINATIONS = frozenset(
-    {"plan_emitted", "agent_stopped", "appworld_completed"}
+    {"plan_emitted", "agent_stopped", "appworld_completed", "do_nothing"}
 )
 FAILED_TERMINATIONS = frozenset(
     {
@@ -68,6 +68,7 @@ EXECUTE_TERMINATIONS = frozenset(
     {
         "agent_stopped",
         "appworld_completed",
+        "do_nothing",
         "step_limit",
         "unrecoverable_tool_error",
         "runtime_error",
@@ -680,6 +681,11 @@ def _validate_episode(episode: EpisodeResult) -> None:
             raise RecordError("plan_emitted requires plan text")
         if not model_steps:
             raise RecordError("plan_emitted requires a model step")
+    if episode.termination_reason == "do_nothing":
+        if episode.evaluator_outcome is None:
+            raise RecordError("do_nothing requires an evaluator outcome")
+        if model_steps or tool_steps:
+            raise RecordError("do_nothing records no steps")
     _validate_steps(episode, model_steps, tool_steps)
     _validate_errors(episode, tool_steps, episode_errors)
 
