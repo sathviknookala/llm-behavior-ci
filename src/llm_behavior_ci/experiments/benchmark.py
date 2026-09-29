@@ -35,7 +35,7 @@ from llm_behavior_ci.experiments.protocol import (
     ProtocolLock,
     TaskSelectionAllowance,
     authorize_faulted_candidate,
-    authorize_gated_candidate,
+    authorize_test_gated_candidate,
     bind_protocol,
 )
 from llm_behavior_ci.export import AggregateResults, ExportError, export_public_results
@@ -50,8 +50,10 @@ from llm_behavior_ci.lifecycle.offline_gate import (
     GateDecision,
     GateExecutionError,
     PlanEvidenceInputs,
+    plan_evidence_to_dict,
     run_offline_gate,
 )
+from llm_behavior_ci.lifecycle.validation_artifact import ValidationArtifact
 from llm_behavior_ci.records import (
     AggregateRecord,
     LifecycleDecision,
@@ -432,15 +434,10 @@ def _gate_classification(outcome: str, harmful: bool) -> str | None:
     return "false_block"
 
 
-def _plan_evidence_to_dict(plan_evidence: PlanEvidenceInputs) -> dict[str, object]:
+def _reference_baselines_to_dict(reference: FrozenReference) -> dict[str, object]:
     return {
-        "plan_format_version": plan_evidence.plan_format_version,
-        "plan_quality_features": list(plan_evidence.plan_quality_features),
-        "plan_quality_weights": list(plan_evidence.plan_quality_weights),
-        "mmd_features": list(plan_evidence.mmd_features),
-        "kl_approximation": plan_evidence.kl_approximation,
-        "required_statistics": list(plan_evidence.required_statistics),
-        "validation_provenance": plan_evidence.validation_provenance,
+        "configuration_hash": reference.configuration_hash,
+        "baselines": [list(item) for item in reference.baselines],
     }
 
 
@@ -484,6 +481,7 @@ def _gate_decision_to_dict(decision: GateDecision) -> dict[str, object]:
             else None
         ),
         "validation_provenance": decision.validation_provenance,
+        "artifact": decision.artifact.to_dict(),
     }
 
 
@@ -502,6 +500,13 @@ def _gate_decision_from_dict(payload: Mapping[str, object]) -> GateDecision:
     provenance = payload.get("validation_provenance")
     if not isinstance(provenance, str) or provenance == "":
         raise BenchmarkError("checkpoint gate validation_provenance is invalid")
+    artifact_raw = payload.get("artifact")
+    if not isinstance(artifact_raw, Mapping):
+        raise BenchmarkError("checkpoint gate artifact is invalid")
+    try:
+        artifact = ValidationArtifact.from_dict(artifact_raw)
+    except Exception as error:
+        raise BenchmarkError("checkpoint gate artifact is invalid") from error
     return GateDecision(
         outcome=str(payload["outcome"]),
         reason_codes=tuple(str(item) for item in reason_codes),
@@ -522,6 +527,7 @@ def _gate_decision_from_dict(payload: Mapping[str, object]) -> GateDecision:
         statistics=statistics,
         public_decision=public_decision,
         validation_provenance=provenance,
+        artifact=artifact,
     )
 
 
@@ -1156,13 +1162,15 @@ def _checkpoint_identity(
     test_normal_bound: RunConfiguration,
     faults: Sequence[FaultSpec],
     plan_evidence: PlanEvidenceInputs,
+    reference_baselines: FrozenReference,
 ) -> dict[str, object]:
     return {
         "protocol_digest": protocol.digest,
         "train_configuration_hash": run_configuration_hash(train_bound),
         "test_normal_configuration_hash": run_configuration_hash(test_normal_bound),
         "fault_versions": [fault.fault_version for fault in faults],
-        "plan_evidence": _plan_evidence_to_dict(plan_evidence),
+        "plan_evidence": plan_evidence_to_dict(plan_evidence),
+        "reference_baselines": _reference_baselines_to_dict(reference_baselines),
     }
 
 
@@ -1190,9 +1198,24 @@ def _start_canary_controller(
     candidate: RunConfiguration,
     allowance: TaskSelectionAllowance,
 ) -> None:
+    """Start the canary from this run's own, just-computed gate decision.
+
+    Calls ``authorize_test_gated_candidate`` rather than
+    ``authorize_gated_candidate``: ``gate_decision.artifact`` was produced
+    a few calls up this same stack, by this same process, either from a
+    real ``run_offline_gate`` call or (for the CPU synthetic path) from
+    one that used a ``synthetic_fixture``-provenance ``PlanEvidenceInputs``.
+    Either way it is trusted in-process evidence, not an externally
+    supplied claim, so the permissive test entry point is the correct one
+    here; the strict ``authorize_gated_candidate`` is reserved for
+    ``service.py``'s HTTP ``/candidates`` route, which admits a candidate
+    on an untrusted caller's say-so and must never accept synthetic
+    evidence.
+    """
+
     try:
-        admission = authorize_gated_candidate(
-            gate_decision,
+        admission = authorize_test_gated_candidate(
+            gate_decision.artifact,
             reference,
             candidate,
             allowance,
@@ -1292,6 +1315,7 @@ def run_lifecycle_benchmark(
         test_normal_bound=test_normal_bound_for_export,
         faults=faults,
         plan_evidence=plan_evidence,
+        reference_baselines=reference_baselines,
     )
     _validate_checkpoint_identity(document, identity)
     document["identity"] = identity

@@ -8,5 +8,11 @@
   "monitor",
   "stream",
   "analysis_version",
-  "seeds"
+  "seeds",
+  "faults",
+  "plan_evidence",
+  "distributional_monitors",
+  "plan_feature_schema_version",
+  "gate_validation_artifact_schema_version",
+  "prompt_template_hashes"
 ]

@@ -11,13 +11,18 @@ from unittest.mock import patch
 import llm_behavior_ci.config as configuration_module
 from llm_behavior_ci.config import (
     HASHED_FIELDS,
+    MISSING_HASHED_LEAF,
     RUNTIME_IDS,
+    AgentConfiguration,
     ConfigError,
     EpisodeIdentity,
+    LoRASettings,
+    ModelConfiguration,
     RunConfiguration,
     RunIdentity,
     TaskConfiguration,
     canonical_configuration_json,
+    hashed_values,
     new_episode_identity,
     new_pair_id,
     new_run_identity,
@@ -34,6 +39,8 @@ _TASK_SET_HASH = "c" * 64
 _OTHER_TASK_SET_HASH = "d" * 64
 _PROTOCOL_HASH = "e" * 64
 _OTHER_PROTOCOL_HASH = "f" * 64
+_LORA_REVISION = "3" * 40
+_OTHER_LORA_REVISION = "4" * 40
 
 _REPLACEMENTS = {
     "model.model.repository": "Qwen/Qwen3-1.7B",
@@ -54,6 +61,8 @@ _REPLACEMENTS = {
     "model.serving.tensor_parallel_size": 2,
     "model.serving.max_logprobs": 21,
     "model.serving.batch_invariant": True,
+    "model.lora.repository": "org/adapter-other",
+    "model.lora.revision": _OTHER_LORA_REVISION,
     "agent.smolagents_version": "1.22.1",
     "agent.action_interface": "tool_calling",
     "agent.prompt.prompt_version": "prompt-v2",
@@ -66,6 +75,8 @@ _REPLACEMENTS = {
     "agent.sampling.min_p": 0.1,
     "agent.sampling.seed": 18,
     "agent.sampling.max_tokens": 513,
+    "agent.api_docs_version": "api-docs-corrupt-v2",
+    "agent.api_docs_app": "other_app",
     "task.appworld_version": "0.1.3.post2",
     "task.split": "dev",
     "task.selection_rule": "fixed-v2",
@@ -110,6 +121,10 @@ def _payload() -> dict[str, object]:
                 "max_logprobs": 20,
                 "batch_invariant": False,
             },
+            "lora": {
+                "repository": "org/adapter-base",
+                "revision": _LORA_REVISION,
+            },
         },
         "agent": {
             "smolagents_version": "1.22.0",
@@ -128,6 +143,8 @@ def _payload() -> dict[str, object]:
                 "seed": 17,
                 "max_tokens": 512,
             },
+            "api_docs_version": "api-docs-corrupt-v1",
+            "api_docs_app": "calendar",
         },
         "task": {
             "appworld_version": "0.1.3.post1",
@@ -526,6 +543,108 @@ class ConfigurationTests(unittest.TestCase):
                 run_id="not-a-run",
                 pair_id=pair,
             )
+
+
+class OptionalHashedLeafTests(unittest.TestCase):
+    def test_unset_lora_and_api_docs_are_omitted_from_canonical_json(self) -> None:
+        payload = _payload()
+        del payload["model"]["lora"]
+        del payload["agent"]["api_docs_version"]
+        del payload["agent"]["api_docs_app"]
+        configuration = RunConfiguration.from_dict(payload)
+        self.assertIsNone(configuration.model.lora)
+        self.assertIsNone(configuration.agent.api_docs_version)
+        self.assertIsNone(configuration.agent.api_docs_app)
+        document = configuration.to_dict()
+        self.assertNotIn("lora", document["model"])
+        self.assertNotIn("api_docs_version", document["agent"])
+        self.assertNotIn("api_docs_app", document["agent"])
+        text = canonical_configuration_json(configuration)
+        self.assertNotIn("lora", text)
+        self.assertNotIn("api_docs", text)
+        restored = RunConfiguration.from_dict(document)
+        self.assertEqual(restored, configuration)
+
+    def test_setting_or_changing_either_optional_pair_changes_the_hash(self) -> None:
+        base_payload = _payload()
+        del base_payload["model"]["lora"]
+        del base_payload["agent"]["api_docs_version"]
+        del base_payload["agent"]["api_docs_app"]
+        unset = RunConfiguration.from_dict(base_payload)
+        unset_hash = run_configuration_hash(unset)
+
+        with_lora = RunConfiguration.from_dict(_payload())
+        self.assertNotEqual(run_configuration_hash(with_lora), unset_hash)
+
+        other_lora_payload = _payload()
+        other_lora_payload["model"]["lora"]["repository"] = "org/adapter-other"
+        other_lora = RunConfiguration.from_dict(other_lora_payload)
+        self.assertNotEqual(
+            run_configuration_hash(other_lora),
+            run_configuration_hash(with_lora),
+        )
+
+        other_docs_payload = _payload()
+        other_docs_payload["agent"]["api_docs_app"] = "other_app"
+        other_docs = RunConfiguration.from_dict(other_docs_payload)
+        self.assertNotEqual(
+            run_configuration_hash(other_docs),
+            run_configuration_hash(with_lora),
+        )
+
+    def test_api_docs_version_and_app_must_be_set_together(self) -> None:
+        only_version = _payload()
+        del only_version["agent"]["api_docs_app"]
+        with self.assertRaises(ConfigError) as ctx:
+            RunConfiguration.from_dict(only_version)
+        self.assertIn("together", str(ctx.exception))
+
+        only_app = _payload()
+        del only_app["agent"]["api_docs_version"]
+        with self.assertRaises(ConfigError) as ctx:
+            RunConfiguration.from_dict(only_app)
+        self.assertIn("together", str(ctx.exception))
+
+    def test_lora_requires_both_fields(self) -> None:
+        with self.assertRaises(ConfigError):
+            LoRASettings.from_dict({"repository": "org/adapter"})
+        with self.assertRaises(ConfigError):
+            ModelConfiguration.from_dict(
+                {
+                    **_payload()["model"],
+                    "lora": {"repository": "org/adapter"},
+                }
+            )
+
+    def test_hashed_values_reads_unset_optional_leaves_as_missing(self) -> None:
+        payload = _payload()
+        del payload["model"]["lora"]
+        del payload["agent"]["api_docs_version"]
+        del payload["agent"]["api_docs_app"]
+        unset = RunConfiguration.from_dict(payload)
+        values = hashed_values(unset)
+        self.assertIs(values["model.lora.repository"], MISSING_HASHED_LEAF)
+        self.assertIs(values["model.lora.revision"], MISSING_HASHED_LEAF)
+        self.assertIs(values["agent.api_docs_version"], MISSING_HASHED_LEAF)
+        self.assertIs(values["agent.api_docs_app"], MISSING_HASHED_LEAF)
+        self.assertEqual(MISSING_HASHED_LEAF, MISSING_HASHED_LEAF)
+
+        present = hashed_values(_configuration())
+        self.assertEqual(present["model.lora.repository"], "org/adapter-base")
+        self.assertEqual(present["agent.api_docs_app"], "calendar")
+        self.assertEqual(set(values), set(HASHED_FIELDS))
+
+    def test_optional_agent_config_field_omitted_from_generic_flatten(self) -> None:
+        without_docs = {
+            key: value
+            for key, value in _payload()["agent"].items()
+            if key not in ("api_docs_version", "api_docs_app")
+        }
+        agent = AgentConfiguration.from_dict(without_docs)
+        self.assertIsNone(agent.api_docs_version)
+        document = agent.to_dict()
+        self.assertNotIn("api_docs_version", document)
+        self.assertNotIn("api_docs_app", document)
 
 
 if __name__ == "__main__":

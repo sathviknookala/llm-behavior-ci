@@ -14,6 +14,7 @@ from llm_behavior_ci.config import (
     HASHED_FIELDS,
     ConfigError,
     RunConfiguration,
+    hashed_values,
     new_run_identity,
     run_configuration_hash,
 )
@@ -52,23 +53,51 @@ _KINDS = frozenset(
         "benign_control",
     }
 )
-_SCHEMA_KINDS = frozenset({"api_documentation", "lora"})
+_SCHEMA_KINDS: frozenset[str] = frozenset()
+"""Fault kinds whose hashed leaves the current schema cannot yet represent.
+
+Empty: every catalog ``kind`` in ``_KINDS`` has a real ``_KIND_PATHS`` entry
+now, including ``api_documentation`` and ``lora``. Kept as a named, checked
+set (not deleted) so a future fault class that genuinely needs a schema
+before it can be patched has somewhere to declare that gap the same way
+these two once did, via ``schema_request``, rather than reusing this
+mechanism only implicitly.
+"""
 _LIVE_UNAVAILABLE_KINDS = frozenset(
     {
         "quantization",
         "lora",
-        "api_documentation",
     }
 )
+"""Representable fault kinds that still need a different vLLM server process.
+
+Both change a ``build_runtime``/launch-spec input
+(``runtime.launch_spec.build_vllm_launch_spec``) that only takes effect when
+a server is (re)started with different weights: ``--quantization`` needs
+quantized weights on disk, ``--enable-lora`` needs the adapter's weights.
+Neither can be applied to an already-running server via a chat-completions
+request the way ``sampling``, ``prompt``, ``template``, ``token_limit``,
+``step_limit``, and ``model`` (a different *base* repository, still loaded
+fresh) can. ``api_documentation`` is deliberately not here: correcting or
+corrupting the API-documentation text a prompt is built from
+(``runtime.api_docs.resolve_api_documentation``) changes only the request
+content sent to whichever server is already running, so it needs no
+relaunch and is live like the request-level kinds.
+"""
 _LIVE_UNAVAILABLE_CONTROLS = frozenset({"batch_invariant"})
 _LIVE_UNAVAILABLE_REASONS: Mapping[str, str] = {
-    "quantization": "quantization weights are unavailable for live execution",
-    "lora": "LoRA weights are unavailable for live execution",
-    "api_documentation": (
-        "optional hashed leaves agent.api_docs_version and agent.api_docs_app "
-        "are unavailable for live execution"
+    "quantization": (
+        "the launch spec would carry --quantization, but quantized weights "
+        "and a running vLLM process are unavailable here"
     ),
-    "batch_invariant": "GPU serving flag is unavailable for live execution",
+    "lora": (
+        "the launch spec would carry --enable-lora, but adapter weights and "
+        "a running vLLM process are unavailable here"
+    ),
+    "batch_invariant": (
+        "the launch spec would carry VLLM_BATCH_INVARIANT=1, but a running "
+        "vLLM process is unavailable here"
+    ),
 }
 _BENIGN_CONTROLS = frozenset(
     {
@@ -105,10 +134,6 @@ _KIND_PATHS: Mapping[str, frozenset[str]] = {
     ),
     "token_limit": frozenset({"agent.sampling.max_tokens"}),
     "step_limit": frozenset({"agent.step_limit"}),
-    "api_documentation": frozenset(),
-    "lora": frozenset(),
-}
-_SCHEMA_KIND_PATHS: Mapping[str, frozenset[str]] = {
     "api_documentation": frozenset(
         {
             "agent.api_docs_version",
@@ -122,6 +147,7 @@ _SCHEMA_KIND_PATHS: Mapping[str, frozenset[str]] = {
         }
     ),
 }
+_SCHEMA_KIND_PATHS: Mapping[str, frozenset[str]] = {}
 _BENIGN_PATHS: Mapping[str, frozenset[str]] = {
     "identical": frozenset(),
     "noop_redeploy": frozenset({"git_commit"}),
@@ -350,30 +376,25 @@ def _coerce_patch_value(path: str, value: object) -> object:
     return value
 
 
-def _leaf_value(document: Mapping[str, object], path: str) -> object:
-    node: object = document
-    for part in path.split("."):
-        if not isinstance(node, Mapping) or part not in node:
-            raise FaultError(f"unknown path {path}")
-        node = node[part]
-    return node
-
-
 def _set_leaf(document: dict[str, object], path: str, value: object) -> None:
+    """Set one already-validated ``HASHED_FIELDS`` path, creating missing parents.
+
+    Every path reaching here was already checked against ``_KIND_PATHS`` (or
+    ``_BENIGN_PATHS``) in ``FaultSpec.__post_init__``, so auto-creating a
+    missing intermediate object is safe: it only ever happens at an optional
+    leaf's parent (``model.lora``, or ``agent`` before ``api_docs_version``/
+    ``api_docs_app`` exist) on a base configuration that has not set it.
+    """
+
     parts = path.split(".")
-    node: object = document
+    node: dict[str, object] = document
     for part in parts[:-1]:
-        if not isinstance(node, dict) or part not in node:
-            raise FaultError(f"unknown path {path}")
-        node = node[part]
-    if not isinstance(node, dict) or parts[-1] not in node:
-        raise FaultError(f"unknown path {path}")
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
     node[parts[-1]] = value
-
-
-def _hashed_values(configuration: RunConfiguration) -> dict[str, object]:
-    document = configuration.to_dict()
-    return {path: _leaf_value(document, path) for path in HASHED_FIELDS}
 
 
 def _under(path: Path, root: Path) -> bool:
@@ -458,6 +479,31 @@ def fault_from_mapping(payload: object) -> FaultSpec:
     )
 
 
+def fault_to_mapping(fault: FaultSpec) -> dict[str, object]:
+    """The catalog-shaped mapping ``fault_from_mapping`` would reconstruct.
+
+    The inverse of ``fault_from_mapping``, so a protocol lock can bind the
+    exact declared faults it authorizes without re-deriving the catalog
+    JSON shape at every call site that needs to persist one.
+    """
+
+    if not isinstance(fault, FaultSpec):
+        raise FaultError("fault_to_mapping requires a FaultSpec")
+    document: dict[str, object] = {
+        "fault_id": fault.fault_id,
+        "version": fault.version,
+        "kind": fault.kind,
+        "patches": [
+            {"path": patch.path, "value": patch.value} for patch in fault.patches
+        ],
+    }
+    if fault.control is not None:
+        document["control"] = fault.control
+    if fault.schema_request is not None:
+        document["schema_request"] = fault.schema_request
+    return document
+
+
 def load_fault(path: Path) -> FaultSpec:
     """Load one fault catalog JSON file into a validated ``FaultSpec``."""
 
@@ -513,8 +559,8 @@ def apply_fault(base: RunConfiguration, fault: FaultSpec) -> RunConfiguration:
         produced = RunConfiguration.from_dict(document)
     except ConfigError as error:
         raise FaultError(f"invalid value: {error}") from error
-    before = _hashed_values(base)
-    after = _hashed_values(produced)
+    before = hashed_values(base)
+    after = hashed_values(produced)
     changed = frozenset(
         path for path in HASHED_FIELDS if before[path] != after[path]
     )

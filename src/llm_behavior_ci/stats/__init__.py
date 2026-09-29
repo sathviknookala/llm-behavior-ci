@@ -13,7 +13,7 @@ from llm_behavior_ci.stats.c2st import (
     C2STResult,
     classifier_two_sample_test,
 )
-from llm_behavior_ci.stats.canary import SequentialCanaryTest
+from llm_behavior_ci.stats.canary import PairedDifferenceCanaryTest, SequentialCanaryTest
 from llm_behavior_ci.stats.chi_square import (
     ChiSquareError,
     ChiSquareResult,
@@ -72,6 +72,7 @@ __all__ = [
     "PairedBootstrapError",
     "PairedBootstrapResult",
     "PairedDifferenceCS",
+    "PairedDifferenceCanaryTest",
     "PairedSuccess",
     "SequentialCanaryTest",
     "StatisticsError",

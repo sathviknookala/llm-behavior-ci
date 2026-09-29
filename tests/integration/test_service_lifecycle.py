@@ -21,6 +21,7 @@ from llm_behavior_ci.config import (
     MonitorSettings,
     RunConfiguration,
     StoppingRule,
+    new_run_identity,
     run_configuration_hash,
 )
 from llm_behavior_ci.lifecycle.canary import assign_canary
@@ -29,7 +30,8 @@ from llm_behavior_ci.lifecycle.monitoring import (
     ProductionMonitor,
     TaskMetadata,
 )
-from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.lifecycle.validation_artifact import build_validation_artifact
+from llm_behavior_ci.records import StatisticalEvidence, TokenLogprob
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import (
     EvaluationResult,
@@ -272,6 +274,14 @@ class LazyStore(EpisodeStore):
         self._ensure()
         return super().append_deployment_decision(decision)
 
+    def append_validation_artifact(self, artifact):
+        self._ensure()
+        return super().append_validation_artifact(artifact)
+
+    def load_validation_artifact(self, artifact_id: str):
+        self._ensure()
+        return super().load_validation_artifact(artifact_id)
+
     def load_alerts(self, *, signal=None):
         self._ensure()
         return super().load_alerts(signal=signal)
@@ -381,15 +391,41 @@ class ServiceLifecycleTests(unittest.TestCase):
     ) -> dict[str, object]:
         reference = self.production if reference is None else reference
         candidate = self.candidate if candidate is None else candidate
-        return {
-            "outcome": outcome,
-            "reason_codes": [] if reason_codes is None else reason_codes,
-            "reference_configuration_hash": run_configuration_hash(reference),
-            "candidate_configuration_hash": run_configuration_hash(candidate),
-            "task_set_hash": reference.task.task_set_hash,
-            "reference_protocol_hash": reference.protocol_hash,
-            "candidate_protocol_hash": candidate.protocol_hash,
-        }
+        codes = tuple(reason_codes) if reason_codes is not None else ()
+        statistics = (
+            (
+                StatisticalEvidence(
+                    method="plan_quality_bootstrap",
+                    split=reference.task.split,
+                    configuration_hash=run_configuration_hash(candidate),
+                    estimate=0.05,
+                    sample_size=2,
+                    unit="score_delta",
+                    reference_configuration_hash=run_configuration_hash(reference),
+                ),
+            )
+            if outcome == "PASS"
+            else ()
+        )
+        artifact = build_validation_artifact(
+            outcome=outcome,
+            reason_codes=codes,
+            reference=reference,
+            candidate=candidate,
+            reference_run=new_run_identity(reference),
+            candidate_run=new_run_identity(candidate),
+            task_set_hash=reference.task.task_set_hash,
+            task_split=reference.task.split,
+            statistics=statistics,
+            validation_provenance="validated",
+            created_at=datetime.now(timezone.utc),
+        )
+        writer = EpisodeStore(self.store_path)
+        try:
+            writer.append_validation_artifact(artifact)
+        finally:
+            writer.close()
+        return {"artifact_id": artifact.artifact_id}
 
     def _dependencies(
         self,
@@ -402,6 +438,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         fraction: float = 1.0,
         horizon_episodes: int = 10,
         harm_margin: float = 0.1,
+        store: EpisodeStore | None = None,
     ):
         chosen_candidate = self.candidate if candidate is None else candidate
         settings = canary_settings or CanarySettings(
@@ -413,6 +450,8 @@ class ServiceLifecycleTests(unittest.TestCase):
                 alpha=0.05,
                 horizon_episodes=horizon_episodes,
             ),
+            metric_orientation="higher_is_better",
+            promotion_policy="horizon_reached_without_harm",
         )
         seen = self.seen_hashes
 
@@ -429,7 +468,7 @@ class ServiceLifecycleTests(unittest.TestCase):
                 candidate=chosen_candidate,
             ),
             runtime_factory=runtime_factory or default_factory,
-            store=self.store,
+            store=self.store if store is None else store,
             monitor=monitor or self._monitor(self.production),
             clock=self.clock,
             max_in_flight=4,
@@ -467,7 +506,10 @@ class ServiceLifecycleTests(unittest.TestCase):
             ),
         )
         client, _app = self._client(
-            self._dependencies(candidate=changed_sampling)
+            self._dependencies(
+                candidate=changed_sampling,
+                store=LazyStore(self.store_path),
+            )
         )
         response = client.post(
             "/candidates",
@@ -485,7 +527,10 @@ class ServiceLifecycleTests(unittest.TestCase):
             ),
         )
         client_b, _app_b = self._client(
-            self._dependencies(candidate=changed_prompt)
+            self._dependencies(
+                candidate=changed_prompt,
+                store=LazyStore(self.store_path),
+            )
         )
         response_b = client_b.post(
             "/candidates",
@@ -801,7 +846,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         from llm_behavior_ci.service import (
             _EpisodeRequest,
             _admit_candidate,
-            _parse_gate,
+            _parse_candidate_admission,
             _request_rollback,
             _run_candidate_episode,
         )
@@ -849,7 +894,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             )
             app = self.create_app(dependencies)
             state = app.state.service
-            _admit_candidate(state, _parse_gate(self._gate_body()))
+            _admit_candidate(state, _parse_candidate_admission(self._gate_body()))
             errors: list[BaseException] = []
             result: dict[str, object] = {}
 

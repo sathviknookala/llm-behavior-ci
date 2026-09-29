@@ -112,6 +112,8 @@ def _settings(**overrides: object) -> CanarySettings:
             alpha=0.05,
             horizon_episodes=1,
         ),
+        "metric_orientation": "higher_is_better",
+        "promotion_policy": "horizon_reached_without_harm",
     }
     values.update(overrides)
     return CanarySettings(**values)
@@ -243,12 +245,13 @@ def _runtime(
     *,
     candidate_success: bool = True,
     candidate_fail: bool = False,
+    reference_success: bool = True,
 ) -> RuntimeDependencies:
     worlds: list[World] = []
 
     def factory(task_id: str) -> World:
         if not worlds:
-            world = World(task_id, success=True)
+            world = World(task_id, success=reference_success)
         else:
             world = World(
                 task_id,
@@ -301,6 +304,7 @@ def _run_execute_pair(
     *,
     candidate_success: bool = True,
     candidate_fail: bool = False,
+    reference_success: bool = True,
 ):
     return run_pair(
         "task-1",
@@ -312,6 +316,7 @@ def _run_execute_pair(
             clock,
             candidate_success=candidate_success,
             candidate_fail=candidate_fail,
+            reference_success=reference_success,
         ),
         mode="execute",
     )
@@ -475,7 +480,10 @@ class CanaryControllerTests(unittest.TestCase):
         self.assertEqual(snap.candidate_configuration_hash, candidate_hash)
         self.assertIsNotNone(snap.promoted_at)
         self.assertIsNotNone(decision.public_decision)
-        self.assertEqual(decision.public_decision.decision, "promote")
+        self.assertEqual(
+            decision.public_decision.decision,
+            "promote_horizon_reached_without_harm",
+        )
         self.assertEqual(decision.public_decision.tier, "canary")
 
     def test_observe_without_pair_execution_rejected(self) -> None:
@@ -686,6 +694,150 @@ class CanaryControllerTests(unittest.TestCase):
         self.assertEqual(snap.serving_configuration_hash, candidate_hash)
         with self.assertRaises(CanaryRejected):
             controller.begin_candidate_episode()
+
+    def test_paired_difference_cs_rollback_on_clear_harm(self) -> None:
+        controller, reference, candidate, clock = _controller(
+            settings=_settings(
+                harm_margin=0.05,
+                stopping_rule=StoppingRule(
+                    name="paired_difference_cs",
+                    alpha=0.05,
+                    horizon_episodes=50,
+                ),
+            )
+        )
+        controller.start(_passing_gate(reference, candidate))
+        controller.begin_candidate_episode()
+        decision = None
+        for _ in range(30):
+            controller.begin_candidate_episode()
+            pair = _run_execute_pair(
+                reference,
+                candidate,
+                clock,
+                candidate_success=False,
+            )
+            decision = controller.observe(pair)
+            if decision.action == "rollback":
+                break
+        assert decision is not None
+        self.assertEqual(decision.action, "rollback")
+        self.assertIsNotNone(decision.evidence)
+        self.assertEqual(decision.evidence.direction, "harmful")
+        self.assertTrue(decision.evidence.alarm)
+        self.assertIsNotNone(decision.public_decision)
+        self.assertEqual(decision.public_decision.decision, "rollback")
+        self.assertEqual(
+            decision.public_decision.evidence[0].direction, "harmful"
+        )
+        self.assertEqual(decision.snapshot.in_flight_at_rollback, 1)
+        self.assertGreaterEqual(decision.snapshot.served_before_rollback, 1)
+
+    def test_paired_difference_cs_improvement_never_rolls_back(self) -> None:
+        controller, reference, candidate, clock = _controller(
+            settings=_settings(
+                harm_margin=0.05,
+                stopping_rule=StoppingRule(
+                    name="paired_difference_cs",
+                    alpha=0.05,
+                    horizon_episodes=15,
+                ),
+            )
+        )
+        controller.start(_passing_gate(reference, candidate))
+        decisions = []
+        for _ in range(15):
+            controller.begin_candidate_episode()
+            pair = _run_execute_pair(
+                reference,
+                candidate,
+                clock,
+                candidate_success=True,
+                reference_success=False,
+            )
+            decision = controller.observe(pair)
+            decisions.append(decision)
+            self.assertNotEqual(decision.action, "rollback")
+            self.assertNotEqual(decision.evidence.direction, "harmful")
+            self.assertFalse(decision.evidence.alarm)
+        self.assertEqual(decisions[0].action, "continue")
+        self.assertEqual(decisions[-1].evidence.direction, "beneficial")
+        self.assertEqual(decisions[-1].action, "promote")
+        self.assertEqual(
+            decisions[-1].public_decision.decision,
+            "promote_horizon_reached_without_harm",
+        )
+
+    def test_paired_difference_cs_continues_when_evidence_insufficient(self) -> None:
+        controller, reference, candidate, clock = _controller(
+            settings=_settings(
+                harm_margin=0.05,
+                stopping_rule=StoppingRule(
+                    name="paired_difference_cs",
+                    alpha=0.05,
+                    horizon_episodes=3,
+                ),
+            )
+        )
+        controller.start(_passing_gate(reference, candidate))
+        controller.begin_candidate_episode()
+        pair = _run_execute_pair(reference, candidate, clock, candidate_success=True)
+        decision = controller.observe(pair)
+        self.assertEqual(decision.action, "continue")
+        self.assertEqual(decision.evidence.direction, "insufficient")
+        self.assertFalse(decision.evidence.alarm)
+
+    def test_metric_orientation_reversal_flips_harm_direction(self) -> None:
+        controller, reference, candidate, clock = _controller(
+            settings=_settings(
+                harm_margin=0.05,
+                metric_orientation="lower_is_better",
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=1,
+                ),
+            )
+        )
+        controller.start(_passing_gate(reference, candidate))
+        controller.begin_candidate_episode()
+        pair = _run_execute_pair(
+            reference,
+            candidate,
+            clock,
+            candidate_success=True,
+            reference_success=False,
+        )
+        decision = controller.observe(pair)
+        self.assertEqual(decision.action, "rollback")
+        self.assertEqual(decision.evidence.direction, "harmful")
+
+    def test_metric_orientation_default_reads_same_pair_as_improvement(self) -> None:
+        controller, reference, candidate, clock = _controller(
+            settings=_settings(
+                harm_margin=0.05,
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=1,
+                ),
+            )
+        )
+        controller.start(_passing_gate(reference, candidate))
+        controller.begin_candidate_episode()
+        pair = _run_execute_pair(
+            reference,
+            candidate,
+            clock,
+            candidate_success=True,
+            reference_success=False,
+        )
+        decision = controller.observe(pair)
+        self.assertEqual(decision.action, "promote")
+        self.assertEqual(
+            decision.public_decision.decision,
+            "promote_horizon_reached_without_harm",
+        )
 
 
 if __name__ == "__main__":

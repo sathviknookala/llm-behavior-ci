@@ -392,6 +392,8 @@ def _build_lock(
             _harm_label(harmful=harmful, task_set_hash=dev_tasks.task_set_hash),
         ),
         validation_reports=(_report(),),
+        faults=(_temperature_fault(),),
+        plan_evidence=_plan_evidence(),
         gate=GateSettings(
             confidence_level=0.9,
             bootstrap_resamples=20,
@@ -411,6 +413,8 @@ def _build_lock(
                 alpha=canary_alpha,
                 horizon_episodes=canary_horizon,
             ),
+            metric_orientation="higher_is_better",
+            promotion_policy="horizon_reached_without_harm",
         ),
         monitor=MonitorSettings(
             reference_configuration_hash=reference_hash,
@@ -835,6 +839,8 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                     ),
                 ),
                 validation_reports=(_report(),),
+                faults=(fault,),
+                plan_evidence=_plan_evidence(),
                 gate=GateSettings(
                     confidence_level=0.9,
                     bootstrap_resamples=20,
@@ -854,6 +860,8 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                         alpha=0.5,
                         horizon_episodes=3,
                     ),
+                    metric_orientation="higher_is_better",
+                    promotion_policy="horizon_reached_without_harm",
                 ),
                 monitor=MonitorSettings(
                     reference_configuration_hash=reference_hash,

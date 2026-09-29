@@ -15,12 +15,14 @@ except ImportError as error:
 
 from llm_behavior_ci.config import (
     CanarySettings,
+    DistributionalMonitorSettings,
     MonitorSettings,
     RunConfiguration,
     StoppingRule,
     run_configuration_hash,
 )
 from llm_behavior_ci.lifecycle.monitoring import (
+    DistributionalMonitor,
     FrozenReference,
     ProductionMonitor,
     TaskMetadata,
@@ -368,6 +370,8 @@ class ServiceEpisodeIntegrationTests(unittest.TestCase):
                     alpha=0.05,
                     horizon_episodes=10,
                 ),
+                metric_orientation="higher_is_better",
+                promotion_policy="horizon_reached_without_harm",
             ),
             canary_assignment_seed=0,
         )
@@ -407,6 +411,142 @@ class ServiceEpisodeIntegrationTests(unittest.TestCase):
             "task_success",
         )
         self.assertEqual(self.monitor.updates[0].value, 1.0)
+
+
+class MultiSignalServiceMonitoringTests(unittest.TestCase):
+    """Every configured scalar signal, plus tool_selection, from one episode."""
+
+    def setUp(self) -> None:
+        from llm_behavior_ci.service import (
+            ConfigurationRegistry,
+            ServiceDependencies,
+            create_app,
+        )
+
+        self.create_app = create_app
+        self.ConfigurationRegistry = ConfigurationRegistry
+        self.ServiceDependencies = ServiceDependencies
+        self._tmpdir = TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.production = _config()
+        self.candidate = _candidate(self.production)
+        self.clock = _clock()
+        self.store_path = Path(self._tmpdir.name) / "episodes.sqlite"
+        self.store = LazyStore(self.store_path)
+        digest = run_configuration_hash(self.production)
+        settings = MonitorSettings(
+            reference_configuration_hash=digest,
+            outcome_delay_seconds=0.0,
+            signals=("task_success", "tool_error_count"),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=20,
+                    threshold=5.0,
+                ),
+            ),
+        )
+        self.monitor = SpyMonitor(
+            settings,
+            FrozenReference(
+                configuration_hash=digest,
+                baselines=(("task_success", 0.9), ("tool_error_count", 0.0)),
+            ),
+            clock=self.clock,
+            dedup_seconds=0.0,
+        )
+        self.tool_selection_monitor = DistributionalMonitor(
+            DistributionalMonitorSettings(
+                signal="tool_selection",
+                reference_counts=(("lookup", 1),),
+                window_episodes=10,
+                alpha=0.01,
+                correction="none",
+            ),
+            reference_configuration_hash=digest,
+            clock=self.clock,
+            dedup_seconds=0.0,
+        )
+
+    def _metadata_for(self, episode) -> TaskMetadata:
+        del episode
+        return TaskMetadata(signal="task_success", completion_index=0)
+
+    def _runtime(self) -> RuntimeDependencies:
+        return RuntimeDependencies(
+            session_factory=lambda task_id: FakeSession(task_id),
+            agent=FakeAgent(
+                [
+                    _turn(_ACTION, action=_ACTION, api_name="lookup"),
+                    _turn("STOP", action=None),
+                ],
+                clock=self.clock,
+            ),
+            clock=self.clock,
+        )
+
+    def _client(self):
+        dependencies = self.ServiceDependencies(
+            registry=self.ConfigurationRegistry(
+                production=self.production,
+                candidate=self.candidate,
+            ),
+            runtime_factory=lambda config: self._runtime(),
+            store=self.store,
+            monitor=self.monitor,
+            clock=self.clock,
+            max_in_flight=4,
+            shutdown_timeout_seconds=1.0,
+            metadata_for=self._metadata_for,
+            canary_settings=CanarySettings(
+                fraction=1.0,
+                outcome_delay_seconds=0.0,
+                harm_margin=0.1,
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=10,
+                ),
+                metric_orientation="higher_is_better",
+                promotion_policy="horizon_reached_without_harm",
+            ),
+            canary_assignment_seed=0,
+            tool_selection_monitor=self.tool_selection_monitor,
+        )
+        app = self.create_app(dependencies)
+        client = TestClient(app)
+        client.__enter__()
+        self.addCleanup(client.__exit__, None, None, None)
+        return client
+
+    def test_every_configured_signal_updates_and_persists_metadata(self) -> None:
+        client = self._client()
+        response = client.post(
+            "/episodes",
+            json={
+                "task_id": "task-1",
+                "mode": "execute",
+                "role": "production",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["monitoring_status"], "updated")
+        episode_id = body["episode_id"]
+
+        self.assertEqual(len(self.monitor.updates), 2)
+        fed_signals = {observation.signal for observation in self.monitor.updates}
+        self.assertEqual(fed_signals, {"task_success", "tool_error_count"})
+
+        reader = EpisodeStore(self.store_path)
+        self.addCleanup(reader.close)
+        persisted = reader.load_monitor_metadata_for_episode(episode_id)
+        persisted_signals = {record.signal for record in persisted}
+        self.assertEqual(
+            persisted_signals,
+            {"task_success", "tool_error_count", "tool_selection"},
+        )
 
 
 if __name__ == "__main__":

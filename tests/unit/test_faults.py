@@ -37,9 +37,6 @@ _REPO = Path(__file__).resolve().parents[2]
 _CATALOG = _REPO / "configs" / "faults"
 _START = datetime(2026, 9, 27, 15, 0, tzinfo=timezone.utc)
 _LOGPROBS = ((TokenLogprob(token_id=7, logprob=-0.5, rank=0),),)
-_SCHEMA_GAP_IDS = frozenset(
-    {"api_documentation_one_app", "lora_off_distribution"}
-)
 _EXPECTED_FAULT_IDS = (
     "api_documentation_one_app",
     "benign_batch_invariant",
@@ -380,26 +377,36 @@ class FaultPatchValidationTests(unittest.TestCase):
             apply_fault(base, fault)
         self.assertIn("outside the declared fault", str(ctx.exception))
 
-    def test_schema_gap_apply_leaves_base_unchanged(self) -> None:
+    def test_lora_and_api_documentation_are_now_representable(self) -> None:
         base = _base()
         before = copy.deepcopy(base)
         model_id = id(base.model)
         agent_id = id(base.agent)
         task_id = id(base.task)
-        for fault_id in sorted(_SCHEMA_GAP_IDS):
-            fault = load_fault(_CATALOG / f"{fault_id}.v1.json")
-            with self.subTest(fault_id=fault_id):
-                with self.assertRaises(FaultError) as ctx:
-                    apply_fault(base, fault)
-                message = str(ctx.exception)
-                self.assertTrue(
-                    "agent.api_docs_version" in message
-                    or "model.lora.repository" in message
-                )
-                self.assertEqual(base, before)
-                self.assertEqual(id(base.model), model_id)
-                self.assertEqual(id(base.agent), agent_id)
-                self.assertEqual(id(base.task), task_id)
+        lora_fault = load_fault(_CATALOG / "lora_off_distribution.v1.json")
+        docs_fault = load_fault(_CATALOG / "api_documentation_one_app.v1.json")
+        self.assertTrue(lora_fault.representable)
+        self.assertTrue(docs_fault.representable)
+
+        lora_candidate = apply_fault(base, lora_fault)
+        self.assertEqual(
+            lora_candidate.model.lora.repository,
+            "Qwen/Qwen3-4B-lora-off-distribution",
+        )
+        self.assertIsNone(base.model.lora)
+
+        docs_candidate = apply_fault(base, docs_fault)
+        self.assertEqual(
+            docs_candidate.agent.api_docs_version,
+            "api-docs-corrupt-v1",
+        )
+        self.assertEqual(docs_candidate.agent.api_docs_app, "supervisor")
+        self.assertIsNone(base.agent.api_docs_version)
+
+        self.assertEqual(base, before)
+        self.assertEqual(id(base.model), model_id)
+        self.assertEqual(id(base.agent), agent_id)
+        self.assertEqual(id(base.task), task_id)
 
 
 class FaultReproducibilityTests(unittest.TestCase):
@@ -584,7 +591,8 @@ class FaultFreezeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         text = buffer.getvalue()
         self.assertIn("fp8_weights:1", text)
-        self.assertIn("schema_gap", text)
+        self.assertIn("live_unavailable", text)
+        self.assertNotIn("schema_gap", text)
 
 
 class FaultSplitRejectionTests(unittest.TestCase):
@@ -647,73 +655,84 @@ class FaultCatalogTests(unittest.TestCase):
         for fault in catalog:
             with self.subTest(fault_id=fault.fault_id):
                 self.assertTrue(fault.schema_supported)
-                if fault.fault_id in _SCHEMA_GAP_IDS:
-                    self.assertFalse(fault.representable)
-                    with self.assertRaises(FaultError):
-                        apply_fault(base, fault)
-                else:
-                    self.assertTrue(fault.representable)
-                    candidate = apply_fault(base, fault)
-                    self.assertIsNot(candidate, base)
-                    if fault.fault_id == "benign_identical":
-                        self.assertEqual(candidate, base)
-                    elif fault.fault_id == "benign_noop_redeploy":
-                        self.assertEqual(candidate.git_commit, "b" * 40)
-                    elif fault.fault_id == "benign_batch_invariant":
-                        self.assertTrue(candidate.model.serving.batch_invariant)
-                    elif fault.fault_id == "benign_logging_refactor":
-                        self.assertEqual(candidate.git_commit, "c" * 40)
-                    elif fault.fault_id == "fp8_weights":
-                        self.assertEqual(
-                            candidate.model.quantization.method,
-                            "fp8",
-                        )
-                    elif fault.fault_id == "nvfp4_weights":
-                        self.assertEqual(
-                            candidate.model.quantization.method,
-                            "nvfp4",
-                        )
-                    elif fault.fault_id == "model_downgrade_qwen3_1_7b":
-                        self.assertEqual(
-                            candidate.model.model.repository,
-                            "Qwen/Qwen3-1.7B",
-                        )
-                        self.assertEqual(
-                            candidate.model.tokenizer.repository,
-                            "Qwen/Qwen3-1.7B",
-                        )
-                        self.assertEqual(
-                            candidate.model.model.revision,
-                            base.model.model.revision,
-                        )
-                        self.assertEqual(
-                            candidate.model.tokenizer.revision,
-                            base.model.tokenizer.revision,
-                        )
-                    elif fault.fault_id == "prompt_remove_api_guidance":
-                        self.assertEqual(
-                            candidate.agent.prompt.prompt_version,
-                            "prompt-no-api-guidance",
-                        )
-                    elif fault.fault_id == "template_thinking_enabled":
-                        self.assertTrue(candidate.agent.prompt.thinking_enabled)
-                    elif fault.fault_id == "sampling_temperature_one":
-                        self.assertEqual(candidate.agent.sampling.temperature, 1.0)
-                        self.assertIsInstance(
-                            candidate.agent.sampling.temperature,
-                            float,
-                        )
-                    elif fault.fault_id == "token_limit_truncation":
-                        self.assertEqual(candidate.agent.sampling.max_tokens, 16)
-                    elif fault.fault_id == "step_limit_reduced":
-                        self.assertEqual(candidate.agent.step_limit, 4)
+                self.assertTrue(fault.representable)
+                candidate = apply_fault(base, fault)
+                self.assertIsNot(candidate, base)
+                if fault.fault_id == "benign_identical":
+                    self.assertEqual(candidate, base)
+                elif fault.fault_id == "benign_noop_redeploy":
+                    self.assertEqual(candidate.git_commit, "b" * 40)
+                elif fault.fault_id == "benign_batch_invariant":
+                    self.assertTrue(candidate.model.serving.batch_invariant)
+                elif fault.fault_id == "benign_logging_refactor":
+                    self.assertEqual(candidate.git_commit, "c" * 40)
+                elif fault.fault_id == "fp8_weights":
+                    self.assertEqual(
+                        candidate.model.quantization.method,
+                        "fp8",
+                    )
+                elif fault.fault_id == "nvfp4_weights":
+                    self.assertEqual(
+                        candidate.model.quantization.method,
+                        "nvfp4",
+                    )
+                elif fault.fault_id == "model_downgrade_qwen3_1_7b":
+                    self.assertEqual(
+                        candidate.model.model.repository,
+                        "Qwen/Qwen3-1.7B",
+                    )
+                    self.assertEqual(
+                        candidate.model.tokenizer.repository,
+                        "Qwen/Qwen3-1.7B",
+                    )
+                    self.assertEqual(
+                        candidate.model.model.revision,
+                        base.model.model.revision,
+                    )
+                    self.assertEqual(
+                        candidate.model.tokenizer.revision,
+                        base.model.tokenizer.revision,
+                    )
+                elif fault.fault_id == "prompt_remove_api_guidance":
+                    self.assertEqual(
+                        candidate.agent.prompt.prompt_version,
+                        "prompt-no-api-guidance",
+                    )
+                elif fault.fault_id == "template_thinking_enabled":
+                    self.assertTrue(candidate.agent.prompt.thinking_enabled)
+                elif fault.fault_id == "sampling_temperature_one":
+                    self.assertEqual(candidate.agent.sampling.temperature, 1.0)
+                    self.assertIsInstance(
+                        candidate.agent.sampling.temperature,
+                        float,
+                    )
+                elif fault.fault_id == "token_limit_truncation":
+                    self.assertEqual(candidate.agent.sampling.max_tokens, 16)
+                elif fault.fault_id == "step_limit_reduced":
+                    self.assertEqual(candidate.agent.step_limit, 4)
+                elif fault.fault_id == "lora_off_distribution":
+                    self.assertEqual(
+                        candidate.model.lora.repository,
+                        "Qwen/Qwen3-4B-lora-off-distribution",
+                    )
+                    self.assertEqual(
+                        candidate.model.lora.revision,
+                        "d" * 40,
+                    )
+                    self.assertIsNone(base.model.lora)
+                elif fault.fault_id == "api_documentation_one_app":
+                    self.assertEqual(
+                        candidate.agent.api_docs_version,
+                        "api-docs-corrupt-v1",
+                    )
+                    self.assertEqual(candidate.agent.api_docs_app, "supervisor")
+                    self.assertIsNone(base.agent.api_docs_version)
 
     def test_live_unavailable_faults_reported_not_absent(self) -> None:
         catalog = load_fault_catalog(_CATALOG)
         by_id = {fault.fault_id: fault for fault in catalog}
         self.assertEqual(set(by_id), set(_EXPECTED_FAULT_IDS))
         unavailable = {
-            "api_documentation_one_app",
             "lora_off_distribution",
             "fp8_weights",
             "nvfp4_weights",
@@ -727,13 +746,17 @@ class FaultCatalogTests(unittest.TestCase):
         live = live_fault_available(by_id["sampling_temperature_one"])
         self.assertTrue(live.available)
         self.assertIsNone(live.reason)
+        docs_live = live_fault_available(by_id["api_documentation_one_app"])
+        self.assertTrue(docs_live.available)
+        self.assertIsNone(docs_live.reason)
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             code = main(["--catalog", str(_CATALOG)])
         self.assertEqual(code, 0)
         text = buffer.getvalue()
         self.assertIn("fp8_weights:1\tquantization\tlive_unavailable", text)
-        self.assertIn("api_documentation_one_app:1\tapi_documentation\tschema_gap", text)
+        self.assertIn("lora_off_distribution:1\tlora\tlive_unavailable", text)
+        self.assertIn("api_documentation_one_app:1\tapi_documentation\tlive", text)
         self.assertIn("sampling_temperature_one:1\tsampling\tlive", text)
 
 

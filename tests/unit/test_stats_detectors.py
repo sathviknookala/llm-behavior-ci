@@ -4,8 +4,15 @@ import math
 import unittest
 
 from llm_behavior_ci.stats.adwin import ADWIN
-from llm_behavior_ci.stats.canary import SequentialCanaryTest
-from llm_behavior_ci.stats.confidence_sequence import BoundedMeanCS, stitched_radius
+from llm_behavior_ci.stats.canary import (
+    PairedDifferenceCanaryTest,
+    SequentialCanaryTest,
+)
+from llm_behavior_ci.stats.confidence_sequence import (
+    BoundedMeanCS,
+    PairedDifferenceCS,
+    stitched_radius,
+)
 from llm_behavior_ci.stats.cusum import CUSUM
 from llm_behavior_ci.stats.e_detector import BettingEDetector
 from llm_behavior_ci.stats.evidence import PairedSuccess, StatisticsError
@@ -97,6 +104,93 @@ class DetectorTests(unittest.TestCase):
         )
         first.update(PairedSuccess(1.0, 1.0))
         self.assertEqual(second.snapshot()["sample_size"], 0)
+
+    def test_harmful_shift_direction_is_harmful_only_on_alarm(self) -> None:
+        detector = HarmfulShiftTest(alpha=0.05, harm_margin=0.05)
+        insufficient = detector.update(PairedSuccess(candidate=1.0, reference=1.0))
+        self.assertFalse(insufficient.alarm)
+        self.assertEqual(insufficient.direction, "insufficient")
+        evidence = insufficient
+        for _ in range(20):
+            evidence = detector.update(PairedSuccess(candidate=0.0, reference=1.0))
+            if evidence.alarm:
+                break
+        self.assertTrue(evidence.alarm)
+        self.assertEqual(evidence.direction, "harmful")
+
+    def test_raw_two_sided_confidence_sequence_alarms_on_improvement(self) -> None:
+        """Documents the bug this task fixes.
+
+        ``PairedDifferenceCS`` is a generic, validated two-sided test: its
+        own null check requires ``null_mean=0``. Constructing it instead
+        with ``null_mean=-harm_margin`` (the canary controller's old
+        construction) makes it alarm the first time the candidate clearly
+        *improves* on the reference, because the confidence sequence
+        excludes ``-harm_margin`` from above just as readily as from
+        below. ``PairedDifferenceCanaryTest`` is the fix: it reads the
+        same, unmodified confidence sequence math but only ever alarms in
+        the harmful direction.
+        """
+        old_construction = PairedDifferenceCS(
+            alpha=0.05,
+            lower=-1.0,
+            upper=1.0,
+            null_mean=-0.1,
+        )
+        evidence = None
+        for _ in range(30):
+            evidence = old_construction.update(
+                PairedSuccess(candidate=1.0, reference=0.0)
+            )
+            if evidence.alarm:
+                break
+        assert evidence is not None
+        self.assertTrue(evidence.alarm)
+
+    def test_paired_difference_canary_test_never_alarms_on_improvement(self) -> None:
+        detector = PairedDifferenceCanaryTest(
+            alpha=0.05,
+            harm_margin=0.1,
+            horizon_episodes=30,
+        )
+        evidence = None
+        for _ in range(30):
+            evidence = detector.update(PairedSuccess(candidate=1.0, reference=0.0))
+            self.assertFalse(evidence.alarm)
+        assert evidence is not None
+        self.assertEqual(evidence.direction, "beneficial")
+
+    def test_paired_difference_canary_test_alarms_only_when_harmful(self) -> None:
+        detector = PairedDifferenceCanaryTest(
+            alpha=0.05,
+            harm_margin=0.05,
+            horizon_episodes=20,
+        )
+        evidence = None
+        for _ in range(20):
+            evidence = detector.update(PairedSuccess(candidate=0.0, reference=1.0))
+            if evidence.alarm:
+                break
+        assert evidence is not None
+        self.assertTrue(evidence.alarm)
+        self.assertEqual(evidence.direction, "harmful")
+
+    def test_paired_difference_canary_test_insufficient_then_stops_at_horizon(
+        self,
+    ) -> None:
+        detector = PairedDifferenceCanaryTest(
+            alpha=0.05,
+            harm_margin=0.1,
+            horizon_episodes=2,
+        )
+        first = detector.update(PairedSuccess(candidate=1.0, reference=1.0))
+        self.assertFalse(first.alarm)
+        self.assertEqual(first.direction, "insufficient")
+        self.assertEqual(dict(first.details)["stopped_at_horizon"], 0.0)
+        second = detector.update(PairedSuccess(candidate=1.0, reference=1.0))
+        self.assertFalse(second.alarm)
+        self.assertEqual(second.direction, "insufficient")
+        self.assertEqual(dict(second.details)["stopped_at_horizon"], 1.0)
 
 
 if __name__ == "__main__":

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, Literal
 
@@ -37,6 +38,8 @@ from llm_behavior_ci.lifecycle.canary import (
     assign_canary,
 )
 from llm_behavior_ci.lifecycle.monitoring import (
+    Alert,
+    DistributionalMonitor,
     FrozenReference,
     LocalAlertSink,
     MissingEvaluatorOutcome,
@@ -44,6 +47,7 @@ from llm_behavior_ci.lifecycle.monitoring import (
     ProductionMonitor,
     TaskMetadata,
     UndefinedRequirementFraction,
+    resolved_slice_name,
     task_mix_observation_from_episode,
     tool_selection_observation_from_episode,
 )
@@ -59,17 +63,8 @@ from llm_behavior_ci.storage import DeploymentDecisionRecord, EpisodeStore, Stor
 
 _EPISODE_REQUIRED = frozenset({"task_id", "mode"})
 _EPISODE_FIELDS = frozenset({"task_id", "mode", "role", "assignment_key"})
-_GATE_FIELDS = frozenset(
-    {
-        "outcome",
-        "reason_codes",
-        "reference_configuration_hash",
-        "candidate_configuration_hash",
-        "task_set_hash",
-        "reference_protocol_hash",
-        "candidate_protocol_hash",
-    }
-)
+_CANDIDATE_ADMISSION_FIELDS = frozenset({"artifact_id"})
+_ARTIFACT_ID = re.compile(r"^[0-9a-f]{64}$")
 _FORBIDDEN_OVERRIDE_FIELDS = frozenset(
     {
         "model",
@@ -115,6 +110,8 @@ class ServiceDependencies:
     canary_settings: CanarySettings
     canary_assignment_seed: int
     task_selection_allowance: TaskSelectionAllowance | None = None
+    tool_selection_monitor: DistributionalMonitor | None = None
+    task_mix_monitor: DistributionalMonitor | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -167,19 +164,20 @@ class ServiceDependencies:
                 raise ValueError(
                     "task_selection_allowance must be TaskSelectionAllowance or None"
                 )
+            if self.tool_selection_monitor is not None and not isinstance(
+                self.tool_selection_monitor, DistributionalMonitor
+            ):
+                raise ValueError(
+                    "tool_selection_monitor must be DistributionalMonitor or None"
+                )
+            if self.task_mix_monitor is not None and not isinstance(
+                self.task_mix_monitor, DistributionalMonitor
+            ):
+                raise ValueError(
+                    "task_mix_monitor must be DistributionalMonitor or None"
+                )
         except ValueError as error:
             raise ServiceError(error) from error
-
-
-@dataclass(frozen=True)
-class _GateDocument:
-    outcome: str
-    reason_codes: tuple[str, ...]
-    reference_configuration_hash: str
-    candidate_configuration_hash: str
-    task_set_hash: str
-    reference_protocol_hash: str | None
-    candidate_protocol_hash: str | None
 
 
 @dataclass(frozen=True)
@@ -294,51 +292,37 @@ def _parse_episode_request(body: object) -> _EpisodeRequest:
     )
 
 
-def _parse_gate(body: object) -> _GateDocument:
+def _parse_candidate_admission(body: object) -> str:
+    """Parse the request for candidate admission down to one artifact id.
+
+    Candidate admission no longer accepts a caller-typed gate document:
+    the request names the ``ValidationArtifact`` a real ``run_offline_gate``
+    call already produced and persisted (``EpisodeStore.
+    append_validation_artifact``), by its content-addressed id. Every
+    other field of that artifact is read back from the store, never from
+    this request body, so nothing here can substitute different evidence
+    under a borrowed id.
+    """
+
     if not isinstance(body, dict):
         raise ServiceError("body must be a JSON object")
     if not all(isinstance(key, str) for key in body):
         raise ServiceError("body keys must be strings")
     _reject_overrides(body)
-    extra = set(body) - _GATE_FIELDS
+    extra = set(body) - _CANDIDATE_ADMISSION_FIELDS
     if extra:
         raise ServiceError(
             "unexpected fields: " + ", ".join(sorted(extra))
         )
-    missing = _GATE_FIELDS - set(body)
+    missing = _CANDIDATE_ADMISSION_FIELDS - set(body)
     if missing:
         raise ServiceError(
             "missing fields: " + ", ".join(sorted(missing))
         )
-    outcome = body["outcome"]
-    reason_codes = body["reason_codes"]
-    if not isinstance(outcome, str) or outcome == "":
-        raise ServiceError("outcome must be a non-empty string")
-    if not isinstance(reason_codes, list) or not all(
-        isinstance(item, str) for item in reason_codes
-    ):
-        raise ServiceError("reason_codes must be a list of strings")
-    for name in (
-        "reference_configuration_hash",
-        "candidate_configuration_hash",
-        "task_set_hash",
-    ):
-        value = body[name]
-        if not isinstance(value, str) or value == "":
-            raise ServiceError(f"{name} must be a non-empty string")
-    for name in ("reference_protocol_hash", "candidate_protocol_hash"):
-        value = body[name]
-        if value is not None and (not isinstance(value, str) or value == ""):
-            raise ServiceError(f"{name} must be a string or null")
-    return _GateDocument(
-        outcome=outcome,
-        reason_codes=tuple(reason_codes),
-        reference_configuration_hash=str(body["reference_configuration_hash"]),
-        candidate_configuration_hash=str(body["candidate_configuration_hash"]),
-        task_set_hash=str(body["task_set_hash"]),
-        reference_protocol_hash=body["reference_protocol_hash"],
-        candidate_protocol_hash=body["candidate_protocol_hash"],
-    )
+    artifact_id = body["artifact_id"]
+    if not isinstance(artifact_id, str) or _ARTIFACT_ID.fullmatch(artifact_id) is None:
+        raise ServiceError("artifact_id must be a lowercase SHA-256 hex digest")
+    return artifact_id
 
 
 def _apply_mode(runtime: RuntimeDependencies, mode: ModeName) -> None:
@@ -373,43 +357,97 @@ def _feed_monitor(
     state: _ServiceState,
     episode: EpisodeResult,
 ) -> str:
-    metadata = state.dependencies.metadata_for(episode)
+    """Feed every configured signal from one execute-mode episode.
+
+    Loops over every scalar series ``state.dependencies.monitor.signals``
+    names (``task_success``, ``requirement_fraction``, ``tool_error_count``,
+    ``invalid_tool_call_count``, ``trajectory_length``, and, when a caller
+    schedules them, ``plan_quality_score``/``plan_kl_mean_nats``), not just
+    the one signal a launcher happens to name first, so a monitor
+    configured for several signals actually sees all of them from the same
+    episode. ``tool_selection`` is always recorded as a typed distributional
+    observation; ``task_mix`` is recorded whenever the caller's metadata
+    names one. Both are routed to their configured ``DistributionalMonitor``
+    when the deployment wires one, never coerced into a scalar signal.
+    Every fed signal's metadata is persisted (``EpisodeStore.
+    append_monitor_metadata``) beside the already-persisted episode, so a
+    later reader can reconstruct the exact detector input this call used.
+    Scalar values themselves come only from ``episode.evaluator_outcome``
+    and ``episode.tool_steps``/``model_steps`` (``normalize_episode``),
+    real execution and evaluation, never a launcher-supplied override.
+    """
+
+    base_metadata = state.dependencies.metadata_for(episode)
     monitor = state.dependencies.monitor
     period_id = state.monitor_period_id
-    try:
-        alerts = monitor.update_from_episode(
-            episode,
-            task_metadata=metadata,
-            period_id=period_id,
-        )
-    except (MissingEvaluatorOutcome, UndefinedRequirementFraction):
-        return "withheld"
-    except MonitorRejected:
-        if metadata.signal in {"tool_selection", "task_mix"}:
-            if metadata.signal == "tool_selection":
-                tool_selection_observation_from_episode(
-                    episode,
-                    task_metadata=metadata,
-                )
-            elif metadata.task_mix is not None:
-                task_mix_observation_from_episode(
-                    episode,
-                    task_metadata=metadata,
-                )
-            return "recorded"
-        raise
-    if metadata.task_mix is not None:
-        task_mix_observation_from_episode(
-            episode,
-            task_metadata=metadata,
-        )
-    tool_selection_observation_from_episode(
+    store = state.dependencies.store
+    episode_id = episode.episode.episode_id
+    all_alerts: list[Alert] = []
+    updated = False
+    recorded = False
+    withheld = False
+
+    for signal in monitor.signals:
+        metadata = replace(base_metadata, signal=signal)
+        store.append_monitor_metadata(metadata.to_record(episode_id))
+        try:
+            alerts = monitor.update_from_episode(
+                episode,
+                task_metadata=metadata,
+                period_id=period_id,
+            )
+        except (MissingEvaluatorOutcome, UndefinedRequirementFraction):
+            withheld = True
+            continue
+        updated = True
+        all_alerts.extend(alerts)
+
+    tool_metadata = replace(base_metadata, signal="tool_selection")
+    store.append_monitor_metadata(tool_metadata.to_record(episode_id))
+    selection = tool_selection_observation_from_episode(
         episode,
-        task_metadata=metadata,
+        task_metadata=tool_metadata,
     )
-    if alerts:
-        state.alert_sink.deliver(alerts)
-    return "updated"
+    tool_monitor = state.dependencies.tool_selection_monitor
+    if tool_monitor is not None:
+        slice_name = resolved_slice_name(
+            episode,
+            tool_metadata,
+            use_slice_attribution=monitor.use_slice_attribution,
+        )
+        all_alerts.extend(tool_monitor.update(selection, slice_name=slice_name))
+        updated = True
+    else:
+        recorded = True
+
+    if base_metadata.task_mix is not None:
+        mix_metadata = replace(base_metadata, signal="task_mix")
+        store.append_monitor_metadata(mix_metadata.to_record(episode_id))
+        mix = task_mix_observation_from_episode(
+            episode,
+            task_metadata=mix_metadata,
+        )
+        mix_monitor = state.dependencies.task_mix_monitor
+        if mix_monitor is not None:
+            slice_name = resolved_slice_name(
+                episode,
+                mix_metadata,
+                use_slice_attribution=monitor.use_slice_attribution,
+            )
+            all_alerts.extend(mix_monitor.update(mix, slice_name=slice_name))
+            updated = True
+        else:
+            recorded = True
+
+    if all_alerts:
+        state.alert_sink.deliver(all_alerts)
+    if updated:
+        return "updated"
+    if recorded:
+        return "recorded"
+    if withheld:
+        return "withheld"
+    return "recorded"
 
 
 def _public_episode_receipt(
@@ -485,6 +523,7 @@ def _persist_lifecycle_decision(
     snapshot: DeploymentSnapshot,
     decided_at: datetime,
     method: str,
+    evidence_artifact_id: str | None = None,
 ) -> None:
     state.dependencies.store.append_deployment_decision(
         DeploymentDecisionRecord(
@@ -500,6 +539,7 @@ def _persist_lifecycle_decision(
             boundary=None,
             sample_size=snapshot.candidate_episodes_served,
             decided_at=decided_at,
+            evidence_artifact_id=evidence_artifact_id,
         )
     )
 
@@ -710,7 +750,7 @@ def _run_candidate_episode(
     )
 
 
-def _admit_candidate(state: _ServiceState, gate: _GateDocument) -> dict[str, object]:
+def _admit_candidate(state: _ServiceState, artifact_id: str) -> dict[str, object]:
     registry = state.dependencies.registry
     if registry.candidate is None:
         raise _Conflict("candidate configuration is not registered")
@@ -721,9 +761,12 @@ def _admit_candidate(state: _ServiceState, gate: _GateDocument) -> dict[str, obj
         raise _Conflict(
             "final-test admission is not performed by this service"
         )
+    artifact = state.dependencies.store.load_validation_artifact(artifact_id)
+    if artifact is None:
+        raise _Conflict("validation artifact is not recorded")
     try:
         admission = authorize_gated_candidate(
-            gate,
+            artifact,
             registry.production,
             registry.candidate,
             allowance=state.dependencies.task_selection_allowance,
@@ -746,6 +789,14 @@ def _admit_candidate(state: _ServiceState, gate: _GateDocument) -> dict[str, obj
             raise _Conflict(_message(error)) from error
         state.controller = controller
         state.admission = "open"
+        _persist_lifecycle_decision(
+            state,
+            decision="admit",
+            snapshot=controller.snapshot(),
+            decided_at=state.dependencies.clock(),
+            method="validation_artifact",
+            evidence_artifact_id=admission.evidence_artifact_id,
+        )
         return _deployment_document(state)
 
 
@@ -892,8 +943,8 @@ def create_app(dependencies: ServiceDependencies) -> FastAPI:
             body = await request.json()
         except Exception as error:
             raise ServiceError("body must be JSON") from error
-        gate = _parse_gate(body)
-        return _admit_candidate(state, gate)
+        artifact_id = _parse_candidate_admission(body)
+        return _admit_candidate(state, artifact_id)
 
     @app.post("/deployment/rollback")
     async def post_rollback() -> dict[str, object]:

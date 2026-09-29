@@ -35,6 +35,8 @@ model.serving.enforce_eager
 model.serving.tensor_parallel_size
 model.serving.max_logprobs
 model.serving.batch_invariant
+model.lora.repository
+model.lora.revision
 agent.smolagents_version
 agent.action_interface
 agent.prompt.prompt_version
@@ -47,6 +49,8 @@ agent.sampling.top_k
 agent.sampling.min_p
 agent.sampling.seed
 agent.sampling.max_tokens
+agent.api_docs_version
+agent.api_docs_app
 task.appworld_version
 task.split
 task.selection_rule
@@ -83,7 +87,21 @@ KV-cache dtypes are bfloat16, float16, and fp8. Model revisions,
 tokenizer revisions, and git_commit are 40-character lowercase git ids.
 task_set_hash and a present protocol_hash are 64-character lowercase
 SHA-256 digests. top_k is -1 or a positive integer. The sampling seed
-is required.
+is required. KL fidelity modes are full and top_k; runtime/scoring.py
+is where full is proven rather than merely claimed.
+
+model.lora.repository, model.lora.revision, agent.api_docs_version, and
+agent.api_docs_app are optional hashed leaves: ``ModelConfiguration.lora``
+and ``AgentConfiguration.api_docs_version``/``api_docs_app`` default to
+unset, and an unset leaf is omitted from canonical JSON entirely rather
+than serialized as null, so a configuration that never names a LoRA
+adapter or a corrupted API-documentation source hashes identically to one
+built before these fields existed. Setting, clearing, or changing either
+pair still changes the digest, because canonical JSON then differs.
+``leaf_value``/``hashed_values`` read these leaves through
+``MISSING_HASHED_LEAF`` rather than raising, so a caller comparing two
+configurations' hashed fields sees "unset" as one comparable value
+instead of a lookup error.
 """
 
 from __future__ import annotations
@@ -94,7 +112,7 @@ import math
 import re
 import uuid
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, Callable, Mapping, TypeVar, get_type_hints
+from typing import Any, Callable, Mapping, TypeVar, get_args, get_type_hints
 
 _T = TypeVar("_T")
 
@@ -103,6 +121,7 @@ ACTION_INTERFACES = frozenset({"code", "tool_calling"})
 QUANTIZATION_METHODS = frozenset({"none", "fp8", "nvfp4"})
 MODEL_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 KV_CACHE_DTYPES = frozenset({"bfloat16", "float16", "fp8"})
+KL_FIDELITY_MODES = frozenset({"full", "top_k"})
 HASHED_FIELDS = frozenset(
     {
         "model.model.repository",
@@ -123,6 +142,8 @@ HASHED_FIELDS = frozenset(
         "model.serving.tensor_parallel_size",
         "model.serving.max_logprobs",
         "model.serving.batch_invariant",
+        "model.lora.repository",
+        "model.lora.revision",
         "agent.smolagents_version",
         "agent.action_interface",
         "agent.prompt.prompt_version",
@@ -135,6 +156,8 @@ HASHED_FIELDS = frozenset(
         "agent.sampling.min_p",
         "agent.sampling.seed",
         "agent.sampling.max_tokens",
+        "agent.api_docs_version",
+        "agent.api_docs_app",
         "task.appworld_version",
         "task.split",
         "task.selection_rule",
@@ -161,8 +184,27 @@ MONITOR_SIGNALS = frozenset(
         "tool_error_count",
         "invalid_tool_call_count",
         "trajectory_length",
+        "plan_quality_score",
+        "plan_kl_mean_nats",
     }
 )
+"""The closed scalar series a ``MonitorObservation`` may carry.
+
+``plan_quality_score`` folds a semantic plan-feature vector (``lifecycle.
+plan_features``) into one bounded [0, 1] read, when a caller schedules
+plan-quality scoring alongside production traffic. ``plan_kl_mean_nats``
+folds one teacher-forced plan-KL result (``stats.kl`` /
+``runtime.scoring``) into one nonnegative read, when a caller schedules
+teacher-forced scoring. Both are optional: a production episode with
+neither scheduled emits neither observation. ``tool_selection`` and
+``task_mix`` are distribution-valued and are never members of this set;
+they are typed observations (``ToolSelectionObservation``,
+``TaskMixObservation``) routed through ``DistributionalMonitorSettings``
+and a windowed categorical test, never coerced into this scalar series.
+"""
+
+DISTRIBUTIONAL_SIGNALS = frozenset({"tool_selection", "task_mix"})
+DISTRIBUTIONAL_CORRECTIONS = frozenset({"none", "bonferroni"})
 
 
 class ConfigError(ValueError):
@@ -346,13 +388,50 @@ def _load(
     return cls(**arguments)
 
 
+def _optional_dataclass_hint(hint: object) -> type | None:
+    """The dataclass a field's type hint names, whether or not it is optional.
+
+    Handles ``SomeDataclass`` directly and ``SomeDataclass | None``
+    (equivalently ``Optional[SomeDataclass]``); returns ``None`` for every
+    other hint, including a plain ``str | None``.
+    """
+
+    if is_dataclass(hint):
+        return hint  # type: ignore[return-value]
+    args = get_args(hint)
+    if args and type(None) in args:
+        remaining = [arg for arg in args if arg is not type(None)]
+        if len(remaining) == 1 and is_dataclass(remaining[0]):
+            return remaining[0]
+    return None
+
+
 def _plain_dict(value: object, cls: type) -> dict[str, object]:
+    """Flatten one dataclass into a plain JSON-able dict, field by field.
+
+    A nested dataclass field (required, or ``SomeDataclass | None``) defers
+    to that field's own ``to_dict()`` rather than re-flattening it
+    structurally here, so a class with a custom ``to_dict()`` (an optional
+    nested config that omits its key entirely when unset, such as
+    ``ModelConfiguration.lora``) is respected however deeply it is nested.
+    A ``None`` optional-dataclass field is omitted from the payload
+    entirely; every other field, including a plain ``str | None`` such as
+    ``RunConfiguration.protocol_hash``, is copied through unchanged,
+    ``None`` included.
+    """
+
     hints = get_type_hints(cls)
     payload: dict[str, object] = {}
     for field in fields(cls):
         child = getattr(value, field.name)
-        if is_dataclass(hints[field.name]):
-            payload[field.name] = _plain_dict(child, hints[field.name])
+        nested = _optional_dataclass_hint(hints[field.name])
+        if nested is not None:
+            if child is None:
+                continue
+            to_dict = getattr(child, "to_dict", None)
+            payload[field.name] = (
+                to_dict() if callable(to_dict) else _plain_dict(child, nested)
+            )
         else:
             payload[field.name] = child
     return payload
@@ -452,12 +531,44 @@ class VLLMBehaviorSettings:
 
 
 @dataclass(frozen=True)
+class LoRASettings:
+    """A LoRA adapter's identity, when a configuration serves one.
+
+    ``ModelConfiguration.lora`` is ``None`` for the healthy base-model
+    configuration; setting it is the ``lora`` fault kind's whole effect.
+    Both fields are required together, matching ``ModelRevision``: a
+    partially-identified adapter is not a valid configuration.
+    """
+
+    repository: str
+    revision: str
+
+    def __post_init__(self) -> None:
+        _text(self.repository, "repository")
+        _git_revision(self.revision, "revision")
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, LoRASettings)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "lora",
+    ) -> LoRASettings:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+@dataclass(frozen=True)
 class ModelConfiguration:
     model: ModelRevision
     tokenizer: ModelRevision
     quantization: QuantizationSettings
     vllm_version: str
     serving: VLLMBehaviorSettings
+    lora: LoRASettings | None = None
 
     def __post_init__(self) -> None:
         _kind(self.model, ModelRevision, "model")
@@ -465,9 +576,20 @@ class ModelConfiguration:
         _kind(self.quantization, QuantizationSettings, "quantization")
         _text(self.vllm_version, "vllm_version")
         _kind(self.serving, VLLMBehaviorSettings, "serving")
+        if self.lora is not None:
+            _kind(self.lora, LoRASettings, "lora")
 
     def to_dict(self) -> dict[str, object]:
-        return _plain_dict(self, ModelConfiguration)
+        document: dict[str, object] = {
+            "model": self.model.to_dict(),
+            "tokenizer": self.tokenizer.to_dict(),
+            "quantization": self.quantization.to_dict(),
+            "vllm_version": self.vllm_version,
+            "serving": self.serving.to_dict(),
+        }
+        if self.lora is not None:
+            document["lora"] = self.lora.to_dict()
+        return document
 
     @classmethod
     def from_dict(
@@ -476,7 +598,7 @@ class ModelConfiguration:
         name: str = "model configuration",
     ) -> ModelConfiguration:
         mapping = _object(payload, name)
-        _require_fields(mapping, cls, name)
+        _require_fields(mapping, cls, name, optional=frozenset({"lora"}))
         model = ModelRevision.from_dict(mapping["model"], name="model")
         tokenizer = ModelRevision.from_dict(
             mapping["tokenizer"],
@@ -484,6 +606,9 @@ class ModelConfiguration:
         )
         quantization = QuantizationSettings.from_dict(mapping["quantization"])
         serving = VLLMBehaviorSettings.from_dict(mapping["serving"])
+        lora = (
+            LoRASettings.from_dict(mapping["lora"]) if "lora" in mapping else None
+        )
         return _construct(
             name,
             lambda: _load(
@@ -493,6 +618,7 @@ class ModelConfiguration:
                 tokenizer=tokenizer,
                 quantization=quantization,
                 serving=serving,
+                lora=lora,
             ),
         )
 
@@ -555,11 +681,21 @@ class SamplingSettings:
 
 @dataclass(frozen=True)
 class AgentConfiguration:
+    """One agent's runtime configuration.
+
+    ``api_docs_version``/``api_docs_app`` are set together or not at all:
+    the healthy configuration leaves both unset, and the ``api_documentation``
+    fault kind's whole effect is naming a corruption transform
+    (``api_docs_version``) and the one app it targets (``api_docs_app``).
+    """
+
     smolagents_version: str
     action_interface: str
     prompt: PromptSettings
     step_limit: int
     sampling: SamplingSettings
+    api_docs_version: str | None = None
+    api_docs_app: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.smolagents_version, "smolagents_version")
@@ -567,9 +703,26 @@ class AgentConfiguration:
         _kind(self.prompt, PromptSettings, "prompt")
         _positive(self.step_limit, "step_limit")
         _kind(self.sampling, SamplingSettings, "sampling")
+        if (self.api_docs_version is None) != (self.api_docs_app is None):
+            raise ConfigError(
+                "api_docs_version and api_docs_app must be set together"
+            )
+        if self.api_docs_version is not None:
+            _text(self.api_docs_version, "api_docs_version")
+            _text(self.api_docs_app, "api_docs_app")
 
     def to_dict(self) -> dict[str, object]:
-        return _plain_dict(self, AgentConfiguration)
+        document: dict[str, object] = {
+            "smolagents_version": self.smolagents_version,
+            "action_interface": self.action_interface,
+            "prompt": self.prompt.to_dict(),
+            "step_limit": self.step_limit,
+            "sampling": self.sampling.to_dict(),
+        }
+        if self.api_docs_version is not None:
+            document["api_docs_version"] = self.api_docs_version
+            document["api_docs_app"] = self.api_docs_app
+        return document
 
     @classmethod
     def from_dict(
@@ -578,7 +731,12 @@ class AgentConfiguration:
         name: str = "agent configuration",
     ) -> AgentConfiguration:
         mapping = _object(payload, name)
-        _require_fields(mapping, cls, name)
+        _require_fields(
+            mapping,
+            cls,
+            name,
+            optional=frozenset({"api_docs_version", "api_docs_app"}),
+        )
         prompt = PromptSettings.from_dict(mapping["prompt"])
         sampling = SamplingSettings.from_dict(mapping["sampling"])
         return _construct(
@@ -588,6 +746,8 @@ class AgentConfiguration:
                 mapping,
                 prompt=prompt,
                 sampling=sampling,
+                api_docs_version=mapping.get("api_docs_version"),
+                api_docs_app=mapping.get("api_docs_app"),
             ),
         )
 
@@ -683,6 +843,53 @@ def canonical_configuration_json(configuration: RunConfiguration) -> str:
 def run_configuration_hash(configuration: RunConfiguration) -> str:
     document = canonical_configuration_json(configuration)
     return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+
+class _MissingHashedLeaf:
+    """Sentinel for a ``HASHED_FIELDS`` path an optional leaf omits.
+
+    Compares equal only to itself, so "unset" is one comparable value
+    rather than a lookup failure: a fault that sets a previously-unset
+    optional leaf, or clears one, is detected as a change the same way a
+    fault that edits an always-present leaf is.
+    """
+
+    def __repr__(self) -> str:
+        return "<missing-hashed-leaf>"
+
+
+MISSING_HASHED_LEAF = _MissingHashedLeaf()
+
+
+def leaf_value(document: Mapping[str, object], path: str) -> object:
+    """Read one dotted ``HASHED_FIELDS`` path out of a configuration's ``to_dict()``.
+
+    Returns ``MISSING_HASHED_LEAF`` when any segment of ``path`` is absent,
+    which is exactly what happens at an optional leaf's parent object
+    (``model.lora``, or the omitted ``agent.api_docs_version``/
+    ``api_docs_app`` pair) when that leaf is unset.
+    """
+
+    node: object = document
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            return MISSING_HASHED_LEAF
+        node = node[part]
+    return node
+
+
+def hashed_values(configuration: RunConfiguration) -> dict[str, object]:
+    """Every ``HASHED_FIELDS`` leaf's value for one configuration.
+
+    An unset optional leaf reads as ``MISSING_HASHED_LEAF`` rather than
+    raising, so a caller that diffs two configurations' hashed fields never
+    needs a special case for a leaf that is being introduced or cleared.
+    """
+
+    if not isinstance(configuration, RunConfiguration):
+        raise ConfigError("hashed_values requires a run configuration")
+    document = configuration.to_dict()
+    return {path: leaf_value(document, path) for path in sorted(HASHED_FIELDS)}
 
 
 def _embeds(value: object, prefix: str, name: str) -> str:
@@ -909,26 +1116,57 @@ class GateSettings:
         return _construct(name, lambda: _load(cls, mapping))
 
 
+METRIC_ORIENTATIONS = frozenset({"higher_is_better", "lower_is_better"})
+"""How to read a rise in the canary's paired metric.
+
+``higher_is_better`` is the only metric this repo's runtime currently
+feeds the canary (evaluator task success), so it is the default. A future
+paired metric where a rise is worse (latency, error rate) sets
+``lower_is_better`` instead, so harm and benefit are never read
+backwards.
+"""
+
+PROMOTION_POLICIES = frozenset({"horizon_reached_without_harm"})
+"""The named automatic-promotion policies this controller implements.
+
+``horizon_reached_without_harm`` is the only one: promote once the
+configured horizon of paired episodes is reached without a harmful-
+direction alarm. It is a stopping-time exposure rule, not a claim that
+the candidate is statistically superior to the reference; that would be
+a separate, stronger promotion rule this task does not add.
+"""
+
+
 @dataclass(frozen=True)
 class CanarySettings:
     """Explicit inputs of paired canary execution.
 
     ``fraction`` is the share of tasks sent to the canary. ``harm_margin``
-    is the drop in evaluator task success that the canary treats as harm.
-    ``outcome_delay_seconds`` is the additional delay before evaluator
-    outcomes become visible. Zero is an explicit delay of none.
+    is the drop, in the direction ``metric_orientation`` calls worse, that
+    the canary treats as harm. ``outcome_delay_seconds`` is the additional
+    delay before evaluator outcomes become visible. Zero is an explicit
+    delay of none. ``metric_orientation`` states which direction of the
+    paired metric is worse, so a lower-is-better metric is never read as
+    if it were higher-is-better. ``promotion_policy`` names the automatic
+    promotion rule in force; it is represented separately from the
+    stopping rule's rollback evidence, and is not itself a rollback or
+    harm signal.
     """
 
     fraction: float
     outcome_delay_seconds: float
     harm_margin: float
     stopping_rule: StoppingRule
+    metric_orientation: str
+    promotion_policy: str
 
     def __post_init__(self) -> None:
         _open_unit(self.fraction, "fraction")
         _nonnegative_float(self.outcome_delay_seconds, "outcome_delay_seconds")
         _positive_float(self.harm_margin, "harm_margin")
         _kind(self.stopping_rule, StoppingRule, "stopping_rule")
+        _choice(self.metric_orientation, METRIC_ORIENTATIONS, "metric_orientation")
+        _choice(self.promotion_policy, PROMOTION_POLICIES, "promotion_policy")
 
     def to_dict(self) -> dict[str, object]:
         return _plain_dict(self, CanarySettings)
@@ -1043,4 +1281,89 @@ class MonitorSettings:
                 signals=signals,
                 stopping_rules=stopping_rules,
             ),
+        )
+
+
+def _reference_counts(value: object, name: str) -> tuple[tuple[str, int], ...]:
+    if not isinstance(value, tuple) or not value:
+        raise ConfigError(f"{name} must be a non-empty tuple of (name, count) pairs")
+    names: list[str] = []
+    pairs: list[tuple[str, int]] = []
+    for item in value:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or item[0] == ""
+        ):
+            raise ConfigError(f"{name} entries must be (name, count) pairs")
+        category, count = item
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ConfigError(f"{name} counts must be non-negative integers")
+        names.append(category)
+        pairs.append((category, count))
+    if len(set(names)) != len(names):
+        raise ConfigError(f"{name} contains a duplicate category name")
+    if sum(count for _category, count in pairs) <= 0:
+        raise ConfigError(f"{name} must have a positive total count")
+    return tuple(pairs)
+
+
+@dataclass(frozen=True)
+class DistributionalMonitorSettings:
+    """Explicit inputs for one windowed categorical drift monitor.
+
+    ``signal`` is ``tool_selection`` or ``task_mix``: a distribution-valued
+    series ``MonitorSettings.signals`` cannot name, since ``MONITOR_SIGNALS``
+    is the closed scalar set. ``reference_counts`` is the frozen baseline
+    category distribution (unnormalized counts; only their proportions
+    enter the chi-square test). ``window_episodes`` is how many observations
+    accumulate before one look. ``correction`` selects the repeated-look
+    adjustment the same way ``lifecycle.detectors.build_hourly_window_detector``
+    does for scalar fixed-window tests.
+    """
+
+    signal: str
+    reference_counts: tuple[tuple[str, int], ...]
+    window_episodes: int
+    alpha: float
+    correction: str
+
+    def __post_init__(self) -> None:
+        _choice(self.signal, DISTRIBUTIONAL_SIGNALS, "signal")
+        _reference_counts(self.reference_counts, "reference_counts")
+        _positive(self.window_episodes, "window_episodes")
+        _open_probability(self.alpha, "alpha")
+        _choice(self.correction, DISTRIBUTIONAL_CORRECTIONS, "correction")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "signal": self.signal,
+            "reference_counts": [list(item) for item in self.reference_counts],
+            "window_episodes": self.window_episodes,
+            "alpha": self.alpha,
+            "correction": self.correction,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "distributional monitor settings",
+    ) -> DistributionalMonitorSettings:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        raw_counts = mapping["reference_counts"]
+        if not isinstance(raw_counts, (list, tuple)):
+            raise ConfigError(f"{name} reference_counts must be a list of pairs")
+        counts = tuple(
+            (str(item[0]), int(item[1]))
+            for item in raw_counts
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        )
+        if len(counts) != len(raw_counts):
+            raise ConfigError(f"{name} reference_counts entries must be pairs")
+        return _construct(
+            name,
+            lambda: _load(cls, mapping, reference_counts=counts),
         )

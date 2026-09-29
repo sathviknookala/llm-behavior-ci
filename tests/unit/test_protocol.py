@@ -5,16 +5,20 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from llm_behavior_ci.config import (
     CanarySettings,
+    DistributionalMonitorSettings,
     GateSettings,
     MonitorSettings,
     RunConfiguration,
     StoppingRule,
     StreamSettings,
     TaskConfiguration,
+    new_run_identity,
     run_configuration_hash,
 )
 from llm_behavior_ci.experiments.faults import (
@@ -32,14 +36,22 @@ from llm_behavior_ci.experiments.protocol import (
     admit_test_normal,
     authorize_faulted_candidate,
     authorize_gated_candidate,
+    authorize_test_gated_candidate,
     bind_protocol,
     lock_protocol,
     require_protocol_lock,
+    verify_runtime_bindings,
 )
 from llm_behavior_ci.experiments.validation import (
     AADependenceReport,
     ValidationReport,
 )
+from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs
+from llm_behavior_ci.lifecycle.validation_artifact import (
+    ValidationArtifact,
+    build_validation_artifact,
+)
+from llm_behavior_ci.records import StatisticalEvidence
 from llm_behavior_ci.tasks.selection import (
     TaskSet,
     canonical_task_set_bytes,
@@ -250,6 +262,22 @@ def _harm_label(task_set_hash: str = _DEV_TASK_SET_HASH) -> HarmLabel:
     )
 
 
+def _fault() -> FaultSpec:
+    return load_fault(_CATALOG / "sampling_temperature_one.v1.json")
+
+
+def _plan_evidence() -> PlanEvidenceInputs:
+    return PlanEvidenceInputs(
+        plan_format_version="plan-v1",
+        plan_quality_features=("char_count",),
+        plan_quality_weights=(1.0,),
+        mmd_features=(),
+        kl_approximation="top_k",
+        required_statistics=("plan_quality",),
+        validation_provenance="protocol-test",
+    )
+
+
 def _gate() -> GateSettings:
     return GateSettings(
         confidence_level=0.9,
@@ -273,6 +301,8 @@ def _canary() -> CanarySettings:
             alpha=0.05,
             horizon_episodes=20,
         ),
+        metric_orientation="higher_is_better",
+        promotion_policy="horizon_reached_without_harm",
     )
 
 
@@ -312,6 +342,8 @@ def _settings(
     task_selections: tuple[TaskConfiguration, ...] | None = None,
     harm_labels: tuple[HarmLabel, ...] | None = None,
     validation_reports: tuple[ValidationReport, ...] | None = None,
+    faults: tuple[FaultSpec, ...] | None = None,
+    plan_evidence: PlanEvidenceInputs | None = None,
 ) -> ProtocolSettings:
     train = _train_config()
     dev = _dev_config()
@@ -332,11 +364,17 @@ def _settings(
         if validation_reports is not None
         else (_report(method="cusum", validated=True),)
     )
+    chosen_faults = faults if faults is not None else (_fault(),)
+    chosen_plan_evidence = (
+        plan_evidence if plan_evidence is not None else _plan_evidence()
+    )
     return ProtocolSettings(
         configurations=chosen,
         task_selections=selections,
         harm_labels=labels,
         validation_reports=reports,
+        faults=chosen_faults,
+        plan_evidence=chosen_plan_evidence,
         gate=_gate(),
         canary=_canary(),
         monitor=_monitor(),
@@ -435,6 +473,8 @@ class ProtocolLockTests(unittest.TestCase):
                     task_selections=(_dev_config().task,),
                     harm_labels=(),
                     validation_reports=(_report(method="cusum", validated=True),),
+                    faults=(_fault(),),
+                    plan_evidence=_plan_evidence(),
                     gate=_gate(),
                     canary=_canary(),
                     monitor=_monitor(),
@@ -450,6 +490,8 @@ class ProtocolLockTests(unittest.TestCase):
                     task_selections=(_dev_config().task,),
                     harm_labels=(_harm_label(),),
                     validation_reports=(),
+                    faults=(_fault(),),
+                    plan_evidence=_plan_evidence(),
                     gate=_gate(),
                     canary=_canary(),
                     monitor=_monitor(),
@@ -471,6 +513,8 @@ class ProtocolLockTests(unittest.TestCase):
                     task_selections=(already_bound.task,),
                     harm_labels=(_harm_label(),),
                     validation_reports=(_report(method="cusum", validated=True),),
+                    faults=(_fault(),),
+                    plan_evidence=_plan_evidence(),
                     gate=_gate(),
                     canary=_canary(),
                     monitor=_monitor(),
@@ -486,6 +530,8 @@ class ProtocolLockTests(unittest.TestCase):
                     task_selections=(_dev_config().task,),
                     harm_labels=(_harm_label(task_set_hash="f" * 64),),
                     validation_reports=(_report(method="cusum", validated=True),),
+                    faults=(_fault(),),
+                    plan_evidence=_plan_evidence(),
                     gate=_gate(),
                     canary=_canary(),
                     monitor=_monitor(),
@@ -594,25 +640,44 @@ class ProtocolLockTests(unittest.TestCase):
             )
 
 
-class _GateView:
-    def __init__(
-        self,
-        *,
-        outcome: str,
-        reason_codes: tuple[str, ...],
-        reference_configuration_hash: str,
-        candidate_configuration_hash: str,
-        task_set_hash: str,
-        reference_protocol_hash: str | None,
-        candidate_protocol_hash: str | None,
-    ) -> None:
-        self.outcome = outcome
-        self.reason_codes = reason_codes
-        self.reference_configuration_hash = reference_configuration_hash
-        self.candidate_configuration_hash = candidate_configuration_hash
-        self.task_set_hash = task_set_hash
-        self.reference_protocol_hash = reference_protocol_hash
-        self.candidate_protocol_hash = candidate_protocol_hash
+def _gate_statistics(reference: RunConfiguration, candidate: RunConfiguration) -> tuple[StatisticalEvidence, ...]:
+    return (
+        StatisticalEvidence(
+            method="plan_quality_bootstrap",
+            split=reference.task.split,
+            configuration_hash=run_configuration_hash(candidate),
+            estimate=0.05,
+            sample_size=2,
+            unit="score_delta",
+            reference_configuration_hash=run_configuration_hash(reference),
+        ),
+    )
+
+
+def _artifact(
+    *,
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    task_set_hash: str,
+    outcome: str = "PASS",
+    reason_codes: tuple[str, ...] = (),
+    validation_provenance: str = "validated",
+) -> ValidationArtifact:
+    return build_validation_artifact(
+        outcome=outcome,
+        reason_codes=reason_codes,
+        reference=reference,
+        candidate=candidate,
+        reference_run=new_run_identity(reference),
+        candidate_run=new_run_identity(candidate),
+        task_set_hash=task_set_hash,
+        task_split=reference.task.split,
+        statistics=(
+            _gate_statistics(reference, candidate) if outcome == "PASS" else ()
+        ),
+        validation_provenance=validation_provenance,
+        created_at=datetime.now(timezone.utc),
+    )
 
 
 def _task_selection_allowance() -> TaskSelectionAllowance:
@@ -651,14 +716,10 @@ class AuthorizeGatedCandidateTests(unittest.TestCase):
                 },
             }
         )
-        gate = _GateView(
-            outcome="PASS",
-            reason_codes=(),
-            reference_configuration_hash=run_configuration_hash(train_reference),
-            candidate_configuration_hash=run_configuration_hash(train_candidate),
+        artifact = _artifact(
+            reference=train_reference,
+            candidate=train_candidate,
             task_set_hash=_TRAIN_TASK_SET_HASH,
-            reference_protocol_hash=None,
-            candidate_protocol_hash=None,
         )
         served_reference = _test_normal_config()
         served_candidate = RunConfiguration.from_dict(
@@ -677,7 +738,7 @@ class AuthorizeGatedCandidateTests(unittest.TestCase):
             }
         )
         admission = authorize_gated_candidate(
-            gate,
+            artifact,
             served_reference,
             served_candidate,
             allowance=_task_selection_allowance(),
@@ -700,18 +761,15 @@ class AuthorizeGatedCandidateTests(unittest.TestCase):
             admission.served_candidate_configuration_hash,
             admission.candidate_configuration_hash,
         )
+        self.assertEqual(admission.evidence_artifact_id, artifact.artifact_id)
 
     def test_sampling_change_rejected_with_legal_task_diff(self) -> None:
         train_reference = _train_config()
         train_candidate = train_reference
-        gate = _GateView(
-            outcome="PASS",
-            reason_codes=(),
-            reference_configuration_hash=run_configuration_hash(train_reference),
-            candidate_configuration_hash=run_configuration_hash(train_candidate),
+        artifact = _artifact(
+            reference=train_reference,
+            candidate=train_candidate,
             task_set_hash=_TRAIN_TASK_SET_HASH,
-            reference_protocol_hash=None,
-            candidate_protocol_hash=None,
         )
         served_reference = _test_normal_config()
         changed = _test_normal_config().to_dict()
@@ -719,7 +777,7 @@ class AuthorizeGatedCandidateTests(unittest.TestCase):
         served_candidate = RunConfiguration.from_dict(changed)
         with self.assertRaises(ProtocolError) as ctx:
             authorize_gated_candidate(
-                gate,
+                artifact,
                 served_reference,
                 served_candidate,
                 allowance=_task_selection_allowance(),
@@ -728,14 +786,10 @@ class AuthorizeGatedCandidateTests(unittest.TestCase):
 
     def test_prompt_change_rejected_with_legal_task_diff(self) -> None:
         train_reference = _train_config()
-        gate = _GateView(
-            outcome="PASS",
-            reason_codes=(),
-            reference_configuration_hash=run_configuration_hash(train_reference),
-            candidate_configuration_hash=run_configuration_hash(train_reference),
+        artifact = _artifact(
+            reference=train_reference,
+            candidate=train_reference,
             task_set_hash=_TRAIN_TASK_SET_HASH,
-            reference_protocol_hash=None,
-            candidate_protocol_hash=None,
         )
         served_reference = _test_normal_config()
         changed = _test_normal_config().to_dict()
@@ -743,7 +797,7 @@ class AuthorizeGatedCandidateTests(unittest.TestCase):
         served_candidate = RunConfiguration.from_dict(changed)
         with self.assertRaises(ProtocolError):
             authorize_gated_candidate(
-                gate,
+                artifact,
                 served_reference,
                 served_candidate,
                 allowance=_task_selection_allowance(),
@@ -762,21 +816,84 @@ class AuthorizeGatedCandidateTests(unittest.TestCase):
                 },
             }
         )
-        gate = _GateView(
-            outcome="PASS",
-            reason_codes=(),
-            reference_configuration_hash=run_configuration_hash(train_candidate),
-            candidate_configuration_hash=run_configuration_hash(train_reference),
+        artifact = _artifact(
+            reference=train_candidate,
+            candidate=train_reference,
             task_set_hash=_TRAIN_TASK_SET_HASH,
-            reference_protocol_hash=None,
-            candidate_protocol_hash=None,
         )
         with self.assertRaises(ProtocolError):
             authorize_gated_candidate(
-                gate,
+                artifact,
                 train_reference,
                 train_candidate,
             )
+
+    def test_free_form_gate_document_rejected(self) -> None:
+        train_reference = _train_config()
+
+        class _GateView:
+            outcome = "PASS"
+            reason_codes: tuple[str, ...] = ()
+            reference_configuration_hash = run_configuration_hash(train_reference)
+            candidate_configuration_hash = run_configuration_hash(train_reference)
+            task_set_hash = _TRAIN_TASK_SET_HASH
+            reference_protocol_hash = None
+            candidate_protocol_hash = None
+
+        with self.assertRaises(ProtocolError) as ctx:
+            authorize_gated_candidate(_GateView(), train_reference, train_reference)
+        self.assertIn("ValidationArtifact", str(ctx.exception))
+
+    def test_failed_gate_rejected(self) -> None:
+        train_reference = _train_config()
+        artifact = _artifact(
+            reference=train_reference,
+            candidate=train_reference,
+            task_set_hash=_TRAIN_TASK_SET_HASH,
+            outcome="BLOCK",
+            reason_codes=("plan_quality_margin",),
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            authorize_gated_candidate(artifact, train_reference, train_reference)
+        self.assertIn("PASS", str(ctx.exception))
+
+    def test_synthetic_fixture_evidence_rejected_by_real_admission(self) -> None:
+        train_reference = _train_config()
+        synthetic = _artifact(
+            reference=train_reference,
+            candidate=train_reference,
+            task_set_hash=_TRAIN_TASK_SET_HASH,
+            validation_provenance="synthetic_fixture",
+        )
+        self.assertEqual(synthetic.evidence_source, "synthetic_fixture")
+        with self.assertRaises(ProtocolError) as ctx:
+            authorize_gated_candidate(synthetic, train_reference, train_reference)
+        self.assertIn("synthetic_fixture", str(ctx.exception))
+
+        admission = authorize_test_gated_candidate(
+            synthetic,
+            train_reference,
+            train_reference,
+        )
+        self.assertEqual(admission.outcome, "PASS")
+        self.assertEqual(admission.evidence_artifact_id, synthetic.artifact_id)
+
+    def test_malformed_artifact_rejected(self) -> None:
+        train_reference = _train_config()
+        artifact = _artifact(
+            reference=train_reference,
+            candidate=train_reference,
+            task_set_hash=_TRAIN_TASK_SET_HASH,
+        )
+        malformed_payload = dict(artifact.to_dict())
+        malformed_payload["candidate_configuration_hash"] = "not-a-hash"
+        with self.assertRaises(Exception):
+            ValidationArtifact.from_dict(malformed_payload)
+
+    def test_missing_artifact_rejected(self) -> None:
+        train_reference = _train_config()
+        with self.assertRaises(ProtocolError):
+            authorize_gated_candidate(None, train_reference, train_reference)
 
 
 class AuthorizeFaultedCandidateTests(unittest.TestCase):
@@ -886,6 +1003,246 @@ class AuthorizeFaultedCandidateTests(unittest.TestCase):
                     _TEST_TASKS,
                 )
             self.assertIn("kind", str(ctx.exception))
+
+    def test_absent_faults_key_no_longer_bypasses_the_lock(self) -> None:
+        """A lock built without ``ProtocolSettings`` can no longer omit ``faults``.
+
+        Guards the fix for the bypass this task closes: before it,
+        ``_authorize_fault_against_lock`` returned early on a missing
+        ``faults`` key, so any fault named only in ``harm_labels`` was
+        admitted with no check that its patches, kind, or control matched
+        anything declared. A hand-built lock without the key must now be
+        refused outright, the same way a malformed lock is.
+        """
+
+        settings = _settings()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            lock = lock_protocol(settings, path)
+            payload = copy.deepcopy(dict(lock.payload))
+            del payload["faults"]
+            digest = hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            bare = ProtocolLock(digest=digest, payload=payload)
+            reference = bind_protocol(_test_normal_config(), bare)
+            fault = _fault()
+            candidate = apply_fault(reference, fault)
+            with self.assertRaises(ProtocolError) as ctx:
+                authorize_faulted_candidate(
+                    bare,
+                    reference,
+                    candidate,
+                    fault,
+                    _TEST_TASKS,
+                )
+            self.assertIn("faults", str(ctx.exception))
+
+
+class ProtocolSettingsFaultBindingTests(unittest.TestCase):
+    def test_faults_must_be_a_non_empty_tuple(self) -> None:
+        with self.assertRaises(ProtocolError) as ctx:
+            _settings(faults=())
+        self.assertIn("faults", str(ctx.exception))
+
+    def test_duplicate_fault_version_rejected(self) -> None:
+        with self.assertRaises(ProtocolError) as ctx:
+            _settings(faults=(_fault(), _fault()))
+        self.assertIn("duplicate fault_version", str(ctx.exception))
+
+    def test_harm_label_must_match_a_declared_fault(self) -> None:
+        other_fault = load_fault(_CATALOG / "step_limit_reduced.v1.json")
+        with self.assertRaises(ProtocolError) as ctx:
+            _settings(faults=(other_fault,))
+        self.assertIn("matches no declared fault", str(ctx.exception))
+
+    def test_locked_faults_round_trip_through_the_lock(self) -> None:
+        settings = _settings()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            lock = lock_protocol(settings, path)
+            stored = lock.payload["faults"]
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0]["fault_id"], "sampling_temperature_one")
+
+    def test_distributional_monitors_default_empty_and_round_trip_when_set(self) -> None:
+        settings = _settings()
+        self.assertEqual(settings.distributional_monitors, ())
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            lock = lock_protocol(settings, path)
+            self.assertEqual(lock.payload["distributional_monitors"], [])
+
+        entry = DistributionalMonitorSettings(
+            signal="tool_selection",
+            reference_counts=(("calendar.lookup", 3), ("venmo.pay", 1)),
+            window_episodes=10,
+            alpha=0.05,
+            correction="bonferroni",
+        )
+        with_entry = _settings()
+        with_entry = ProtocolSettings(
+            configurations=with_entry.configurations,
+            task_selections=with_entry.task_selections,
+            harm_labels=with_entry.harm_labels,
+            validation_reports=with_entry.validation_reports,
+            gate=with_entry.gate,
+            canary=with_entry.canary,
+            monitor=with_entry.monitor,
+            stream=with_entry.stream,
+            analysis_version=with_entry.analysis_version,
+            seeds=with_entry.seeds,
+            faults=with_entry.faults,
+            plan_evidence=with_entry.plan_evidence,
+            distributional_monitors=(entry,),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            lock = lock_protocol(with_entry, path)
+            stored = lock.payload["distributional_monitors"]
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0]["signal"], "tool_selection")
+            self.assertEqual(stored[0]["window_episodes"], 10)
+
+    def test_duplicate_distributional_monitor_signal_rejected(self) -> None:
+        entry = DistributionalMonitorSettings(
+            signal="task_mix",
+            reference_counts=(("normal", 1),),
+            window_episodes=5,
+            alpha=0.05,
+            correction="none",
+        )
+        base = _settings()
+        with self.assertRaises(ProtocolError) as ctx:
+            ProtocolSettings(
+                configurations=base.configurations,
+                task_selections=base.task_selections,
+                harm_labels=base.harm_labels,
+                validation_reports=base.validation_reports,
+                gate=base.gate,
+                canary=base.canary,
+                monitor=base.monitor,
+                stream=base.stream,
+                analysis_version=base.analysis_version,
+                seeds=base.seeds,
+                faults=base.faults,
+                plan_evidence=base.plan_evidence,
+                distributional_monitors=(entry, entry),
+            )
+        self.assertIn("duplicate distributional monitor signal", str(ctx.exception))
+
+
+class RuntimeBindingDriftTests(unittest.TestCase):
+    def _locked(self) -> tuple[ProtocolLock, Path]:
+        settings = _settings()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "lock.json"
+        lock = lock_protocol(settings, path)
+        return lock, path
+
+    def _relocked_with(self, lock: ProtocolLock, **overrides: object) -> ProtocolLock:
+        payload = copy.deepcopy(dict(lock.payload))
+        payload.update(overrides)
+        digest = hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        return ProtocolLock(digest=digest, payload=payload)
+
+    def test_stale_plan_feature_schema_version_fails_closed(self) -> None:
+        lock, _path = self._locked()
+        stale = self._relocked_with(
+            lock,
+            plan_feature_schema_version="plan-features-v0",
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            verify_runtime_bindings(stale)
+        self.assertIn("plan_feature_schema_version", str(ctx.exception))
+
+    def test_stale_gate_validation_artifact_schema_version_fails_closed(self) -> None:
+        lock, _path = self._locked()
+        stale = self._relocked_with(
+            lock,
+            gate_validation_artifact_schema_version="gate-validation-artifact-v0",
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            verify_runtime_bindings(stale)
+        self.assertIn("gate_validation_artifact_schema_version", str(ctx.exception))
+
+    def test_edited_prompt_template_content_fails_closed(self) -> None:
+        lock, _path = self._locked()
+        edited_hashes = [dict(item) for item in lock.payload["prompt_template_hashes"]]
+        self.assertTrue(edited_hashes)
+        edited_hashes[0]["content_hash"] = "0" * 64
+        stale = self._relocked_with(lock, prompt_template_hashes=edited_hashes)
+        with self.assertRaises(ProtocolError) as ctx:
+            verify_runtime_bindings(stale)
+        self.assertIn("prompt template content changed", str(ctx.exception))
+
+    def test_require_protocol_lock_fails_closed_on_drift(self) -> None:
+        lock, path = self._locked()
+        stale = self._relocked_with(
+            lock,
+            plan_feature_schema_version="plan-features-v0",
+        )
+        document = json.dumps(
+            {"digest": stale.digest, "payload": stale.payload},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8") + b"\n"
+        path.write_bytes(document)
+        with self.assertRaises(ProtocolError) as ctx:
+            require_protocol_lock(path)
+        self.assertIn("plan_feature_schema_version", str(ctx.exception))
+
+    def test_admit_test_normal_fails_closed_on_drift(self) -> None:
+        lock, _path = self._locked()
+        reference = bind_protocol(_test_normal_config(), lock)
+        stale = self._relocked_with(
+            lock,
+            plan_feature_schema_version="plan-features-v0",
+        )
+        with self.assertRaises(ProtocolError) as ctx:
+            admit_test_normal(
+                stale,
+                reference,
+                task_set_hash=_TEST_TASK_SET_HASH,
+            )
+        self.assertIn("plan_feature_schema_version", str(ctx.exception))
+
+    def test_unregistered_prompt_version_refuses_to_lock(self) -> None:
+        mutated = replace(
+            _train_config(),
+            agent=replace(
+                _train_config().agent,
+                prompt=replace(
+                    _train_config().agent.prompt,
+                    prompt_version="prompt-does-not-exist",
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            with self.assertRaises(ProtocolError):
+                lock_protocol(
+                    _settings(configurations=(mutated, _dev_config(), _test_normal_config())),
+                    path,
+                )
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

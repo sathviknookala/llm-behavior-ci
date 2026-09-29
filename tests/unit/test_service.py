@@ -19,6 +19,7 @@ from llm_behavior_ci.config import (
     MonitorSettings,
     RunConfiguration,
     StoppingRule,
+    new_run_identity,
     run_configuration_hash,
 )
 from llm_behavior_ci.lifecycle.monitoring import (
@@ -26,7 +27,8 @@ from llm_behavior_ci.lifecycle.monitoring import (
     ProductionMonitor,
     TaskMetadata,
 )
-from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.lifecycle.validation_artifact import build_validation_artifact
+from llm_behavior_ci.records import StatisticalEvidence, TokenLogprob
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import (
     EvaluationResult,
@@ -119,6 +121,39 @@ def _candidate(reference: RunConfiguration) -> RunConfiguration:
             prompt=replace(reference.agent.prompt, prompt_version="prompt-v2"),
         ),
         run_seed=reference.run_seed + 1,
+    )
+
+
+def _gate_artifact(
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    *,
+    task_set_hash: str | None = None,
+    validation_provenance: str = "validated",
+):
+    statistics = (
+        StatisticalEvidence(
+            method="plan_quality_bootstrap",
+            split=reference.task.split,
+            configuration_hash=run_configuration_hash(candidate),
+            estimate=0.05,
+            sample_size=2,
+            unit="score_delta",
+            reference_configuration_hash=run_configuration_hash(reference),
+        ),
+    )
+    return build_validation_artifact(
+        outcome="PASS",
+        reason_codes=(),
+        reference=reference,
+        candidate=candidate,
+        reference_run=new_run_identity(reference),
+        candidate_run=new_run_identity(candidate),
+        task_set_hash=task_set_hash or reference.task.task_set_hash,
+        task_split=reference.task.split,
+        statistics=statistics,
+        validation_provenance=validation_provenance,
+        created_at=datetime.now(timezone.utc),
     )
 
 
@@ -276,6 +311,14 @@ class SpyStore(EpisodeStore):
         self._ensure()
         return super().append_deployment_decision(decision)
 
+    def append_validation_artifact(self, artifact):
+        self._ensure()
+        return super().append_validation_artifact(artifact)
+
+    def load_validation_artifact(self, artifact_id: str):
+        self._ensure()
+        return super().load_validation_artifact(artifact_id)
+
     def load_alerts(self, *, signal=None):
         self._ensure()
         return super().load_alerts(signal=signal)
@@ -318,6 +361,8 @@ def _canary_settings() -> CanarySettings:
             alpha=0.05,
             horizon_episodes=10,
         ),
+        metric_orientation="higher_is_better",
+        promotion_policy="horizon_reached_without_harm",
     )
 
 
@@ -438,6 +483,20 @@ class ServiceUnitTests(unittest.TestCase):
         self.addCleanup(client.__exit__, None, None, None)
         return client
 
+    def _persist_artifact(self, artifact) -> None:
+        writer = EpisodeStore(Path(self._tmpdir.name) / "episodes.sqlite")
+        try:
+            writer.append_validation_artifact(artifact)
+        finally:
+            writer.close()
+
+    def _read_decisions(self):
+        reader = EpisodeStore(Path(self._tmpdir.name) / "episodes.sqlite")
+        try:
+            return reader.load_deployment_decisions()
+        finally:
+            reader.close()
+
     def test_rejects_extra_model_fields_and_keeps_registry_hash(self) -> None:
         before = run_configuration_hash(self.production)
         client = self._client()
@@ -514,46 +573,56 @@ class ServiceUnitTests(unittest.TestCase):
 
     def test_candidate_admission_hash_mismatch_returns_409(self) -> None:
         client = self._client()
+        mismatched_reference = replace(
+            self.production, run_seed=self.production.run_seed + 999
+        )
+        artifact = _gate_artifact(mismatched_reference, self.candidate)
+        self._persist_artifact(artifact)
         response = client.post(
             "/candidates",
-            json={
-                "outcome": "PASS",
-                "reason_codes": [],
-                "reference_configuration_hash": "0" * 64,
-                "candidate_configuration_hash": run_configuration_hash(
-                    self.candidate
-                ),
-                "task_set_hash": self.production.task.task_set_hash,
-                "reference_protocol_hash": self.production.protocol_hash,
-                "candidate_protocol_hash": self.candidate.protocol_hash,
-            },
+            json={"artifact_id": artifact.artifact_id},
         )
         self.assertEqual(response.status_code, 409)
         deployment = client.get("/deployment").json()
         self.assertNotIn("state", deployment)
 
-    def test_candidate_admission_starts_controller(self) -> None:
+    def test_candidate_admission_missing_artifact_returns_409(self) -> None:
         client = self._client()
         response = client.post(
             "/candidates",
-            json={
-                "outcome": "PASS",
-                "reason_codes": [],
-                "reference_configuration_hash": run_configuration_hash(
-                    self.production
-                ),
-                "candidate_configuration_hash": run_configuration_hash(
-                    self.candidate
-                ),
-                "task_set_hash": self.production.task.task_set_hash,
-                "reference_protocol_hash": self.production.protocol_hash,
-                "candidate_protocol_hash": self.candidate.protocol_hash,
-            },
+            json={"artifact_id": "0" * 64},
+        )
+        self.assertEqual(response.status_code, 409)
+
+    def test_candidate_admission_starts_controller(self) -> None:
+        client = self._client()
+        artifact = _gate_artifact(self.production, self.candidate)
+        self._persist_artifact(artifact)
+        response = client.post(
+            "/candidates",
+            json={"artifact_id": artifact.artifact_id},
         )
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["state"], "GATE_PASSED")
         self.assertEqual(body["admission"], "open")
+        decisions = self._read_decisions()
+        self.assertEqual(decisions[-1].decision, "admit")
+        self.assertEqual(decisions[-1].evidence_artifact_id, artifact.artifact_id)
+
+    def test_candidate_admission_rejects_synthetic_fixture_evidence(self) -> None:
+        client = self._client()
+        artifact = _gate_artifact(
+            self.production,
+            self.candidate,
+            validation_provenance="synthetic_fixture",
+        )
+        self._persist_artifact(artifact)
+        response = client.post(
+            "/candidates",
+            json={"artifact_id": artifact.artifact_id},
+        )
+        self.assertEqual(response.status_code, 409)
 
     def test_runtime_unavailable_returns_503(self) -> None:
         def factory(config: RunConfiguration) -> RuntimeDependencies:
@@ -620,21 +689,11 @@ class ServiceUnitTests(unittest.TestCase):
 
     def test_rollback_blocks_candidate_allows_production(self) -> None:
         client = self._client()
+        artifact = _gate_artifact(self.production, self.candidate)
+        self._persist_artifact(artifact)
         admit = client.post(
             "/candidates",
-            json={
-                "outcome": "PASS",
-                "reason_codes": [],
-                "reference_configuration_hash": run_configuration_hash(
-                    self.production
-                ),
-                "candidate_configuration_hash": run_configuration_hash(
-                    self.candidate
-                ),
-                "task_set_hash": self.production.task.task_set_hash,
-                "reference_protocol_hash": self.production.protocol_hash,
-                "candidate_protocol_hash": self.candidate.protocol_hash,
-            },
+            json={"artifact_id": artifact.artifact_id},
         )
         self.assertEqual(admit.status_code, 200)
         rollback = client.post("/deployment/rollback")

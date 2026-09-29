@@ -5,13 +5,19 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Callable, Mapping
 
-from llm_behavior_ci.config import MONITOR_SIGNALS, MonitorSettings
+from llm_behavior_ci.config import (
+    DISTRIBUTIONAL_SIGNALS,
+    MONITOR_SIGNALS,
+    DistributionalMonitorSettings,
+    MonitorSettings,
+)
 from llm_behavior_ci.lifecycle.detectors import (
     BOUNDED_SIGNALS,
     DetectorConstructionError,
     build_detectors,
+    build_distributional_detector,
 )
 from llm_behavior_ci.records import (
     EpisodeResult,
@@ -26,10 +32,13 @@ from llm_behavior_ci.storage import (
     AlertRecord,
     DeploymentDecisionRecord,
     EpisodeStore,
+    MonitorMetadataRecord,
 )
 
 _DELAYED_SIGNALS = BOUNDED_SIGNALS
-_DISTRIBUTIONAL_SIGNALS = frozenset({"tool_selection", "task_mix"})
+_DISTRIBUTIONAL_SIGNALS = DISTRIBUTIONAL_SIGNALS
+PLAN_QUALITY_SIGNAL = "plan_quality_score"
+PLAN_KL_SIGNAL = "plan_kl_mean_nats"
 
 
 class MissingEvaluatorOutcome(ValueError):
@@ -76,6 +85,35 @@ class TaskMetadata:
         ):
             raise MonitorRejected("slice_id must be a non-empty string when set")
 
+    def to_record(self, episode_id: str) -> MonitorMetadataRecord:
+        """Serialize this metadata so a stored episode's inputs can be rebuilt.
+
+        Paired with the persisted ``EpisodeResult`` (which already carries
+        the evaluator outcome, tool steps, and model steps), this record is
+        everything ``normalize_episode``/``observation_from_episode`` and
+        the typed distributional builders need to reconstruct the exact
+        detector input a live update once used.
+        """
+
+        return MonitorMetadataRecord(
+            episode_id=episode_id,
+            signal=self.signal,
+            completion_index=self.completion_index,
+            difficulty=self.difficulty,
+            task_mix=self.task_mix,
+            slice_id=self.slice_id,
+        )
+
+    @classmethod
+    def from_record(cls, record: MonitorMetadataRecord) -> TaskMetadata:
+        return cls(
+            signal=record.signal,
+            completion_index=record.completion_index,
+            difficulty=record.difficulty,
+            task_mix=record.task_mix,
+            slice_id=record.slice_id,
+        )
+
 
 @dataclass(frozen=True)
 class NormalizedEpisode:
@@ -95,6 +133,7 @@ class NormalizedEpisode:
     task_mix: str | None
     completion_index: int
     missing_outcome: bool
+    difficulty: int | None
 
 
 @dataclass(frozen=True)
@@ -224,6 +263,67 @@ class LocalAlertSink:
         return tuple(self._delivered)
 
 
+def _resolved_difficulty(
+    episode: EpisodeResult,
+    task_metadata: TaskMetadata,
+) -> int | None:
+    """Prefer the evaluator's own difficulty over a caller-supplied label.
+
+    ``task_metadata.difficulty`` is a launcher-side hint, not a claim about
+    execution. When AppWorld's evaluator has already recorded a difficulty
+    for this episode, that is the value monitoring uses and slices by; a
+    caller label that disagrees is rejected rather than silently
+    overriding actual evaluator-derived task metadata with a launcher-
+    supplied synthetic value.
+    """
+
+    evaluator_difficulty = (
+        None
+        if episode.evaluator_outcome is None
+        else episode.evaluator_outcome.difficulty
+    )
+    if (
+        evaluator_difficulty is not None
+        and task_metadata.difficulty is not None
+        and task_metadata.difficulty != evaluator_difficulty
+    ):
+        raise MonitorRejected(
+            "task_metadata.difficulty must match the episode's evaluator difficulty"
+        )
+    return (
+        evaluator_difficulty
+        if evaluator_difficulty is not None
+        else task_metadata.difficulty
+    )
+
+
+def resolved_slice_name(
+    episode: EpisodeResult,
+    task_metadata: TaskMetadata,
+    *,
+    use_slice_attribution: bool,
+) -> str | None:
+    """The slice label a monitor should attribute this episode's signal to.
+
+    Prefers an explicit ``task_metadata.slice_id``. Otherwise, when slice
+    attribution is enabled, falls back to the evaluator-derived difficulty
+    (``f"difficulty:{difficulty}"``): the only per-task cluster the split
+    policy releases on ``test_normal`` (``docs/DATA.md``), so it is the
+    project's default defined cluster rather than a ground-truth app label.
+    Returns ``None`` when attribution is off or neither label is available,
+    leaving the caller at aggregate-only attribution.
+    """
+
+    if not use_slice_attribution:
+        return None
+    if task_metadata.slice_id is not None:
+        return task_metadata.slice_id
+    difficulty = _resolved_difficulty(episode, task_metadata)
+    if difficulty is not None:
+        return f"difficulty:{difficulty}"
+    return None
+
+
 def normalize_episode(
     episode: EpisodeResult,
     *,
@@ -231,6 +331,7 @@ def normalize_episode(
 ) -> NormalizedEpisode:
     """Normalize episode fields for monitoring without substituting missing outcomes."""
 
+    difficulty = _resolved_difficulty(episode, task_metadata)
     missing = episode.evaluator_outcome is None
     if missing:
         task_success: float | None = None
@@ -270,6 +371,7 @@ def normalize_episode(
         task_mix=task_metadata.task_mix,
         completion_index=task_metadata.completion_index,
         missing_outcome=missing,
+        difficulty=difficulty,
     )
 
 
@@ -361,6 +463,73 @@ def task_mix_observation_from_episode(
     )
 
 
+def plan_quality_observation_from_features(
+    episode: EpisodeResult,
+    *,
+    features: Mapping[str, float],
+) -> MonitorObservation:
+    """Fold one semantic plan-feature vector into a bounded monitor observation.
+
+    ``features`` is whatever ``lifecycle.plan_features.semantic_plan_features``
+    computed for this episode's plan text against its ``TaskPlanSpec``: an
+    offline, pre-execution representation. This adapter reads only
+    ``requirement_coverage_fraction``, which is already bounded in [0, 1]
+    and defined even for a task with no declared subgoals (vacuous 1.0), so
+    the fold needs no extra caller weighting to stay a valid ``plan_quality_
+    score`` observation. Plan-quality scoring is scheduled by the caller,
+    not implied by every episode: an episode with no plan representation
+    simply never calls this.
+    """
+
+    if "requirement_coverage_fraction" not in features:
+        raise MonitorRejected(
+            "features must include requirement_coverage_fraction"
+        )
+    value = features["requirement_coverage_fraction"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MonitorRejected("requirement_coverage_fraction must be a float")
+    return MonitorObservation(
+        episode=episode.episode,
+        run=episode.run,
+        split=episode.task.split,
+        signal=PLAN_QUALITY_SIGNAL,
+        value=float(value),
+        observed_at=episode.ended_at,
+    )
+
+
+def plan_kl_observation(
+    episode: EpisodeResult,
+    *,
+    mean_kl_nats: float,
+) -> MonitorObservation:
+    """Fold one teacher-forced plan-KL result into a monitor observation.
+
+    Takes the bare ``mean_kl_nats`` float rather than a KL result type
+    directly: ``stats.kl`` and ``runtime.scoring`` are a concurrently
+    developed contract that may still change shape, so the coupling here
+    stays to one scalar a caller reads off ``NextTokenKLResult.mean_kl_nats``
+    or ``TruncatedKLResult.mean_kl_nats`` (or an equivalent
+    ``DistributionScore.mean_kl_nats``) and passes explicitly. Teacher-forced
+    scoring is scheduled by the caller alongside production traffic, not run
+    on every episode.
+    """
+
+    if isinstance(mean_kl_nats, bool) or not isinstance(mean_kl_nats, (int, float)):
+        raise MonitorRejected("mean_kl_nats must be a finite nonnegative float")
+    value = float(mean_kl_nats)
+    if not math.isfinite(value) or value < 0.0:
+        raise MonitorRejected("mean_kl_nats must be a finite nonnegative float")
+    return MonitorObservation(
+        episode=episode.episode,
+        run=episode.run,
+        split=episode.task.split,
+        signal=PLAN_KL_SIGNAL,
+        value=value,
+        observed_at=episode.ended_at,
+    )
+
+
 @dataclass(frozen=True)
 class _HeldObservation:
     observation: MonitorObservation
@@ -412,6 +581,7 @@ class ProductionMonitor:
         self._held: list[_HeldObservation] = []
         self._seen: set[tuple[str, str]] = set()
         self._last_alert_at: dict[str, datetime] = {}
+        self._slice_detectors: dict[tuple[str, str], list[Detector]] = {}
         if reference.configuration_hash != settings.reference_configuration_hash:
             raise MonitorRejected(
                 "reference.configuration_hash must equal settings.reference_configuration_hash"
@@ -427,6 +597,16 @@ class ProductionMonitor:
     @property
     def period_id(self) -> str | None:
         return self._period_id
+
+    @property
+    def signals(self) -> tuple[str, ...]:
+        """The configured scalar series, in the order ``MonitorSettings`` names them."""
+
+        return self._settings.signals
+
+    @property
+    def use_slice_attribution(self) -> bool:
+        return self._use_slice_attribution
 
     def update(
         self,
@@ -488,9 +668,11 @@ class ProductionMonitor:
         period_id: str | None = None,
     ) -> tuple[Alert, ...]:
         observation = observation_from_episode(episode, task_metadata=task_metadata)
-        slice_name = None
-        if self._use_slice_attribution and task_metadata.slice_id is not None:
-            slice_name = task_metadata.slice_id
+        slice_name = resolved_slice_name(
+            episode,
+            task_metadata,
+            use_slice_attribution=self._use_slice_attribution,
+        )
         return self.update(
             observation,
             completion_index=task_metadata.completion_index,
@@ -507,6 +689,7 @@ class ProductionMonitor:
         self._held.clear()
         self._seen.clear()
         self._last_alert_at.clear()
+        self._slice_detectors.clear()
 
     def _check_period(self, period_id: str | None) -> None:
         if self._period_id is None:
@@ -555,7 +738,49 @@ class ProductionMonitor:
         *,
         slice_name: str,
     ) -> list[Alert]:
-        detectors = self._detectors[observation.signal]
+        """Run the aggregate detector chain, and a slice-specific one when named.
+
+        The aggregate chain (``self._detectors[signal]``) sees every episode
+        for that signal regardless of slice, so it always reports under the
+        signal's own name. A caller-resolved ``slice_name`` different from
+        the bare signal name (see ``update_from_episode``'s difficulty- or
+        ``slice_id``-derived label) additionally feeds an independent
+        detector chain scoped to only that slice's episodes, built from the
+        same ``_detectors_from`` construction and reference as the
+        aggregate. A regression confined to one slice can then alarm on its
+        own chain even when it is too small a share of the aggregate stream
+        to move the aggregate chain, which is what lets a fired alert name
+        ``slice_name`` as the slice that moved, not just the monitored
+        signal.
+        """
+
+        alerts = self._run_detectors(
+            self._detectors[observation.signal],
+            observation,
+            slice_name=observation.signal,
+        )
+        if slice_name != observation.signal:
+            key = (observation.signal, slice_name)
+            if key not in self._slice_detectors:
+                self._slice_detectors[key] = self._detectors_from(self._reference)[
+                    observation.signal
+                ]
+            alerts.extend(
+                self._run_detectors(
+                    self._slice_detectors[key],
+                    observation,
+                    slice_name=slice_name,
+                )
+            )
+        return alerts
+
+    def _run_detectors(
+        self,
+        detectors: list[Detector],
+        observation: MonitorObservation,
+        *,
+        slice_name: str,
+    ) -> list[Alert]:
         alerts: list[Alert] = []
         for detector in detectors:
             evidence = detector.update(observation.value)
@@ -599,6 +824,146 @@ class ProductionMonitor:
             sample_size=evidence.sample_size,
             raised_at=raised_at,
         )
+
+
+DistributionalObservation = ToolSelectionObservation | TaskMixObservation
+
+
+def _counts_from_observation(
+    observation: DistributionalObservation,
+) -> dict[str, int]:
+    if isinstance(observation, ToolSelectionObservation):
+        return {item.name: item.count for item in observation.counts}
+    return {observation.label: 1}
+
+
+class DistributionalMonitor:
+    """Windowed categorical drift monitor for ``tool_selection`` or ``task_mix``.
+
+    Distribution-valued observations are never forced through a scalar
+    ``Detector.update(float)`` interface: this monitor routes them to
+    ``lifecycle.detectors.build_distributional_detector``, the same
+    canonical construction ``experiments.replay.distributional_detector_
+    factories`` uses, so monitoring and replay never diverge on how a
+    ``tool_selection`` or ``task_mix`` detector is built. ``task_mix`` is
+    monitored independently of every behavior signal, so a shift in the
+    incoming task composition is attributed as input drift rather than
+    misread as a change in model behavior.
+    """
+
+    def __init__(
+        self,
+        settings: DistributionalMonitorSettings,
+        *,
+        reference_configuration_hash: str,
+        clock: Callable[[], datetime],
+        dedup_seconds: float,
+    ) -> None:
+        if not isinstance(settings, DistributionalMonitorSettings):
+            raise MonitorRejected(
+                "settings must be DistributionalMonitorSettings"
+            )
+        if not isinstance(reference_configuration_hash, str) or not reference_configuration_hash:
+            raise MonitorRejected(
+                "reference_configuration_hash must be a non-empty string"
+            )
+        if not callable(clock):
+            raise MonitorRejected("clock must be callable")
+        if isinstance(dedup_seconds, bool) or not isinstance(
+            dedup_seconds, (int, float)
+        ):
+            raise MonitorRejected("dedup_seconds must be a finite float >= 0")
+        window = float(dedup_seconds)
+        if not math.isfinite(window) or window < 0.0:
+            raise MonitorRejected("dedup_seconds must be a finite float >= 0")
+        self._settings = settings
+        self._reference_configuration_hash = reference_configuration_hash
+        self._clock = clock
+        self._dedup_seconds = window
+        self._detector = build_distributional_detector(
+            signal=settings.signal,
+            reference_counts=dict(settings.reference_counts),
+            window_episodes=settings.window_episodes,
+            alpha=settings.alpha,
+            correction=settings.correction,
+        )
+        self._slice_detectors: dict[str, object] = {}
+        self._last_alert_at: dict[str, datetime] = {}
+
+    @property
+    def signal(self) -> str:
+        return self._settings.signal
+
+    def update(
+        self,
+        observation: DistributionalObservation,
+        *,
+        slice_name: str | None = None,
+    ) -> tuple[Alert, ...]:
+        expected = ToolSelectionObservation if self.signal == "tool_selection" else TaskMixObservation
+        if not isinstance(observation, expected):
+            raise MonitorRejected(f"{self.signal} monitor requires {expected.__name__}")
+        counts = _counts_from_observation(observation)
+        resolved_slice = self.signal if slice_name is None else slice_name
+        alerts: list[Alert] = []
+        alerts.extend(
+            self._apply(self._detector, counts, observation, slice_name=self.signal)
+        )
+        if resolved_slice != self.signal:
+            detector = self._slice_detectors.setdefault(
+                resolved_slice,
+                build_distributional_detector(
+                    signal=self._settings.signal,
+                    reference_counts=dict(self._settings.reference_counts),
+                    window_episodes=self._settings.window_episodes,
+                    alpha=self._settings.alpha,
+                    correction=self._settings.correction,
+                ),
+            )
+            alerts.extend(
+                self._apply(detector, counts, observation, slice_name=resolved_slice)
+            )
+        return tuple(alerts)
+
+    def _apply(
+        self,
+        detector: object,
+        counts: Mapping[str, int],
+        observation: DistributionalObservation,
+        *,
+        slice_name: str,
+    ) -> list[Alert]:
+        evidence = detector.update(counts)
+        if not evidence.alarm:
+            return []
+        raised_at = self._clock()
+        dedup_key = f"{self.signal}:{slice_name}"
+        last = self._last_alert_at.get(dedup_key)
+        if (
+            self._dedup_seconds > 0.0
+            and last is not None
+            and (raised_at - last).total_seconds() < self._dedup_seconds
+        ):
+            return []
+        self._last_alert_at[dedup_key] = raised_at
+        return [
+            Alert(
+                configuration_hash=observation.run.configuration_hash,
+                reference_configuration_hash=self._reference_configuration_hash,
+                signal=self.signal,
+                slice_name=slice_name,
+                method=evidence.method,
+                estimate=evidence.estimate,
+                boundary=evidence.boundary,
+                sample_size=evidence.sample_size,
+                raised_at=raised_at,
+            )
+        ]
+
+    def reset(self) -> None:
+        self._detector.reset()
+        self._slice_detectors.clear()
+        self._last_alert_at.clear()
 
 
 def _baselines_for_signals(

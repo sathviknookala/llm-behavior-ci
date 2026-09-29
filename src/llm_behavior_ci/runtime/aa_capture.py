@@ -616,10 +616,10 @@ def live_runtime_factory(base_url: str) -> Callable[[str], RuntimeDependencies]:
     """
 
     def factory(mode: str) -> RuntimeDependencies:
-        from llm_behavior_ci.runtime.agent import VLLMAgent
+        from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
         from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
 
-        agent = VLLMAgent(base_url)
+        agent = SmolagentsVLLMAgent(base_url)
         agent.set_mode(mode)
         return RuntimeDependencies(
             session_factory=LiveAppWorldSession,

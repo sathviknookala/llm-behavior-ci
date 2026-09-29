@@ -42,6 +42,7 @@ from llm_behavior_ci.service import (
     create_app,
 )
 from llm_behavior_ci.storage import EpisodeStore
+from llm_behavior_ci.tasks.plan_specs import task_plan_specs_from_mapping
 from llm_behavior_ci.tasks.selection import (
     TaskSet,
     canonical_task_set_bytes,
@@ -204,6 +205,14 @@ class LazyStore(EpisodeStore):
         self._ensure()
         return super().append_deployment_decision(decision)
 
+    def append_validation_artifact(self, artifact):
+        self._ensure()
+        return super().append_validation_artifact(artifact)
+
+    def load_validation_artifact(self, artifact_id: str):
+        self._ensure()
+        return super().load_validation_artifact(artifact_id)
+
     def load_alerts(self, *, signal=None):
         self._ensure()
         return super().load_alerts(signal=signal)
@@ -329,6 +338,7 @@ def _plan_evidence() -> PlanEvidenceInputs:
     payload = json.loads(_PLAN_EVIDENCE.read_text(encoding="utf-8"))
     if payload.get("validation_provenance") != "synthetic_fixture":
         raise RuntimeError("synthetic plan evidence must use synthetic_fixture")
+    task_plan_specs = task_plan_specs_from_mapping(payload.get("task_plan_specs", []))
     return PlanEvidenceInputs(
         plan_format_version=str(payload["plan_format_version"]),
         plan_quality_features=tuple(payload["plan_quality_features"]),
@@ -337,6 +347,7 @@ def _plan_evidence() -> PlanEvidenceInputs:
         kl_approximation=str(payload["kl_approximation"]),  # type: ignore[arg-type]
         required_statistics=tuple(payload["required_statistics"]),
         validation_provenance=str(payload["validation_provenance"]),
+        task_plan_specs=task_plan_specs,
     )
 
 
@@ -427,22 +438,22 @@ def _execute_runtime(clock, *, success: bool = True) -> RuntimeDependencies:
     )
 
 
-def _gate_body(
-    *,
-    outcome: str,
-    reference: RunConfiguration,
-    candidate: RunConfiguration,
-    reason_codes: list[str] | None = None,
-) -> dict[str, object]:
-    return {
-        "outcome": outcome,
-        "reason_codes": [] if reason_codes is None else reason_codes,
-        "reference_configuration_hash": run_configuration_hash(reference),
-        "candidate_configuration_hash": run_configuration_hash(candidate),
-        "task_set_hash": reference.task.task_set_hash,
-        "reference_protocol_hash": reference.protocol_hash,
-        "candidate_protocol_hash": candidate.protocol_hash,
-    }
+def _persist_artifact(path: Path, artifact) -> dict[str, object]:
+    """Write a real gate's ``ValidationArtifact`` into the store a client reads.
+
+    Uses a short-lived writer connection to the same SQLite file rather
+    than the client's own (lazily opened, thread-bound) store object, so
+    the write always lands before the app's portal thread ever touches
+    that file. Returns the ``/candidates`` request body: just the content
+    hash, never the artifact's fields, mirroring what a real caller sends.
+    """
+
+    writer = EpisodeStore(path)
+    try:
+        writer.append_validation_artifact(artifact)
+    finally:
+        writer.close()
+    return {"artifact_id": artifact.artifact_id}
 
 
 def _dependencies(
@@ -467,6 +478,8 @@ def _dependencies(
             alpha=0.05,
             horizon_episodes=horizon_episodes,
         ),
+        metric_orientation="higher_is_better",
+        promotion_policy="horizon_reached_without_harm",
     )
     completion = {"index": 0}
 
@@ -577,6 +590,34 @@ def main() -> int:
     if passed.outcome != "PASS":
         print("expected synthetic train gate PASS shape", file=sys.stderr)
         return 1
+    if passed.artifact.evidence_source != "synthetic_fixture":
+        print("expected synthetic_fixture evidence_source", file=sys.stderr)
+        return 1
+
+    real_evidence = replace(evidence, validation_provenance="connected_lifecycle_demo")
+    real_passed = run_offline_gate(
+        production,
+        candidate,
+        task_set,
+        settings=GateSettings(
+            confidence_level=0.9,
+            bootstrap_resamples=40,
+            score_margin=-0.02,
+            kl_limit_nats=0.05,
+            mmd_bandwidth=1.0,
+            mmd_permutations=19,
+            mmd_alpha=0.05,
+            plan_format_version="plan-v1",
+        ),
+        runtime=_plan_runtime(_clock()),
+        plan_evidence=real_evidence,
+    )
+    if real_passed.outcome != "PASS":
+        print("expected non-synthetic train gate PASS shape", file=sys.stderr)
+        return 1
+    if real_passed.artifact.evidence_source != "gate_run":
+        print("expected gate_run evidence_source", file=sys.stderr)
+        return 1
 
     summary: dict[str, object] = {
         "provenance": "synthetic_fixture",
@@ -610,17 +651,33 @@ def main() -> int:
         with client:
             block_admit = client.post(
                 "/candidates",
-                json=_gate_body(
-                    outcome="BLOCK",
-                    reference=production,
-                    candidate=candidate,
-                    reason_codes=list(blocked.reason_codes),
-                ),
+                json=_persist_artifact(root / "episodes.sqlite", blocked.artifact),
             )
             if block_admit.status_code != 409:
                 print("BLOCK gate must not admit", file=sys.stderr)
                 return 1
             summary["block_admission_status"] = block_admit.status_code
+
+            synthetic_admit = client.post(
+                "/candidates",
+                json=_persist_artifact(root / "episodes.sqlite", passed.artifact),
+            )
+            if synthetic_admit.status_code != 409:
+                print(
+                    "synthetic_fixture PASS evidence must not admit",
+                    file=sys.stderr,
+                )
+                return 1
+            summary["synthetic_fixture_admission_status"] = synthetic_admit.status_code
+
+            missing_admit = client.post(
+                "/candidates",
+                json={"artifact_id": "0" * 64},
+            )
+            if missing_admit.status_code != 409:
+                print("missing artifact must not admit", file=sys.stderr)
+                return 1
+            summary["missing_artifact_admission_status"] = missing_admit.status_code
 
             changed = replace(
                 candidate,
@@ -629,12 +686,13 @@ def main() -> int:
                     sampling=replace(candidate.agent.sampling, temperature=1.0),
                 ),
             )
+            changed_store_path = root / "changed.sqlite"
             changed_client = TestClient(
                 create_app(
                     _dependencies(
                         production=production,
                         candidate=changed,
-                        store=LazyStore(root / "changed.sqlite"),
+                        store=LazyStore(changed_store_path),
                         clock=clock,
                         runtime_factory=factory,
                         monitor=_monitor(production, clock),
@@ -644,11 +702,7 @@ def main() -> int:
             with changed_client:
                 reject_changed = changed_client.post(
                     "/candidates",
-                    json=_gate_body(
-                        outcome="PASS",
-                        reference=production,
-                        candidate=candidate,
-                    ),
+                    json=_persist_artifact(changed_store_path, real_passed.artifact),
                 )
             if reject_changed.status_code != 409:
                 print("PASS gate must not admit a changed candidate", file=sys.stderr)
@@ -697,7 +751,8 @@ def main() -> int:
                     clock=clock,
                 )
 
-            rollback_store = LazyStore(root / "rollback.sqlite")
+            rollback_store_path = root / "rollback.sqlite"
+            rollback_store = LazyStore(rollback_store_path)
             rollback_client = TestClient(
                 create_app(
                     _dependencies(
@@ -715,11 +770,7 @@ def main() -> int:
             with rollback_client:
                 admit = rollback_client.post(
                     "/candidates",
-                    json=_gate_body(
-                        outcome="PASS",
-                        reference=production,
-                        candidate=candidate,
-                    ),
+                    json=_persist_artifact(rollback_store_path, real_passed.artifact),
                 )
                 if admit.status_code != 200:
                     print("PASS gate must admit matching candidate", file=sys.stderr)
@@ -741,7 +792,8 @@ def main() -> int:
                     return 1
                 summary["canary_rollback_state"] = deployment["state"]
 
-            promote_store = LazyStore(root / "promote.sqlite")
+            promote_store_path = root / "promote.sqlite"
+            promote_store = LazyStore(promote_store_path)
             promote_client = TestClient(
                 create_app(
                     _dependencies(
@@ -759,11 +811,7 @@ def main() -> int:
             with promote_client:
                 admit = promote_client.post(
                     "/candidates",
-                    json=_gate_body(
-                        outcome="PASS",
-                        reference=production,
-                        candidate=candidate,
-                    ),
+                    json=_persist_artifact(promote_store_path, real_passed.artifact),
                 )
                 if admit.status_code != 200:
                     print("promotion admit failed", file=sys.stderr)

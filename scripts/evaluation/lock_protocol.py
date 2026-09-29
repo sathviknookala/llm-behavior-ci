@@ -9,6 +9,12 @@ Settings JSON fields:
 - gate, canary, monitor, stream: their to_dict() shapes
 - analysis_version: non-empty string
 - seeds: non-empty list of integers
+- faults: fault catalog JSON objects (fault_id, version, kind, patches,
+  and optional control/schema_request), one per fault this lock
+  authorizes for final-test execution
+- plan_evidence: lifecycle.offline_gate.plan_evidence_to_dict() shape
+- distributional_monitors: DistributionalMonitorSettings.to_dict() list;
+  may be an empty list
 
 Full ValidationReport JSON mirrors ValidationReport fields. Nested
 CheckResult, CaseAgreement, and AADependenceReport objects use the same
@@ -27,13 +33,14 @@ from pathlib import Path
 
 from llm_behavior_ci.config import (
     CanarySettings,
+    DistributionalMonitorSettings,
     GateSettings,
     MonitorSettings,
     RunConfiguration,
     StreamSettings,
     TaskConfiguration,
 )
-from llm_behavior_ci.experiments.faults import HarmLabel
+from llm_behavior_ci.experiments.faults import FaultError, HarmLabel, fault_from_mapping
 from llm_behavior_ci.experiments.protocol import (
     ProtocolError,
     ProtocolSettings,
@@ -45,6 +52,10 @@ from llm_behavior_ci.experiments.validation import (
     CaseAgreement,
     CheckResult,
     ValidationReport,
+)
+from llm_behavior_ci.lifecycle.offline_gate import (
+    GateExecutionError,
+    plan_evidence_from_dict,
 )
 
 
@@ -218,14 +229,23 @@ def _settings_from_mapping(document: object) -> ProtocolSettings:
         harm_labels = document["harm_labels"]
         validation_reports = document["validation_reports"]
         seeds = document["seeds"]
+        faults = document["faults"]
+        plan_evidence = document["plan_evidence"]
     except KeyError as error:
         raise ProtocolError("settings document is missing a required field") from error
+    distributional_monitors = document.get("distributional_monitors", [])
     if not isinstance(configurations, list) or not isinstance(task_selections, list):
         raise ProtocolError("configurations and task_selections must be lists")
     if not isinstance(harm_labels, list) or not isinstance(validation_reports, list):
         raise ProtocolError("harm_labels and validation_reports must be lists")
     if not isinstance(seeds, list):
         raise ProtocolError("seeds must be a list")
+    if not isinstance(faults, list):
+        raise ProtocolError("faults must be a list")
+    if not isinstance(plan_evidence, Mapping):
+        raise ProtocolError("plan_evidence must be an object")
+    if not isinstance(distributional_monitors, list):
+        raise ProtocolError("distributional_monitors must be a list")
     return ProtocolSettings(
         configurations=tuple(
             RunConfiguration.from_dict(item) for item in configurations
@@ -243,7 +263,27 @@ def _settings_from_mapping(document: object) -> ProtocolSettings:
         stream=StreamSettings.from_dict(document["stream"]),
         analysis_version=str(document["analysis_version"]),
         seeds=tuple(int(item) for item in seeds),
+        faults=_faults(faults),
+        plan_evidence=_plan_evidence(plan_evidence),
+        distributional_monitors=tuple(
+            DistributionalMonitorSettings.from_dict(item)
+            for item in distributional_monitors
+        ),
     )
+
+
+def _faults(items: Sequence[object]) -> tuple[object, ...]:
+    try:
+        return tuple(fault_from_mapping(item) for item in items)
+    except FaultError as error:
+        raise ProtocolError(str(error)) from error
+
+
+def _plan_evidence(payload: Mapping[str, object]) -> object:
+    try:
+        return plan_evidence_from_dict(payload)
+    except GateExecutionError as error:
+        raise ProtocolError(str(error)) from error
 
 
 def main(argv: Sequence[str] | None = None) -> int:

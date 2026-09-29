@@ -14,7 +14,7 @@ from llm_behavior_ci.runtime.appworld import (
     TaskContext,
     ToolResult,
 )
-from llm_behavior_ci.runtime.agent import VLLMAgent, action_execution_backend
+from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent, action_execution_backend
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
     RuntimeDependencies,
@@ -477,10 +477,36 @@ class EpisodeRunnerTests(unittest.TestCase):
         self.assertEqual(session.actions, [_ACTION])
         self.assertEqual(action_execution_backend(), "appworld_session.execute")
 
+    def test_tool_calling_action_interface_still_executes_through_appworld(
+        self,
+    ) -> None:
+        config = replace(
+            _config(),
+            agent=replace(_config().agent, action_interface="tool_calling"),
+        )
+        clock = _clock()
+        session = FakeSession()
+        agent = FakeAgent(
+            [
+                _turn(_ACTION, action=_ACTION),
+                _turn("STOP", action=None),
+            ],
+            clock=clock,
+        )
+        run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(session.actions, [_ACTION])
+        self.assertEqual(action_execution_backend(), "appworld_session.execute")
+
     def test_build_runtime_uses_endpoint_and_rejects_unknown_prompt(self) -> None:
         config = _config()
         runtime = build_runtime(config, "http://127.0.0.1:9", mode="plan")
-        self.assertIsInstance(runtime.agent, VLLMAgent)
+        self.assertIsInstance(runtime.agent, SmolagentsVLLMAgent)
         self.assertEqual(runtime.agent.base_url, "http://127.0.0.1:9")
         bad = replace(
             config,

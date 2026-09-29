@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from datetime import datetime
+from typing import Literal, Mapping, Sequence
 
 from llm_behavior_ci.config import (
     GateSettings,
+    KL_FIDELITY_MODES,
     RunConfiguration,
+    RunIdentity,
     new_run_identity,
     run_configuration_hash,
+)
+from llm_behavior_ci.lifecycle.plan_features import (
+    PLAN_FEATURE_SCHEMA_VERSION,
+    PlanFeatureError,
+    SEMANTIC_PLAN_FEATURES,
+    STRUCTURAL_PLAN_FEATURES,
+    semantic_plan_features,
+    structural_plan_features,
+)
+from llm_behavior_ci.lifecycle.validation_artifact import (
+    ValidationArtifact,
+    build_validation_artifact,
 )
 from llm_behavior_ci.records import (
     EpisodeResult,
@@ -25,25 +39,26 @@ from llm_behavior_ci.runtime.episode import (
     RuntimeUnavailable,
     run_pair,
 )
-from llm_behavior_ci.runtime.scoring import ScoringError, score_full, score_top_k
+from llm_behavior_ci.runtime.scoring import (
+    FidelityProofError,
+    PositionAlignmentError,
+    ScoredPosition,
+    ScoringContract,
+    ScoringError,
+    SupportAlignmentError,
+    fingerprint_messages,
+    score_full,
+    score_top_k,
+    verify_scoring_contracts,
+)
 from llm_behavior_ci.stats.bootstrap import clustered_paired_bootstrap
 from llm_behavior_ci.stats.mmd import MMDError, mmd_permutation_test
+from llm_behavior_ci.tasks.plan_specs import TaskPlanSpec
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 
 _STATISTIC_NAMES = frozenset({"plan_quality", "kl", "mmd"})
-_PLAN_V1_FEATURES = frozenset(
-    {
-        "char_count",
-        "line_count",
-        "numbered_step_count",
-        "token_count",
-        "empty_line_count",
-        "mean_step_chars",
-        "model_step_count",
-    }
-)
-_NUMBERED_STEP = re.compile(r"^\s*\d+\.")
-_KL_APPROXIMATIONS = frozenset({"full", "top_k"})
+_MODEL_STEP_FEATURE = "model_step_count"
+_KL_APPROXIMATIONS = KL_FIDELITY_MODES
 
 
 class GateExecutionError(ValueError):
@@ -52,6 +67,26 @@ class GateExecutionError(ValueError):
 
 @dataclass(frozen=True)
 class PlanEvidenceInputs:
+    """Caller-supplied plan-evidence settings.
+
+    ``task_plan_specs`` binds pre-execution ``TaskPlanSpec`` metadata by
+    task id. It is optional and defaults to empty: a caller whose
+    ``plan_quality_features``/``mmd_features`` are all structural (see
+    ``lifecycle.plan_features.STRUCTURAL_PLAN_FEATURES``) never needs it.
+    Requesting a semantic feature (``lifecycle.plan_features.
+    SEMANTIC_PLAN_FEATURES``) for a task with no matching spec raises
+    ``GateExecutionError`` at scoring time rather than degrading silently;
+    that is a missing-metadata failure, not an empty-metadata one.
+
+    ``kl_vocabulary_size`` is the verified tokenizer's true vocabulary
+    size; it is a required companion to ``kl_approximation="full"`` and is
+    otherwise unused. Supplying it is a necessary precondition for a
+    "full" claim, not proof: ``runtime.scoring.verify_scoring_contracts``
+    still checks, from the teacher-forced positions actually returned,
+    that every one of them covers exactly that vocabulary and is
+    normalized before the claim is honored.
+    """
+
     plan_format_version: str
     plan_quality_features: tuple[str, ...]
     plan_quality_weights: tuple[float, ...]
@@ -59,6 +94,8 @@ class PlanEvidenceInputs:
     kl_approximation: Literal["full", "top_k"]
     required_statistics: tuple[str, ...]
     validation_provenance: str
+    task_plan_specs: tuple[TaskPlanSpec, ...] = ()
+    kl_vocabulary_size: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan_format_version, str) or not self.plan_format_version:
@@ -67,6 +104,16 @@ class PlanEvidenceInputs:
             raise GateExecutionError("validation_provenance must be a non-empty string")
         if self.kl_approximation not in _KL_APPROXIMATIONS:
             raise GateExecutionError("kl_approximation must be full or top_k")
+        if self.kl_vocabulary_size is not None and (
+            not isinstance(self.kl_vocabulary_size, int)
+            or isinstance(self.kl_vocabulary_size, bool)
+            or self.kl_vocabulary_size <= 0
+        ):
+            raise GateExecutionError("kl_vocabulary_size must be a positive int")
+        if self.kl_approximation == "full" and self.kl_vocabulary_size is None:
+            raise GateExecutionError(
+                "kl_approximation full requires kl_vocabulary_size"
+            )
         if not self.required_statistics:
             raise GateExecutionError("required_statistics must be non-empty")
         for name in self.required_statistics:
@@ -86,6 +133,114 @@ class PlanEvidenceInputs:
                     raise GateExecutionError("plan_quality_weights must be numeric")
         if "mmd" in self.required_statistics and not self.mmd_features:
             raise GateExecutionError("mmd_features must be non-empty")
+        if not isinstance(self.task_plan_specs, tuple):
+            raise GateExecutionError("task_plan_specs must be a tuple")
+        seen_spec_ids: set[str] = set()
+        for spec in self.task_plan_specs:
+            if not isinstance(spec, TaskPlanSpec):
+                raise GateExecutionError(
+                    "task_plan_specs entries must be TaskPlanSpec instances"
+                )
+            if spec.task_id in seen_spec_ids:
+                raise GateExecutionError(
+                    "task_plan_specs contains a duplicate task_id"
+                )
+            seen_spec_ids.add(spec.task_id)
+
+
+def _task_plan_spec_to_dict(spec: TaskPlanSpec) -> dict[str, object]:
+    return {
+        "task_id": spec.task_id,
+        "available_tools": list(spec.available_tools),
+        "subgoal_keywords": [list(group) for group in spec.subgoal_keywords],
+        "required_entities": list(spec.required_entities),
+        "dependency_pairs": [list(pair) for pair in spec.dependency_pairs],
+    }
+
+
+def plan_evidence_to_dict(plan_evidence: PlanEvidenceInputs) -> dict[str, object]:
+    """A complete, JSON-canonicalizable mapping of one ``PlanEvidenceInputs``.
+
+    Every field round-trips through ``plan_evidence_from_dict``, including
+    ``task_plan_specs`` and ``kl_vocabulary_size``: the caller-supplied
+    inputs that decide which plan features a semantic gate statistic reads
+    and whether teacher-forced KL claims full-vocabulary fidelity. A
+    protocol lock or a benchmark checkpoint that binds only the scalar
+    settings and drops these two would let either change silently between
+    runs without changing the lock digest or failing a resume.
+    """
+
+    return {
+        "plan_format_version": plan_evidence.plan_format_version,
+        "plan_quality_features": list(plan_evidence.plan_quality_features),
+        "plan_quality_weights": list(plan_evidence.plan_quality_weights),
+        "mmd_features": list(plan_evidence.mmd_features),
+        "kl_approximation": plan_evidence.kl_approximation,
+        "kl_vocabulary_size": plan_evidence.kl_vocabulary_size,
+        "required_statistics": list(plan_evidence.required_statistics),
+        "validation_provenance": plan_evidence.validation_provenance,
+        "task_plan_specs": [
+            _task_plan_spec_to_dict(spec) for spec in plan_evidence.task_plan_specs
+        ],
+        "plan_feature_schema_version": PLAN_FEATURE_SCHEMA_VERSION,
+    }
+
+
+def _task_plan_spec_from_dict(payload: Mapping[str, object]) -> TaskPlanSpec:
+    from llm_behavior_ci.tasks.plan_specs import task_plan_spec_from_mapping
+
+    return task_plan_spec_from_mapping(
+        {
+            "task_id": payload["task_id"],
+            "available_tools": list(payload["available_tools"]),
+            "subgoal_keywords": [
+                list(group) for group in payload["subgoal_keywords"]
+            ],
+            "required_entities": list(payload["required_entities"]),
+            "dependency_pairs": [
+                list(pair) for pair in payload["dependency_pairs"]
+            ],
+        }
+    )
+
+
+def plan_evidence_from_dict(payload: Mapping[str, object]) -> PlanEvidenceInputs:
+    """Reconstruct a ``PlanEvidenceInputs`` from ``plan_evidence_to_dict``'s shape.
+
+    Raises ``GateExecutionError`` (not a bare ``KeyError``/``TypeError``) on
+    a malformed payload, matching every other loader in this package.
+    """
+
+    try:
+        features = payload["plan_quality_features"]
+        weights = payload["plan_quality_weights"]
+        mmd_features = payload["mmd_features"]
+        required = payload["required_statistics"]
+        specs = payload.get("task_plan_specs", [])
+        if not isinstance(features, list) or not isinstance(weights, list):
+            raise GateExecutionError("plan evidence features are invalid")
+        if not isinstance(mmd_features, list) or not isinstance(required, list):
+            raise GateExecutionError("plan evidence feature lists are invalid")
+        if not isinstance(specs, list):
+            raise GateExecutionError("plan evidence task_plan_specs is invalid")
+        kl_vocabulary_size = payload.get("kl_vocabulary_size")
+        return PlanEvidenceInputs(
+            plan_format_version=str(payload["plan_format_version"]),
+            plan_quality_features=tuple(str(item) for item in features),
+            plan_quality_weights=tuple(float(item) for item in weights),
+            mmd_features=tuple(str(item) for item in mmd_features),
+            kl_approximation=str(payload["kl_approximation"]),  # type: ignore[arg-type]
+            required_statistics=tuple(str(item) for item in required),
+            validation_provenance=str(payload["validation_provenance"]),
+            task_plan_specs=tuple(
+                _task_plan_spec_from_dict(item) for item in specs
+            ),
+            kl_vocabulary_size=(
+                int(kl_vocabulary_size) if kl_vocabulary_size is not None else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise GateExecutionError("plan evidence is invalid") from error
 
 
 @dataclass(frozen=True)
@@ -103,6 +258,7 @@ class GateDecision:
     statistics: tuple[StatisticalEvidence, ...]
     public_decision: LifecycleDecision | None
     validation_provenance: str
+    artifact: ValidationArtifact
 
 
 def _require_train_inputs(
@@ -164,45 +320,47 @@ def _plan_succeeded(episode: EpisodeResult) -> bool:
     )
 
 
-def _plan_v1_structure(plan_text: str) -> dict[str, float]:
-    lines = plan_text.splitlines()
-    non_empty = [line for line in lines if line.strip()]
-    numbered = [line for line in non_empty if _NUMBERED_STEP.match(line)]
-    tokens = plan_text.split()
-    mean_step_chars = (
-        float(sum(len(line) for line in numbered) / len(numbered))
-        if numbered
-        else 0.0
-    )
-    return {
-        "char_count": float(len(plan_text)),
-        "line_count": float(len(non_empty)),
-        "numbered_step_count": float(len(numbered)),
-        "token_count": float(len(tokens)),
-        "empty_line_count": float(len(lines) - len(non_empty)),
-        "mean_step_chars": mean_step_chars,
-    }
+def _task_plan_spec(
+    task_plan_specs: Mapping[str, TaskPlanSpec],
+    task_id: str,
+) -> TaskPlanSpec:
+    spec = task_plan_specs.get(task_id)
+    if spec is None:
+        raise GateExecutionError(
+            f"missing task_plan_spec for task_id: {task_id}"
+        )
+    return spec
 
 
 def _feature_value(
     episode: EpisodeResult,
     feature: str,
     plan_format_version: str,
+    task_plan_specs: Mapping[str, TaskPlanSpec],
 ) -> float:
-    if feature not in _PLAN_V1_FEATURES:
-        raise GateExecutionError(f"unknown plan feature: {feature}")
+    if feature == _MODEL_STEP_FEATURE:
+        return float(len(episode.model_steps))
     if plan_format_version != "plan-v1":
         raise GateExecutionError("plan_format_version must be plan-v1")
-    if feature == "model_step_count":
-        return float(len(episode.model_steps))
-    if episode.plan_text is None:
-        raise GateExecutionError("plan text is required for plan features")
-    return _plan_v1_structure(episode.plan_text)[feature]
+    if feature in STRUCTURAL_PLAN_FEATURES:
+        if episode.plan_text is None:
+            raise GateExecutionError("plan text is required for plan features")
+        return structural_plan_features(episode.plan_text)[feature]
+    if feature in SEMANTIC_PLAN_FEATURES:
+        if episode.plan_text is None:
+            raise GateExecutionError("plan text is required for plan features")
+        spec = _task_plan_spec(task_plan_specs, episode.task.task_id)
+        try:
+            return semantic_plan_features(episode.plan_text, spec)[feature]
+        except PlanFeatureError as error:
+            raise GateExecutionError(str(error)) from error
+    raise GateExecutionError(f"unknown plan feature: {feature}")
 
 
 def _plan_quality_score(
     episode: EpisodeResult,
     plan_evidence: PlanEvidenceInputs,
+    task_plan_specs: Mapping[str, TaskPlanSpec],
 ) -> float:
     total = 0.0
     for feature, weight in zip(
@@ -214,6 +372,7 @@ def _plan_quality_score(
             episode,
             feature,
             plan_evidence.plan_format_version,
+            task_plan_specs,
         )
     return total
 
@@ -221,37 +380,36 @@ def _plan_quality_score(
 def _plan_representation(
     episode: EpisodeResult,
     plan_evidence: PlanEvidenceInputs,
+    task_plan_specs: Mapping[str, TaskPlanSpec],
 ) -> tuple[float, ...]:
     return tuple(
-        _feature_value(episode, feature, plan_evidence.plan_format_version)
+        _feature_value(
+            episode,
+            feature,
+            plan_evidence.plan_format_version,
+            task_plan_specs,
+        )
         for feature in plan_evidence.mmd_features
     )
 
 
-def _aligned_logprob_vectors(
-    reference_positions: Sequence[Sequence[TokenLogprob]],
-    candidate_positions: Sequence[Sequence[TokenLogprob]],
-) -> tuple[tuple[tuple[float, ...], ...], tuple[tuple[float, ...], ...]] | None:
-    if len(reference_positions) != len(candidate_positions):
-        return None
-    production: list[tuple[float, ...]] = []
-    comparison: list[tuple[float, ...]] = []
-    for reference_position, candidate_position in zip(
-        reference_positions,
-        candidate_positions,
-        strict=True,
-    ):
-        if not reference_position or not candidate_position:
+def _scored_positions(
+    positions: Sequence[Sequence[TokenLogprob]],
+) -> tuple[ScoredPosition, ...] | None:
+    converted: list[ScoredPosition] = []
+    for index, position in enumerate(positions):
+        if not position:
             return None
-        reference_ids = tuple(item.token_id for item in reference_position)
-        candidate_ids = tuple(item.token_id for item in candidate_position)
-        if reference_ids != candidate_ids:
-            return None
-        production.append(tuple(item.logprob for item in reference_position))
-        comparison.append(tuple(item.logprob for item in candidate_position))
-    if not production:
+        converted.append(
+            ScoredPosition(
+                position=index,
+                support_token_ids=tuple(item.token_id for item in position),
+                log_probabilities=tuple(item.logprob for item in position),
+            )
+        )
+    if not converted:
         return None
-    return tuple(production), tuple(comparison)
+    return tuple(converted)
 
 
 def _matched_messages(agent: object, context: object, config: RunConfiguration) -> list[dict[str, str]]:
@@ -281,7 +439,14 @@ def _teacher_force_pair(
     reference: RunConfiguration,
     candidate: RunConfiguration,
     frozen_plan_text: str,
-) -> tuple[tuple[tuple[TokenLogprob, ...], ...], tuple[tuple[TokenLogprob, ...], ...]] | str:
+) -> (
+    tuple[
+        tuple[tuple[TokenLogprob, ...], ...],
+        tuple[tuple[TokenLogprob, ...], ...],
+        str,
+    ]
+    | str
+):
     teacher_force = getattr(runtime.agent, "teacher_force_plan", None)
     if not callable(teacher_force):
         return "teacher_force_unavailable"
@@ -289,6 +454,7 @@ def _teacher_force_pair(
     try:
         context = session.context()
         messages = _matched_messages(runtime.agent, context, reference)
+        prefix_fingerprint = fingerprint_messages(messages)
         runtime.agent.begin(context, reference)
         try:
             reference_positions = teacher_force(
@@ -317,7 +483,7 @@ def _teacher_force_pair(
         candidate_positions, tuple
     ):
         return "kl_alignment_failed"
-    return reference_positions, candidate_positions
+    return reference_positions, candidate_positions, prefix_fingerprint
 
 
 def _evidence(
@@ -385,6 +551,9 @@ def run_offline_gate(
     reference_run = new_run_identity(reference)
     candidate_run = new_run_identity(candidate)
     required = frozenset(plan_evidence.required_statistics)
+    task_plan_specs = {
+        spec.task_id: spec for spec in plan_evidence.task_plan_specs
+    }
 
     pairs: list[tuple[EpisodeResult, EpisodeResult, str, str]] = []
     try:
@@ -408,10 +577,13 @@ def run_offline_gate(
                     candidate=candidate,
                     reference_hash=reference_hash,
                     candidate_hash=candidate_hash,
+                    reference_run=reference_run,
+                    candidate_run=candidate_run,
                     task_set=task_set,
                     settings=settings,
                     reason_codes=("tool_execution",),
                     validation_provenance=plan_evidence.validation_provenance,
+                    created_at=runtime.clock(),
                 )
             if not _plan_succeeded(pair.reference) or not _plan_succeeded(
                 pair.candidate
@@ -421,10 +593,13 @@ def run_offline_gate(
                     candidate=candidate,
                     reference_hash=reference_hash,
                     candidate_hash=candidate_hash,
+                    reference_run=reference_run,
+                    candidate_run=candidate_run,
                     task_set=task_set,
                     settings=settings,
                     reason_codes=("plan_run_failed",),
                     validation_provenance=plan_evidence.validation_provenance,
+                    created_at=runtime.clock(),
                 )
             pairs.append(
                 (
@@ -448,11 +623,11 @@ def run_offline_gate(
 
     if "plan_quality" in required:
         reference_scores = tuple(
-            _plan_quality_score(reference_episode, plan_evidence)
+            _plan_quality_score(reference_episode, plan_evidence, task_plan_specs)
             for reference_episode, _candidate, _label, _task_id in pairs
         )
         candidate_scores = tuple(
-            _plan_quality_score(candidate_episode, plan_evidence)
+            _plan_quality_score(candidate_episode, plan_evidence, task_plan_specs)
             for _reference, candidate_episode, _label, _task_id in pairs
         )
         bootstrap = clustered_paired_bootstrap(
@@ -507,14 +682,48 @@ def run_offline_gate(
                 if isinstance(forced, str):
                     kl_reason = forced
                     break
-                reference_forced, candidate_forced = forced
-                vectors = _aligned_logprob_vectors(reference_forced, candidate_forced)
-                if vectors is None:
+                reference_forced, candidate_forced, prefix_fingerprint = forced
+                reference_scored = _scored_positions(reference_forced)
+                candidate_scored = _scored_positions(candidate_forced)
+                if reference_scored is None or candidate_scored is None:
                     kl_reason = "kl_alignment_failed"
                     break
-                production_chunk, candidate_chunk = vectors
-                production_positions.extend(production_chunk)
-                candidate_positions.extend(candidate_chunk)
+                try:
+                    reference_contract = ScoringContract(
+                        model_repository=reference.model.model.repository,
+                        model_revision=reference.model.model.revision,
+                        tokenizer_repository=reference.model.tokenizer.repository,
+                        tokenizer_revision=reference.model.tokenizer.revision,
+                        input_prefix_fingerprint=prefix_fingerprint,
+                        positions=reference_scored,
+                        fidelity=plan_evidence.kl_approximation,
+                        declared_vocabulary_size=plan_evidence.kl_vocabulary_size,
+                    )
+                    candidate_contract = ScoringContract(
+                        model_repository=candidate.model.model.repository,
+                        model_revision=candidate.model.model.revision,
+                        tokenizer_repository=candidate.model.tokenizer.repository,
+                        tokenizer_revision=candidate.model.tokenizer.revision,
+                        input_prefix_fingerprint=prefix_fingerprint,
+                        positions=candidate_scored,
+                        fidelity=plan_evidence.kl_approximation,
+                        declared_vocabulary_size=plan_evidence.kl_vocabulary_size,
+                    )
+                    verify_scoring_contracts(reference_contract, candidate_contract)
+                except (PositionAlignmentError, SupportAlignmentError):
+                    kl_reason = "kl_alignment_failed"
+                    break
+                except FidelityProofError:
+                    kl_reason = "kl_fidelity_unproven"
+                    break
+                except ScoringError as error:
+                    raise GateExecutionError(str(error)) from error
+                production_positions.extend(
+                    position.log_probabilities for position in reference_scored
+                )
+                candidate_positions.extend(
+                    position.log_probabilities for position in candidate_scored
+                )
             if kl_reason is not None:
                 reason_codes.append(kl_reason)
             else:
@@ -546,11 +755,11 @@ def run_offline_gate(
 
     if "mmd" in required:
         reference_points = tuple(
-            _plan_representation(reference_episode, plan_evidence)
+            _plan_representation(reference_episode, plan_evidence, task_plan_specs)
             for reference_episode, _candidate, _label, _task_id in pairs
         )
         candidate_points = tuple(
-            _plan_representation(candidate_episode, plan_evidence)
+            _plan_representation(candidate_episode, plan_evidence, task_plan_specs)
             for _reference, candidate_episode, _label, _task_id in pairs
         )
         try:
@@ -594,6 +803,19 @@ def run_offline_gate(
             evidence=tuple(statistics),
             decided_at=decided_at,
         )
+    artifact = build_validation_artifact(
+        outcome=outcome,
+        reason_codes=reason_codes,
+        reference=reference,
+        candidate=candidate,
+        reference_run=reference_run,
+        candidate_run=candidate_run,
+        task_set_hash=task_set.task_set_hash,
+        task_split=task_set.split,
+        statistics=statistics,
+        validation_provenance=plan_evidence.validation_provenance,
+        created_at=decided_at,
+    )
     return GateDecision(
         outcome=outcome,
         reason_codes=tuple(reason_codes),
@@ -606,6 +828,7 @@ def run_offline_gate(
         statistics=tuple(statistics),
         public_decision=public_decision,
         validation_provenance=plan_evidence.validation_provenance,
+        artifact=artifact,
     )
 
 
@@ -615,11 +838,27 @@ def _blocked_without_statistics(
     candidate: RunConfiguration,
     reference_hash: str,
     candidate_hash: str,
+    reference_run: RunIdentity,
+    candidate_run: RunIdentity,
     task_set: TaskSet,
     settings: GateSettings,
     reason_codes: Sequence[str],
     validation_provenance: str,
+    created_at: datetime,
 ) -> GateDecision:
+    artifact = build_validation_artifact(
+        outcome="BLOCK",
+        reason_codes=reason_codes,
+        reference=reference,
+        candidate=candidate,
+        reference_run=reference_run,
+        candidate_run=candidate_run,
+        task_set_hash=task_set.task_set_hash,
+        task_split=task_set.split,
+        statistics=(),
+        validation_provenance=validation_provenance,
+        created_at=created_at,
+    )
     return GateDecision(
         outcome="BLOCK",
         reason_codes=tuple(reason_codes),
@@ -632,4 +871,5 @@ def _blocked_without_statistics(
         statistics=(),
         public_decision=None,
         validation_provenance=validation_provenance,
+        artifact=artifact,
     )

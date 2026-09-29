@@ -15,6 +15,9 @@ class HarmfulShiftTest:
     Boundary: wealth >= 1/alpha.
     Reset: clears the inner detector.
     Evidence: alarm means the e-process crossed 1/alpha. This is the project's harmful-shift test in the Podkopaev–Ramdas role. It is this betting procedure, not a line-by-line port. No rollback method.
+    Direction: this test only ever tests the harmful side, so its evidence
+    direction is ``harmful`` on alarm and ``insufficient`` otherwise. It
+    never reports ``beneficial``, because it never tested for that.
     """
 
     def __init__(self, *, alpha: float, harm_margin: float) -> None:
@@ -56,6 +59,7 @@ class HarmfulShiftTest:
             boundary=evidence.boundary,
             p_value=evidence.p_value,
             details=evidence.details,
+            direction="harmful" if evidence.alarm else "insufficient",
         )
 
     def reset(self) -> None:

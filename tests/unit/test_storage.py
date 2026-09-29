@@ -327,3 +327,35 @@ class EpisodeStoreTests(unittest.TestCase):
             loaded = store.load_alerts(signal="task_success")
             self.assertEqual(loaded, (first,))
             store.close()
+
+    def test_monitor_metadata_round_trips_and_is_content_idempotent(self) -> None:
+        from llm_behavior_ci.storage import MonitorMetadataRecord
+
+        record = MonitorMetadataRecord(
+            episode_id="episode-1",
+            signal="task_success",
+            completion_index=3,
+            difficulty=2,
+            task_mix="difficulty:2",
+            slice_id="difficulty:2",
+        )
+        other_signal = MonitorMetadataRecord(
+            episode_id="episode-1",
+            signal="tool_selection",
+            completion_index=3,
+            difficulty=2,
+            task_mix="difficulty:2",
+            slice_id=None,
+        )
+        with TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite")
+            store.append_monitor_metadata(record)
+            store.append_monitor_metadata(record)
+            store.append_monitor_metadata(other_signal)
+            loaded = store.load_monitor_metadata("episode-1", "task_success")
+            self.assertEqual(loaded, record)
+            missing = store.load_monitor_metadata("episode-1", "requirement_fraction")
+            self.assertIsNone(missing)
+            everything = store.load_monitor_metadata_for_episode("episode-1")
+            self.assertEqual(everything, (record, other_signal))
+            store.close()

@@ -23,7 +23,12 @@ from llm_behavior_ci.records import (
     RecordedError,
     ToolStep,
 )
-from llm_behavior_ci.runtime.agent import AgentLoop, AgentTurn, validate_chat_request
+from llm_behavior_ci.runtime.agent import (
+    AgentLoop,
+    AgentTurn,
+    build_appworld_executor,
+    validate_chat_request,
+)
 from llm_behavior_ci.runtime.appworld import (
     AppWorldSession,
     EvaluationResult,
@@ -209,6 +214,7 @@ def run_episode(
                 episode_errors=(),
             )
 
+        executor = build_appworld_executor(config.agent.action_interface, session.execute)
         model_turns = 0
         tool_output: str | None = None
         next_index = 0
@@ -264,7 +270,7 @@ def run_episode(
                 )
             try:
                 tool_started = runtime.clock()
-                result = session.execute(turn.action)
+                result = executor(turn.action)
             except Exception as error:
                 return _finish(
                     identity=identity,
@@ -516,10 +522,20 @@ def build_runtime(
 ) -> RuntimeDependencies:
     """Build runtime dependencies for one configuration and HTTP endpoint.
 
-    Imports the live AppWorld session adapter and the HTTP agent only when
-    called. Does not import vLLM. Prompt versions, action interface, and
-    chat-expressible serving flags are checked before the runtime is
-    returned. Actions still execute through ``AppWorldSession.execute``.
+    Imports the live AppWorld session adapter only when called. Does not
+    import vLLM or smolagents; vLLM stays a served HTTP endpoint, never an
+    in-process backend, and smolagents stays an optional import so this
+    function, like the rest of this module, is CPU-testable without it
+    (`CONSTRAINTS.md` keeps the hosted CPU suite smolagents-free).
+    ``SmolagentsVLLMAgent`` genuinely subclasses ``smolagents.Model`` when
+    the package is present and falls back to a plain object base otherwise;
+    either way its control flow, and the version recorded on
+    ``configuration.agent.smolagents_version``, are identical. Prompt
+    versions, action interface, and chat-expressible serving flags are
+    checked before the runtime is returned. Actions still execute through
+    ``AppWorldSession.execute``, reached by ``run_episode`` via
+    ``build_appworld_executor`` and never by smolagents'
+    ``LocalPythonExecutor``.
     """
 
     if not isinstance(configuration, RunConfiguration):
@@ -529,7 +545,7 @@ def build_runtime(
     if mode not in {"plan", "execute"}:
         raise EpisodeRejected("mode must be plan or execute")
     validate_chat_request(configuration)
-    from llm_behavior_ci.runtime.agent import VLLMAgent
+    from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
     from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
     from llm_behavior_ci.runtime.prompts import UnknownPromptVersion, render_system_text
 
@@ -546,7 +562,7 @@ def build_runtime(
     except ValueError as error:
         raise RuntimeUnavailable(str(error)) from error
 
-    agent = VLLMAgent(endpoint_url)
+    agent = SmolagentsVLLMAgent(endpoint_url)
     agent.set_mode(mode)
     return RuntimeDependencies(
         session_factory=LiveAppWorldSession,

@@ -12,11 +12,32 @@ from typing import Callable, Mapping, Protocol
 
 from llm_behavior_ci.config import ACTION_INTERFACES, RunConfiguration
 from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.runtime.api_docs import (
+    ApiDocsCorruptionError,
+    resolve_api_documentation,
+)
 from llm_behavior_ci.runtime.appworld import TaskContext
 from llm_behavior_ci.runtime.prompts import (
     UnknownPromptVersion,
     render_system_text,
 )
+
+try:
+    from smolagents.models import ChatMessage as _SmolChatMessage
+    from smolagents.models import Model as _SmolModel
+except ImportError:
+    _SmolChatMessage = None
+    _SmolModel = object
+
+try:
+    from smolagents.tools import Tool as _SmolTool
+except ImportError:
+    _SmolTool = object
+
+try:
+    from smolagents.local_python_executor import PythonExecutor as _SmolPythonExecutor
+except ImportError:
+    _SmolPythonExecutor = object
 
 _CALL = re.compile(r"^CALL ([^ \n]+) ([^ \n]+)\n([\s\S]+)$")
 
@@ -42,6 +63,8 @@ _UNCHECKED_IDENTITY_FIELDS = (
     "model.serving.batch_invariant",
     "model.quantization.method",
     "model.vllm_version",
+    "model.lora.repository",
+    "model.lora.revision",
 )
 
 
@@ -202,7 +225,18 @@ def check_model_identity(
     return unchecked
 
 
-class AppWorldActionExecutor:
+class AppWorldActionExecutor(_SmolPythonExecutor):
+    """Delegates a ``CodeAgent``-style code action to AppWorld's own shell.
+
+    Structurally satisfies smolagents' ``PythonExecutor`` interface
+    (``send_tools``, ``send_variables``, ``__call__``) and, when smolagents
+    is installed, is also a genuine subclass of it. It never evaluates the
+    action itself; ``__call__`` forwards the raw text straight to
+    ``AppWorldSession.execute``, which is the only place a mutation happens
+    (`DECISIONS.md` D18/D20). ``smolagents.local_python_executor.LocalPythonExecutor``
+    is never constructed on this path.
+    """
+
     def __init__(self, execute: Callable[[str], object]) -> None:
         self._execute = execute
         self._tools: dict[str, object] = {}
@@ -218,14 +252,141 @@ class AppWorldActionExecutor:
         return self._execute(code_action)
 
 
+class AppWorldExecuteTool(_SmolTool):
+    """Exposes one AppWorld action as a smolagents-style tool.
+
+    This is the ``ToolCallingAgent`` counterpart to
+    ``AppWorldActionExecutor``'s ``CodeAgent`` shape (`DECISIONS.md` D18's
+    two options). When smolagents is installed this is a genuine
+    ``smolagents.Tool`` subclass and passes its own argument and signature
+    validation; ``forward`` still only ever calls into
+    ``AppWorldSession.execute``. ``output_type`` is ``"object"`` because the
+    return value is the local ``ToolResult`` record, not raw text.
+    """
+
+    name = "appworld_execute"
+    description = (
+        "Execute one AppWorld action or tool call against the current "
+        "task's isolated world and return the raw result."
+    )
+    inputs = {
+        "action": {
+            "type": "string",
+            "description": "The action payload to execute through AppWorld.",
+        }
+    }
+    output_type = "object"
+
+    def __init__(self, execute: Callable[[str], object]) -> None:
+        if _SmolTool is not object:
+            super().__init__()
+        else:
+            self.is_initialized = False
+        self._execute = execute
+
+    def setup(self) -> None:
+        self.is_initialized = True
+
+    def forward(self, action: str) -> object:
+        return self._execute(action)
+
+    def __call__(self, action: str) -> object:
+        if not self.is_initialized:
+            self.setup()
+        return self.forward(action)
+
+
 def bind_appworld_action_executor(
     execute: Callable[[str], object],
 ) -> AppWorldActionExecutor:
     return AppWorldActionExecutor(execute)
 
 
-class VLLMAgent:
+def served_model_id(config: RunConfiguration) -> str:
+    """The chat-completions ``model`` field this configuration serves as.
+
+    A LoRA request names the adapter, not the base repository: vLLM routes
+    a request to the loaded LoRA module by matching ``model`` against the
+    name ``runtime.launch_spec.build_vllm_launch_spec`` registered with
+    ``--lora-modules``, which is this same ``lora.repository``. The healthy
+    configuration (``model.lora`` unset) is unaffected and keeps naming the
+    base repository.
+    """
+
+    lora = config.model.lora
+    if lora is not None:
+        return lora.repository
+    return config.model.model.repository
+
+
+def build_appworld_executor(
+    action_interface: str,
+    execute: Callable[[str], object],
+) -> AppWorldActionExecutor | AppWorldExecuteTool:
+    """Bind one AppWorld executor matching the configured action interface.
+
+    ``code`` returns the ``PythonExecutor``-shaped ``AppWorldActionExecutor``;
+    ``tool_calling`` returns the ``Tool``-shaped ``AppWorldExecuteTool``. Both
+    wrap the same ``execute`` callable and both call it, unchanged, from
+    their ``__call__``; only the smolagents-facing shape differs. D18's
+    action-interface choice is read from configuration rather than decided
+    here.
+    """
+
+    resolve_action_interface(action_interface)
+    if action_interface == "code":
+        return AppWorldActionExecutor(execute)
+    return AppWorldExecuteTool(execute)
+
+
+@dataclass(frozen=True)
+class _FallbackChatMessage:
+    """Stand-in for ``smolagents.ChatMessage`` when smolagents is absent.
+
+    Exposes the same ``content``/``raw``/``tool_calls`` attributes so
+    ``SmolagentsVLLMAgent.next_turn`` reads a generated message the same
+    way regardless of whether the real package is installed. Only
+    ``build_runtime`` requires smolagents to actually be present on the
+    live path; CPU tests exercise this exact control flow through this
+    fallback.
+    """
+
+    role: str
+    content: str | None
+    tool_calls: None
+    raw: Mapping[object, object] | None
+
+
+def _build_chat_message(
+    *, role: str, content: str, raw: Mapping[object, object]
+) -> object:
+    if _SmolChatMessage is not None:
+        return _SmolChatMessage(role=role, content=content, tool_calls=None, raw=raw)
+    return _FallbackChatMessage(role=role, content=content, tool_calls=None, raw=raw)
+
+
+class SmolagentsVLLMAgent(_SmolModel):
+    """The one live ``AgentLoop``: a smolagents model served by vLLM.
+
+    Subclasses ``smolagents.Model`` when smolagents is installed, so
+    ``generate`` is a genuine smolagents model call, not a re-implementation
+    of one; ``next_turn`` drives the per-episode turn loop and calls
+    ``self.generate`` for the model step. Falls back to a plain ``object``
+    base so the same control flow is exercised by CPU tests that do not
+    install smolagents (`CONSTRAINTS.md` keeps the hosted CPU suite
+    smolagents-free). ``build_runtime`` is the one path that requires the
+    real package and checks its version against
+    ``config.agent.smolagents_version``.
+
+    Tool execution is not performed here: ``run_episode`` executes the
+    parsed action through ``build_appworld_executor`` against
+    ``AppWorldSession.execute`` directly, so AppWorld stays the only place a
+    mutation happens regardless of which action interface is configured.
+    """
+
     def __init__(self, base_url: str) -> None:
+        if _SmolModel is not object:
+            super().__init__(model_id=base_url)
         self._base_url = base_url.rstrip("/")
         self._mode = "execute"
         self._local = threading.local()
@@ -279,6 +440,20 @@ class VLLMAgent:
 
             raise RuntimeUnavailable(str(error)) from error
 
+    def _api_documentation(self) -> str:
+        state = self._state()
+        agent = state.config.agent
+        try:
+            return resolve_api_documentation(
+                state.context.api_documentation,
+                api_docs_version=agent.api_docs_version,
+                api_docs_app=agent.api_docs_app,
+            )
+        except ApiDocsCorruptionError as error:
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable(str(error)) from error
+
     def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
         state = self._state()
         built = [
@@ -287,7 +462,7 @@ class VLLMAgent:
                 "role": "user",
                 "content": (
                     f"{state.context.instruction}\n"
-                    f"{state.context.api_documentation}"
+                    f"{self._api_documentation()}"
                 ),
             },
         ]
@@ -303,7 +478,7 @@ class VLLMAgent:
         validate_chat_request(state.config)
         sampling = state.config.agent.sampling
         return {
-            "model": state.config.model.model.repository,
+            "model": served_model_id(state.config),
             "temperature": sampling.temperature,
             "top_p": sampling.top_p,
             "max_tokens": sampling.max_tokens,
@@ -337,7 +512,7 @@ class VLLMAgent:
             {"role": "assistant", "content": plan_text}
         ]
         return {
-            "model": state.config.model.model.repository,
+            "model": served_model_id(state.config),
             "temperature": sampling.temperature,
             "top_p": sampling.top_p,
             "max_tokens": 0,
@@ -349,6 +524,7 @@ class VLLMAgent:
                 "top_k": sampling.top_k,
                 "min_p": sampling.min_p,
                 "prompt_logprobs": state.config.model.serving.max_logprobs,
+                "return_token_ids": True,
                 "add_generation_prompt": False,
                 "chat_template_kwargs": {
                     "enable_thinking": state.config.agent.prompt.thinking_enabled
@@ -361,16 +537,32 @@ class VLLMAgent:
     ) -> tuple[str | None, str | None, str | None]:
         return parse_model_output(text)
 
-    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
-        state = self._state()
-        started_at = datetime.now(timezone.utc)
-        if tool_output is not None:
-            state.history.append({"role": "user", "content": tool_output})
-        messages = self.messages()
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        stop_sequences: list[str] | None = None,
+        response_format: dict[str, str] | None = None,
+        tools_to_call_from: list[object] | None = None,
+        **kwargs: object,
+    ) -> object:
+        """The smolagents ``Model.generate`` call this agent loop runs on.
+
+        Signature-compatible with ``smolagents.Model.generate`` so this
+        class is a drop-in model wherever smolagents expects one.
+        ``stop_sequences``, ``response_format``, and ``tools_to_call_from``
+        are accepted for that compatibility and not sent: prompt-v1/plan-v1
+        already carry the action-interface instruction as system text, and
+        per-API structured tool schemas need a live AppWorld catalog this
+        environment does not have (see the final report). Returns a
+        ``smolagents.ChatMessage`` when smolagents is installed, else the
+        attribute-compatible ``_FallbackChatMessage``; either way ``.raw``
+        holds the full decoded response so logprobs are not lost the way
+        they would be through ``smolagents.OpenAIServerModel``.
+        """
+
+        del stop_sequences, response_format, tools_to_call_from, kwargs
         payload = self.completion_payload(messages)
-        began = time.perf_counter()
         raw = self._post(payload)
-        latency_seconds = time.perf_counter() - began
         choices = raw["choices"]
         if not isinstance(choices, list) or not choices:
             from llm_behavior_ci.runtime.episode import RuntimeUnavailable
@@ -387,6 +579,20 @@ class VLLMAgent:
             content = message.get("content")
             if isinstance(content, str):
                 output_text = content
+        return _build_chat_message(role="assistant", content=output_text, raw=raw)
+
+    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+        state = self._state()
+        started_at = datetime.now(timezone.utc)
+        if tool_output is not None:
+            state.history.append({"role": "user", "content": tool_output})
+        messages = self.messages()
+        began = time.perf_counter()
+        chat_message = self.generate(messages)
+        latency_seconds = time.perf_counter() - began
+        output_text = chat_message.content or ""
+        raw = chat_message.raw
+        choice = raw["choices"][0]
         logprobs = parse_logprobs(choice)
         action, app_name, api_name = parse_model_output(output_text)
         state.history.append({"role": "assistant", "content": output_text})
@@ -431,7 +637,7 @@ class VLLMAgent:
                 raise RuntimeUnavailable(
                     "endpoint did not return prompt or echo logprobs for the frozen plan"
                 )
-            return _parse_prompt_logprobs(prompt_logprobs)
+            return _parse_prompt_logprobs(prompt_logprobs, raw.get("prompt_token_ids"))
         return parse_logprobs(choice)
 
     def _post(self, payload: dict[str, object]) -> dict[str, object]:
@@ -453,35 +659,71 @@ class VLLMAgent:
 
 def _parse_prompt_logprobs(
     prompt_logprobs: list[object],
+    prompt_token_ids: object,
 ) -> tuple[tuple[TokenLogprob, ...], ...]:
+    """Parse vLLM's ``prompt_logprobs`` into per-position ``TokenLogprob`` tuples.
+
+    ``prompt_logprobs[i]`` is a mapping of alternative token id to its
+    logprob at position ``i``; it never marks which entry is the token
+    that was actually forced there, so ``prompt_token_ids`` (from
+    ``return_token_ids``) is required to identify it unambiguously. The
+    forced token is always placed at ``rank=0``; the remaining
+    alternatives are ordered by ascending token id, a canonical,
+    model-independent order so that two teacher-forced calls over the
+    same support compare as aligned regardless of how each model ranks
+    its own probabilities.
+    """
+
     from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 
+    if not isinstance(prompt_token_ids, list):
+        raise RuntimeUnavailable(
+            "endpoint did not return prompt_token_ids; the forced token at "
+            "each position cannot be identified"
+        )
+    if len(prompt_token_ids) != len(prompt_logprobs):
+        raise RuntimeUnavailable(
+            "prompt_logprobs and prompt_token_ids length differ"
+        )
     positions: list[tuple[TokenLogprob, ...]] = []
-    for item in prompt_logprobs:
+    for index, (item, forced_token_id) in enumerate(
+        zip(prompt_logprobs, prompt_token_ids)
+    ):
         if item is None:
             continue
         if not isinstance(item, Mapping):
             raise RuntimeUnavailable(
                 "endpoint did not return prompt or echo logprobs for the frozen plan"
             )
-        alternatives: list[TokenLogprob] = []
-        rank = 0
+        entries: dict[int, float] = {}
         for token_id_key, payload in item.items():
             if not isinstance(payload, Mapping):
                 raise RuntimeUnavailable(
                     "endpoint did not return prompt or echo logprobs for the frozen plan"
                 )
             token_id = int(payload.get("token_id", token_id_key))
+            entries[token_id] = float(payload["logprob"])
+        forced_token_id = int(forced_token_id)
+        if forced_token_id not in entries:
+            raise RuntimeUnavailable(
+                f"forced token is missing from returned logprobs at position {index}"
+            )
+        alternatives = [
+            TokenLogprob(
+                token_id=forced_token_id,
+                logprob=entries[forced_token_id],
+                rank=0,
+            )
+        ]
+        rank = 1
+        for token_id in sorted(entries):
+            if token_id == forced_token_id:
+                continue
             alternatives.append(
-                TokenLogprob(
-                    token_id=token_id,
-                    logprob=float(payload["logprob"]),
-                    rank=rank,
-                )
+                TokenLogprob(token_id=token_id, logprob=entries[token_id], rank=rank)
             )
             rank += 1
-        if alternatives:
-            positions.append(tuple(alternatives))
+        positions.append(tuple(alternatives))
     if not positions:
         raise RuntimeUnavailable(
             "endpoint did not return prompt or echo logprobs for the frozen plan"

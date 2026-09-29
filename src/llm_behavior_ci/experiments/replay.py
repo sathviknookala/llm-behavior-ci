@@ -18,13 +18,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from llm_behavior_ci.config import MonitorSettings, StoppingRule
+from llm_behavior_ci.config import (
+    DistributionalMonitorSettings,
+    MonitorSettings,
+    StoppingRule,
+)
 from llm_behavior_ci.lifecycle.detectors import (
     BOUNDED_SIGNALS,
     CORRECTIONS,
     MONITOR_RULE_NAMES,
     DetectorConstructionError,
     build_detector,
+    build_distributional_detector,
     build_harmful_shift_adapter,
     build_hourly_window_detector,
 )
@@ -533,6 +538,134 @@ def monitoring_detector_factories(
 
     factories["harmful_shift"] = _harmful_factory
     return factories
+
+
+def distributional_detector_factories(
+    settings: DistributionalMonitorSettings,
+) -> dict[str, Callable[[], Detector]]:
+    """Build a fresh distributional detector factory from shared settings.
+
+    Shares ``lifecycle.detectors.build_distributional_detector`` with
+    ``lifecycle.monitoring.DistributionalMonitor``, the same way
+    ``monitoring_detector_factories`` shares scalar detector construction
+    with ``ProductionMonitor``: a replayed ``tool_selection`` or
+    ``task_mix`` stream is scored by the identical construction a live
+    monitor would have used for the same ``DistributionalMonitorSettings``.
+    """
+
+    if not isinstance(settings, DistributionalMonitorSettings):
+        raise ReplayError("settings must be DistributionalMonitorSettings")
+
+    def _factory(
+        bound_settings: DistributionalMonitorSettings = settings,
+    ) -> Detector:
+        try:
+            return build_distributional_detector(
+                signal=bound_settings.signal,
+                reference_counts=dict(bound_settings.reference_counts),
+                window_episodes=bound_settings.window_episodes,
+                alpha=bound_settings.alpha,
+                correction=bound_settings.correction,
+            )
+        except DetectorConstructionError as error:
+            raise ReplayError(str(error)) from error
+
+    name = (
+        "chi_square_hourly"
+        if settings.correction == "none"
+        else "chi_square_hourly_bonferroni"
+    )
+    return {name: _factory}
+
+
+def _distributional_stream_hash(
+    counts: Sequence[Mapping[str, int]],
+    schedule: ReplaySchedule,
+) -> str:
+    rows: list[list[object]] = []
+    for index, item in enumerate(counts):
+        rows.append(
+            [
+                sorted(item.items()),
+                schedule.arrival_times[index].isoformat(),
+                schedule.scenario_keys[index],
+                schedule.onset_index,
+                schedule.horizon_episodes,
+            ]
+        )
+    return hashlib.sha256(_canonical_json(rows)).hexdigest()
+
+
+def replay_distributional_detectors(
+    counts: Sequence[Mapping[str, int]],
+    detector_factories: Mapping[str, Callable[[], Detector]],
+    *,
+    schedule: ReplaySchedule,
+) -> Mapping[str, ReplayResult]:
+    """Replay independent distributional detectors on one frozen counts stream.
+
+    ``counts`` is one named-category count mapping per episode (a
+    ``tool_selection`` episode's ``{name: count}``, or a ``task_mix``
+    episode's single-label ``{label: 1}``), in caller order. Distribution-
+    valued behavior signals are never outcome-delayed the way
+    ``task_success``/``requirement_fraction`` are, so every item applies as
+    soon as it arrives; detection-delay and false-alarm scoring reuse the
+    same ``_score_alarms`` scalar replay uses.
+    """
+
+    if not isinstance(schedule, ReplaySchedule):
+        raise ReplayError("schedule must be ReplaySchedule")
+    if not isinstance(detector_factories, Mapping) or not detector_factories:
+        raise ReplayError("detector_factories must be a non-empty mapping")
+    for name, factory in detector_factories.items():
+        if not isinstance(name, str) or name == "":
+            raise ReplayError("factory names must be non-empty strings")
+        if not callable(factory):
+            raise ReplayError("each factory must be callable")
+    if not isinstance(counts, Sequence) or isinstance(counts, (str, bytes)):
+        raise ReplayError("counts must be a non-empty sequence")
+    if len(counts) == 0:
+        raise ReplayError("counts must be a non-empty sequence")
+    total = len(counts)
+    if len(schedule.scenario_keys) != total:
+        raise ReplayError("scenario_keys length must match counts")
+    if len(schedule.arrival_times) != total:
+        raise ReplayError("arrival_times length must match counts")
+    if schedule.onset_index > total:
+        raise ReplayError("onset_index must be <= len(counts)")
+    materialised: list[dict[str, int]] = []
+    for item in counts:
+        if not isinstance(item, Mapping):
+            raise ReplayError("counts entries must be mappings of name to count")
+        row: dict[str, int] = {}
+        for name, value in item.items():
+            if not isinstance(name, str) or name == "":
+                raise ReplayError("counts entries must name non-empty categories")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ReplayError("counts entries must be non-negative integers")
+            row[name] = value
+        materialised.append(row)
+    stream_hash = _distributional_stream_hash(materialised, schedule)
+    results: dict[str, ReplayResult] = {}
+    for name, factory in detector_factories.items():
+        detector = _validate_detector(factory())
+        alarm_indices: list[tuple[int, str]] = []
+        started = time.perf_counter()
+        for index, item in enumerate(materialised):
+            evidence = detector.update(item)
+            if evidence.alarm:
+                alarm_indices.append((index, schedule.scenario_keys[index]))
+        compute_seconds = time.perf_counter() - started
+        results[name] = _score_alarms(
+            method=name,
+            stream_hash=stream_hash,
+            alarm_indices=alarm_indices,
+            schedule=schedule,
+            compute_seconds=compute_seconds,
+            observations_applied=total,
+            observations_withheld=0,
+        )
+    return results
 
 
 def replay_result_public_dict(result: ReplayResult) -> dict[str, Any]:

@@ -11,7 +11,9 @@
   "mmd_features": [
     "char_count",
     "numbered_step_count",
-    "model_step_count"
+    "model_step_count",
+    "requirement_coverage_fraction",
+    "invalid_tool_reference_fraction"
   ],
   "kl_approximation": "top_k",
   "required_statistics": [
@@ -19,5 +21,21 @@
     "kl",
     "mmd"
   ],
-  "validation_provenance": "synthetic_fixture"
+  "validation_provenance": "synthetic_fixture",
+  "task_plan_specs": [
+    {
+      "task_id": "task-a",
+      "available_tools": ["calendar.open_calendar", "calendar.create_event"],
+      "subgoal_keywords": [["open the calendar"]],
+      "required_entities": ["calendar"],
+      "dependency_pairs": []
+    },
+    {
+      "task_id": "task-b",
+      "available_tools": ["calendar.open_calendar", "calendar.create_event"],
+      "subgoal_keywords": [["open the calendar"]],
+      "required_entities": ["calendar"],
+      "dependency_pairs": []
+    }
+  ]
 }

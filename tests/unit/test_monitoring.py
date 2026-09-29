@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from llm_behavior_ci.config import (
+    DistributionalMonitorSettings,
     EpisodeIdentity,
     MonitorSettings,
     RunIdentity,
@@ -18,6 +19,7 @@ from llm_behavior_ci.lifecycle.detectors import (
 )
 from llm_behavior_ci.lifecycle.monitoring import (
     Alert,
+    DistributionalMonitor,
     FrozenReference,
     LocalAlertSink,
     MissingEvaluatorOutcome,
@@ -29,6 +31,9 @@ from llm_behavior_ci.lifecycle.monitoring import (
     UndefinedRequirementFraction,
     normalize_episode,
     observation_from_episode,
+    plan_kl_observation,
+    plan_quality_observation_from_features,
+    resolved_slice_name,
     task_mix_observation_from_episode,
     tool_selection_observation_from_episode,
 )
@@ -37,13 +42,17 @@ from llm_behavior_ci.records import (
     EvaluatorOutcome,
     LocalTaskRef,
     ModelStep,
+    MonitorObservation,
+    NamedCount,
     RecordError,
     RecordedError,
+    TaskMixObservation,
     TokenLogprob,
+    ToolSelectionObservation,
     ToolStep,
     assert_public_payload,
 )
-from llm_behavior_ci.storage import EpisodeStore
+from llm_behavior_ci.storage import EpisodeStore, MonitorMetadataRecord
 
 _HASH_A = "a" * 64
 _HASH_B = "b" * 64
@@ -178,7 +187,11 @@ class NormalizeEpisodeTests(unittest.TestCase):
         )
         normalized = normalize_episode(
             episode,
-            task_metadata=_metadata(task_mix="difficulty:1", completion_index=3),
+            task_metadata=_metadata(
+                difficulty=1,
+                task_mix="difficulty:1",
+                completion_index=3,
+            ),
         )
         self.assertIsInstance(normalized, NormalizedEpisode)
         self.assertEqual(normalized.task_success, 1.0)
@@ -193,6 +206,37 @@ class NormalizeEpisodeTests(unittest.TestCase):
         self.assertEqual(normalized.task_mix, "difficulty:1")
         self.assertEqual(normalized.completion_index, 3)
         self.assertFalse(normalized.missing_outcome)
+        self.assertEqual(normalized.difficulty, 1)
+
+    def test_evaluator_difficulty_overrides_a_launcher_label_left_unset(self) -> None:
+        episode = _episode(
+            evaluator_outcome=EvaluatorOutcome(
+                success=True,
+                passed_requirements=2,
+                total_requirements=2,
+                difficulty=3,
+            )
+        )
+        normalized = normalize_episode(
+            episode,
+            task_metadata=_metadata(difficulty=None),
+        )
+        self.assertEqual(normalized.difficulty, 3)
+
+    def test_launcher_difficulty_conflicting_with_evaluator_is_rejected(self) -> None:
+        episode = _episode(
+            evaluator_outcome=EvaluatorOutcome(
+                success=True,
+                passed_requirements=2,
+                total_requirements=2,
+                difficulty=3,
+            )
+        )
+        with self.assertRaises(MonitorRejected):
+            normalize_episode(
+                episode,
+                task_metadata=_metadata(difficulty=1),
+            )
 
     def test_missing_outcome_leaves_success_and_fraction_none(self) -> None:
         episode = _episode(
@@ -554,6 +598,373 @@ class ProductionMonitorUnitTests(unittest.TestCase):
             self.assertEqual(store.load_alerts(), (alert.to_record(),))
             self.assertEqual(len(store.load_deployment_decisions()), 1)
             store.close()
+
+
+class TaskMetadataRecordTests(unittest.TestCase):
+    def test_to_record_and_from_record_round_trip(self) -> None:
+        metadata = TaskMetadata(
+            signal="task_success",
+            completion_index=4,
+            difficulty=2,
+            task_mix="difficulty:2",
+            slice_id="difficulty:2",
+        )
+        record = metadata.to_record("episode-7")
+        self.assertIsInstance(record, MonitorMetadataRecord)
+        self.assertEqual(record.episode_id, "episode-7")
+        restored = TaskMetadata.from_record(record)
+        self.assertEqual(restored, metadata)
+
+
+class ProductionMonitorSignalsPropertyTests(unittest.TestCase):
+    def test_signals_property_feeds_every_configured_series(self) -> None:
+        settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success", "tool_error_count", "trajectory_length"),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=20,
+                    threshold=0.5,
+                ),
+            ),
+        )
+        self.assertEqual(
+            settings.signals,
+            ("task_success", "tool_error_count", "trajectory_length"),
+        )
+        monitor = ProductionMonitor(
+            settings,
+            FrozenReference(
+                configuration_hash=_HASH_A,
+                baselines=(
+                    ("task_success", 0.9),
+                    ("tool_error_count", 0.0),
+                    ("trajectory_length", 2.0),
+                ),
+            ),
+            clock=lambda: _END,
+            dedup_seconds=0.0,
+        )
+        self.assertEqual(monitor.signals, settings.signals)
+        episode = _episode(
+            tool_steps=(_tool_step(1, error=None),),
+            evaluator_outcome=EvaluatorOutcome(
+                success=True,
+                passed_requirements=2,
+                total_requirements=2,
+                difficulty=2,
+            ),
+        )
+        applied = []
+        for signal in monitor.signals:
+            applied.extend(
+                monitor.update(
+                    observation_from_episode(
+                        episode,
+                        task_metadata=_metadata(signal, difficulty=2),
+                    )
+                )
+            )
+        self.assertEqual(len(monitor.signals), 3)
+
+
+class PlanQualityAndKLObservationTests(unittest.TestCase):
+    def test_plan_quality_observation_reads_requirement_coverage(self) -> None:
+        episode = _episode(mode="execute")
+        observation = plan_quality_observation_from_features(
+            episode,
+            features={
+                "requirement_coverage_fraction": 0.75,
+                "entity_coverage_fraction": 1.0,
+            },
+        )
+        self.assertEqual(observation.signal, "plan_quality_score")
+        self.assertEqual(observation.value, 0.75)
+
+    def test_plan_quality_observation_requires_the_coverage_feature(self) -> None:
+        episode = _episode(mode="execute")
+        with self.assertRaises(MonitorRejected):
+            plan_quality_observation_from_features(episode, features={})
+
+    def test_plan_kl_observation_reads_mean_kl_nats(self) -> None:
+        episode = _episode(mode="execute")
+        observation = plan_kl_observation(episode, mean_kl_nats=0.42)
+        self.assertEqual(observation.signal, "plan_kl_mean_nats")
+        self.assertEqual(observation.value, 0.42)
+
+    def test_plan_kl_observation_rejects_negative_values(self) -> None:
+        episode = _episode(mode="execute")
+        with self.assertRaises(MonitorRejected):
+            plan_kl_observation(episode, mean_kl_nats=-0.1)
+
+    def test_plan_quality_and_kl_signals_drive_a_bounded_and_unbounded_detector(
+        self,
+    ) -> None:
+        quality_settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("plan_quality_score",),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=20,
+                    threshold=0.5,
+                ),
+            ),
+        )
+        quality_monitor = ProductionMonitor(
+            quality_settings,
+            FrozenReference(
+                configuration_hash=_HASH_A,
+                baselines=(("plan_quality_score", 0.9),),
+            ),
+            clock=lambda: _END,
+            dedup_seconds=0.0,
+        )
+        episode = _episode(mode="execute")
+        low_quality = plan_quality_observation_from_features(
+            episode,
+            features={"requirement_coverage_fraction": 0.1},
+        )
+        alerts = quality_monitor.update(low_quality)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].signal, "plan_quality_score")
+
+        kl_settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("plan_kl_mean_nats",),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=20,
+                    threshold=0.5,
+                ),
+            ),
+        )
+        kl_monitor = ProductionMonitor(
+            kl_settings,
+            FrozenReference(
+                configuration_hash=_HASH_A,
+                baselines=(("plan_kl_mean_nats", 0.0),),
+            ),
+            clock=lambda: _END,
+            dedup_seconds=0.0,
+        )
+        second_episode = _episode(mode="execute", episode_token="3" * 32)
+        kl_alerts = kl_monitor.update(
+            plan_kl_observation(second_episode, mean_kl_nats=5.0)
+        )
+        self.assertEqual(len(kl_alerts), 1)
+        self.assertEqual(kl_alerts[0].signal, "plan_kl_mean_nats")
+
+
+def _selection_observation(
+    counts: dict[str, int],
+    *,
+    token: str,
+    split: str = "dev",
+) -> ToolSelectionObservation:
+    run = _run()
+    return ToolSelectionObservation(
+        episode=EpisodeIdentity(
+            episode_id=f"{run.run_id}.{token}",
+            run_id=run.run_id,
+            pair_id=None,
+        ),
+        run=run,
+        split=split,
+        counts=tuple(
+            NamedCount(name=name, count=count)
+            for name, count in sorted(counts.items())
+        ),
+        observed_at=_END,
+        completion_index=0,
+    )
+
+
+def _mix_observation(
+    label: str,
+    *,
+    token: str,
+    split: str = "dev",
+) -> TaskMixObservation:
+    run = _run()
+    return TaskMixObservation(
+        episode=EpisodeIdentity(
+            episode_id=f"{run.run_id}.{token}",
+            run_id=run.run_id,
+            pair_id=None,
+        ),
+        run=run,
+        split=split,
+        label=label,
+        observed_at=_END,
+        completion_index=0,
+    )
+
+
+class DistributionalMonitorTests(unittest.TestCase):
+    def test_tool_selection_monitor_alarms_on_windowed_drift_and_dedups(self) -> None:
+        settings = DistributionalMonitorSettings(
+            signal="tool_selection",
+            reference_counts=(("calendar.lookup", 80), ("mail.send", 20)),
+            window_episodes=2,
+            alpha=0.01,
+            correction="none",
+        )
+        monitor = DistributionalMonitor(
+            settings,
+            reference_configuration_hash=_HASH_A,
+            clock=lambda: _END,
+            dedup_seconds=60.0,
+        )
+        first_alerts: list[Alert] = []
+        for index in range(2):
+            first_alerts.extend(
+                monitor.update(
+                    _selection_observation(
+                        {"mail.send": 10},
+                        token=f"{index + 2}" * 32,
+                    )
+                )
+            )
+        self.assertEqual(len(first_alerts), 1)
+        self.assertEqual(first_alerts[0].signal, "tool_selection")
+        self.assertEqual(first_alerts[0].method, "chi_square_hourly")
+        self.assertEqual(first_alerts[0].reference_configuration_hash, _HASH_A)
+
+        deduped: list[Alert] = []
+        for index in range(2):
+            deduped.extend(
+                monitor.update(
+                    _selection_observation(
+                        {"mail.send": 10},
+                        token=f"{index + 4}" * 32,
+                    )
+                )
+            )
+        self.assertEqual(deduped, [])
+
+    def test_task_mix_monitor_is_independent_of_tool_selection(self) -> None:
+        settings = DistributionalMonitorSettings(
+            signal="task_mix",
+            reference_counts=(("easy", 90), ("hard", 10)),
+            window_episodes=3,
+            alpha=0.01,
+            correction="bonferroni",
+        )
+        monitor = DistributionalMonitor(
+            settings,
+            reference_configuration_hash=_HASH_A,
+            clock=lambda: _END,
+            dedup_seconds=0.0,
+        )
+        alerts: list[Alert] = []
+        for index in range(3):
+            alerts.extend(
+                monitor.update(_mix_observation("hard", token=f"{index + 2}" * 32))
+            )
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].signal, "task_mix")
+        self.assertEqual(alerts[0].method, "chi_square_hourly_bonferroni")
+        with self.assertRaises(MonitorRejected):
+            monitor.update(_selection_observation({"mail.send": 1}, token="9" * 32))
+
+    def test_distributional_monitor_tracks_independent_per_slice_sample_sizes(
+        self,
+    ) -> None:
+        settings = DistributionalMonitorSettings(
+            signal="tool_selection",
+            reference_counts=(("calendar.lookup", 80), ("mail.send", 20)),
+            window_episodes=5,
+            alpha=0.01,
+            correction="none",
+        )
+        monitor = DistributionalMonitor(
+            settings,
+            reference_configuration_hash=_HASH_A,
+            clock=lambda: _END,
+            dedup_seconds=0.0,
+        )
+        monitor.update(
+            _selection_observation({"mail.send": 1}, token="2" * 32),
+            slice_name="difficulty:1",
+        )
+        monitor.update(
+            _selection_observation({"mail.send": 1}, token="3" * 32),
+            slice_name="difficulty:2",
+        )
+        monitor.update(
+            _selection_observation({"mail.send": 1}, token="4" * 32),
+            slice_name="difficulty:1",
+        )
+        aggregate_snapshot = monitor._detector.snapshot()
+        self.assertEqual(aggregate_snapshot["sample_size"], 3)
+        slice_one = monitor._slice_detectors["difficulty:1"].snapshot()
+        slice_two = monitor._slice_detectors["difficulty:2"].snapshot()
+        self.assertEqual(slice_one["sample_size"], 2)
+        self.assertEqual(slice_two["sample_size"], 1)
+
+
+class SliceAttributionTests(unittest.TestCase):
+    def test_slice_specific_chain_alarms_while_aggregate_stays_quiet(self) -> None:
+        settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success",),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=50,
+                    threshold=1.6,
+                ),
+            ),
+        )
+        reference = FrozenReference(
+            configuration_hash=_HASH_A,
+            baselines=(("task_success", 0.9),),
+        )
+        monitor = ProductionMonitor(
+            settings,
+            reference,
+            clock=lambda: _END,
+            dedup_seconds=0.0,
+            use_slice_attribution=True,
+        )
+
+        def _success_observation(token: str, *, success: bool) -> MonitorObservation:
+            episode = _episode(
+                episode_token=token,
+                evaluator_outcome=EvaluatorOutcome(
+                    success=success,
+                    passed_requirements=2 if success else 0,
+                    total_requirements=2,
+                    difficulty=1,
+                ),
+            )
+            return observation_from_episode(
+                episode,
+                task_metadata=_metadata("task_success", difficulty=1),
+            )
+
+        sequence = [True, True, True, False, True, True, True, True, True, False]
+        hex_digits = "0123456789abcdef"
+        all_alerts: list[Alert] = []
+        for index, success in enumerate(sequence):
+            token = hex_digits[index + 2] * 32
+            observation = _success_observation(token, success=success)
+            slice_name = "good" if success else "bad"
+            all_alerts.extend(monitor.update(observation, slice_name=slice_name))
+        self.assertEqual(len(all_alerts), 1)
+        self.assertEqual(all_alerts[0].slice_name, "bad")
+        self.assertEqual(all_alerts[0].signal, "task_success")
 
 
 if __name__ == "__main__":

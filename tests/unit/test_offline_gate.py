@@ -19,6 +19,7 @@ from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
 from llm_behavior_ci.runtime.episode import RuntimeDependencies
 from llm_behavior_ci.runtime.scoring import score_top_k
+from llm_behavior_ci.tasks.plan_specs import TaskPlanSpec
 from llm_behavior_ci.tasks.selection import (
     TaskSet,
     canonical_task_set_bytes,
@@ -176,6 +177,30 @@ def _settings(**overrides: object) -> GateSettings:
     }
     values.update(overrides)
     return GateSettings(**values)
+
+
+def _task_plan_specs() -> tuple[TaskPlanSpec, ...]:
+    spec = TaskPlanSpec(
+        task_id="task-a",
+        available_tools=("calendar.open_calendar", "calendar.create_event"),
+        subgoal_keywords=(
+            ("open the calendar",),
+            ("create an event", "add an event"),
+        ),
+        required_entities=("calendar",),
+        dependency_pairs=(("calendar.open_calendar", "calendar.create_event"),),
+    )
+    other = TaskPlanSpec(
+        task_id="task-b",
+        available_tools=("calendar.open_calendar", "calendar.create_event"),
+        subgoal_keywords=(
+            ("open the calendar",),
+            ("create an event", "add an event"),
+        ),
+        required_entities=("calendar",),
+        dependency_pairs=(("calendar.open_calendar", "calendar.create_event"),),
+    )
+    return (spec, other)
 
 
 def _evidence(**overrides: object) -> PlanEvidenceInputs:
@@ -510,6 +535,7 @@ class OfflineGateUnitTests(unittest.TestCase):
             plan_evidence=_evidence(
                 kl_approximation="full",
                 required_statistics=("kl",),
+                kl_vocabulary_size=2,
             ),
         )
         self.assertEqual(top_k.statistics[0].method, "plan_kl_top_k")
@@ -624,6 +650,128 @@ class OfflineGateUnitTests(unittest.TestCase):
                     required_statistics=("plan_quality",),
                 ),
             )
+
+    def test_missing_task_plan_spec_is_execution_error(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        with self.assertRaises(GateExecutionError):
+            run_offline_gate(
+                reference,
+                candidate,
+                task_set,
+                settings=_settings(),
+                runtime=_runtime(),
+                plan_evidence=_evidence(
+                    plan_quality_features=("requirement_coverage_fraction",),
+                    plan_quality_weights=(1.0,),
+                    required_statistics=("plan_quality",),
+                    task_plan_specs=(),
+                ),
+            )
+
+    def test_semantic_plan_quality_reflects_requirement_coverage(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        decision = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(score_margin=-1.0),
+            runtime=_runtime(
+                by_run_seed={
+                    7: ("1. open the calendar", _MATCHING_LOGPROBS),
+                    8: (
+                        "1. open the calendar\n2. create an event",
+                        _MATCHING_LOGPROBS,
+                    ),
+                }
+            ),
+            plan_evidence=_evidence(
+                plan_quality_features=("requirement_coverage_fraction",),
+                plan_quality_weights=(1.0,),
+                required_statistics=("plan_quality",),
+                task_plan_specs=_task_plan_specs(),
+            ),
+        )
+        statistic = decision.statistics[0]
+        self.assertEqual(statistic.method, "plan_quality_bootstrap")
+        self.assertGreater(statistic.estimate, 0.0)
+
+    def test_semantic_mmd_features_use_task_plan_specs_and_preserve_clusters(
+        self,
+    ) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        with patch(
+            "llm_behavior_ci.lifecycle.offline_gate.mmd_permutation_test",
+        ) as mmd_call:
+            mmd_call.return_value = SimpleNamespace(mmd_squared=0.0, p_value=1.0)
+            run_offline_gate(
+                reference,
+                candidate,
+                task_set,
+                settings=_settings(),
+                runtime=_runtime(
+                    by_run_seed={
+                        7: ("1. open the calendar", _MATCHING_LOGPROBS),
+                        8: (
+                            "1. open the calendar\n2. create an event",
+                            _MATCHING_LOGPROBS,
+                        ),
+                    }
+                ),
+                plan_evidence=_evidence(
+                    mmd_features=(
+                        "requirement_coverage_fraction",
+                        "invalid_tool_reference_fraction",
+                    ),
+                    required_statistics=("mmd",),
+                    task_plan_specs=_task_plan_specs(),
+                ),
+            )
+        kwargs = mmd_call.call_args.kwargs
+        self.assertEqual(kwargs["clusters"], ("scenario-1", "task-b"))
+        self.assertEqual(kwargs["production"], ((0.5, 0.0), (0.5, 0.0)))
+        self.assertEqual(kwargs["candidate"], ((1.0, 0.0), (1.0, 0.0)))
+
+    def test_semantic_features_are_deterministic_across_repeated_calls(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        evidence = _evidence(
+            plan_quality_features=("requirement_coverage_fraction",),
+            plan_quality_weights=(1.0,),
+            mmd_features=("requirement_coverage_fraction", "tool_reference_fraction"),
+            required_statistics=("plan_quality", "mmd"),
+            task_plan_specs=_task_plan_specs(),
+        )
+        first = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(
+                plan_text="1. open the calendar\n2. create an event"
+            ),
+            plan_evidence=evidence,
+        )
+        second = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(
+                plan_text="1. open the calendar\n2. create an event"
+            ),
+            plan_evidence=evidence,
+        )
+        self.assertEqual(
+            tuple(item.to_dict() for item in first.statistics),
+            tuple(item.to_dict() for item in second.statistics),
+        )
 
     def test_plan_run_failed_blocks_without_statistics(self) -> None:
         task_set = _task_set()

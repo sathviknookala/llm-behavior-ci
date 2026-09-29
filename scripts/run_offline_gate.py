@@ -15,6 +15,8 @@ from llm_behavior_ci.lifecycle.offline_gate import (
 )
 from llm_behavior_ci.records import assert_public_payload, public_record_dict
 from llm_behavior_ci.runtime.episode import RuntimeDependencies, build_runtime
+from llm_behavior_ci.storage import EpisodeStore, StorageError
+from llm_behavior_ci.tasks.plan_specs import PlanSpecError, task_plan_specs_from_mapping
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
     TaskSet,
@@ -78,6 +80,9 @@ def _load_plan_evidence(payload: object) -> PlanEvidenceInputs:
         approximation = str(payload["kl_approximation"])
         if approximation not in {"full", "top_k"}:
             raise GateExecutionError("kl_approximation must be full or top_k")
+        task_plan_specs = task_plan_specs_from_mapping(
+            payload.get("task_plan_specs", [])
+        )
         return PlanEvidenceInputs(
             plan_format_version=str(payload["plan_format_version"]),
             plan_quality_features=features,
@@ -86,8 +91,9 @@ def _load_plan_evidence(payload: object) -> PlanEvidenceInputs:
             kl_approximation=approximation,  # type: ignore[arg-type]
             required_statistics=required,
             validation_provenance=str(payload["validation_provenance"]),
+            task_plan_specs=task_plan_specs,
         )
-    except (GateExecutionError, KeyError, TypeError, ValueError) as error:
+    except (GateExecutionError, PlanSpecError, KeyError, TypeError, ValueError) as error:
         raise GateExecutionError("plan evidence is incomplete") from error
 
 
@@ -184,6 +190,8 @@ def _public_document(decision: GateDecision) -> dict[str, object]:
             else None
         ),
         "validation_provenance": decision.validation_provenance,
+        "artifact": public_record_dict(decision.artifact),
+        "artifact_id": decision.artifact.artifact_id,
     }
     assert_public_payload(document)
     return document
@@ -210,6 +218,16 @@ def main(
     parser.add_argument("--live-runtime", action="store_true")
     parser.add_argument("--reference-endpoint", default=None)
     parser.add_argument("--candidate-endpoint", default=None)
+    parser.add_argument(
+        "--episode-store",
+        default=None,
+        help=(
+            "SQLite episode log to record the validation artifact into. "
+            "Candidate admission (POST /candidates) looks the artifact up "
+            "by id from this same store; without --episode-store the gate "
+            "still prints artifact_id, but no admission call can find it."
+        ),
+    )
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
     except SystemExit as error:
@@ -254,7 +272,13 @@ def main(
             runtime=active_runtime,
             plan_evidence=plan_evidence,
         )
-    except (GateExecutionError, ConfigError, SelectionError) as error:
+        if args.episode_store is not None:
+            store = EpisodeStore(Path(args.episode_store))
+            try:
+                store.append_validation_artifact(decision.artifact)
+            finally:
+                store.close()
+    except (GateExecutionError, ConfigError, SelectionError, StorageError) as error:
         print(str(error) or "offline gate execution failed", file=sys.stderr)
         return 2
     except Exception:

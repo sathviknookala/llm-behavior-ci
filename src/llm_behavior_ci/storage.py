@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 from llm_behavior_ci.config import EpisodeIdentity, RunIdentity
-from llm_behavior_ci.records import EpisodeResult, ModelStep, PairedResult, ToolStep
+from llm_behavior_ci.lifecycle.validation_artifact import ValidationArtifact
+from llm_behavior_ci.records import EpisodeResult, ModelStep, PairedResult, ToolStep, RecordError
 
 _T = TypeVar("_T")
 _DUMP = {"sort_keys": True, "separators": (",", ":"), "ensure_ascii": False}
@@ -108,6 +109,16 @@ class AlertRecord:
 
 @dataclass(frozen=True)
 class DeploymentDecisionRecord:
+    """A local record of one deployment-lifecycle decision.
+
+    ``evidence_artifact_id`` is the ``ValidationArtifact.artifact_id`` that
+    authorized the candidate this decision concerns, when the decision has
+    one (an admission decision always does; a canary promote/rollback
+    decision may not, since ``lifecycle.canary`` is not extended here to
+    thread it through). ``None`` means no artifact backs this row, not
+    that verification was skipped for a row that needed it.
+    """
+
     configuration_hash: str
     reference_configuration_hash: str
     signal: str
@@ -118,6 +129,7 @@ class DeploymentDecisionRecord:
     boundary: float | None
     sample_size: int
     decided_at: datetime
+    evidence_artifact_id: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -131,6 +143,7 @@ class DeploymentDecisionRecord:
             "boundary": self.boundary,
             "sample_size": self.sample_size,
             "decided_at": self.decided_at.isoformat(),
+            "evidence_artifact_id": self.evidence_artifact_id,
         }
 
     @classmethod
@@ -166,6 +179,11 @@ class DeploymentDecisionRecord:
             value = payload.get(key)
             if not isinstance(value, str) or value == "":
                 raise StorageError(f"deployment decision {key} is invalid")
+        evidence_artifact_id = payload.get("evidence_artifact_id")
+        if evidence_artifact_id is not None and (
+            not isinstance(evidence_artifact_id, str) or evidence_artifact_id == ""
+        ):
+            raise StorageError("deployment decision evidence_artifact_id is invalid")
         return cls(
             configuration_hash=str(payload["configuration_hash"]),
             reference_configuration_hash=str(
@@ -179,6 +197,74 @@ class DeploymentDecisionRecord:
             boundary=None if boundary is None else float(boundary),
             sample_size=sample_size,
             decided_at=parsed,
+            evidence_artifact_id=evidence_artifact_id,
+        )
+
+
+@dataclass(frozen=True)
+class MonitorMetadataRecord:
+    """The caller-supplied metadata behind one persisted monitor observation.
+
+    Paired with the already-persisted ``EpisodeResult`` for ``episode_id``,
+    this is everything ``lifecycle.monitoring.normalize_episode`` and the
+    typed observation builders need to reconstruct the exact detector
+    input a live ``ProductionMonitor.update_from_episode`` call once used,
+    for one ``signal`` (a scalar ``MONITOR_SIGNALS`` member, or
+    ``tool_selection``/``task_mix``).
+    """
+
+    episode_id: str
+    signal: str
+    completion_index: int
+    difficulty: int | None
+    task_mix: str | None
+    slice_id: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "episode_id": self.episode_id,
+            "signal": self.signal,
+            "completion_index": self.completion_index,
+            "difficulty": self.difficulty,
+            "task_mix": self.task_mix,
+            "slice_id": self.slice_id,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> MonitorMetadataRecord:
+        if not isinstance(payload, dict):
+            raise StorageError("monitor metadata record must be an object")
+        episode_id = payload.get("episode_id")
+        signal = payload.get("signal")
+        completion_index = payload.get("completion_index")
+        if not isinstance(episode_id, str) or episode_id == "":
+            raise StorageError("monitor metadata record episode_id is invalid")
+        if not isinstance(signal, str) or signal == "":
+            raise StorageError("monitor metadata record signal is invalid")
+        if isinstance(completion_index, bool) or not isinstance(
+            completion_index, int
+        ):
+            raise StorageError(
+                "monitor metadata record completion_index is invalid"
+            )
+        difficulty = payload.get("difficulty")
+        if difficulty is not None and (
+            isinstance(difficulty, bool) or not isinstance(difficulty, int)
+        ):
+            raise StorageError("monitor metadata record difficulty is invalid")
+        task_mix = payload.get("task_mix")
+        if task_mix is not None and not isinstance(task_mix, str):
+            raise StorageError("monitor metadata record task_mix is invalid")
+        slice_id = payload.get("slice_id")
+        if slice_id is not None and not isinstance(slice_id, str):
+            raise StorageError("monitor metadata record slice_id is invalid")
+        return cls(
+            episode_id=episode_id,
+            signal=signal,
+            completion_index=completion_index,
+            difficulty=difficulty,
+            task_mix=task_mix,
+            slice_id=slice_id,
         )
 
 
@@ -254,6 +340,25 @@ class EpisodeStore:
                   decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
                   decided_at TEXT NOT NULL,
                   decision_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS validation_artifacts (
+                  artifact_id TEXT NOT NULL PRIMARY KEY,
+                  created_at TEXT NOT NULL,
+                  artifact_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitor_metadata (
+                  episode_id TEXT NOT NULL,
+                  signal TEXT NOT NULL,
+                  metadata_json TEXT NOT NULL,
+                  PRIMARY KEY (episode_id, signal)
                 )
                 """
             )
@@ -591,6 +696,155 @@ class EpisodeStore:
             )
 
         return self._run("load_deployment_decisions", read)
+
+    def append_validation_artifact(
+        self,
+        artifact: ValidationArtifact,
+    ) -> ValidationArtifact:
+        """Persist one gate-emitted artifact, keyed by its content hash.
+
+        Content-addressed, so a second call with an artifact that hashes
+        to an id already in the store is a no-op rather than a conflict:
+        the row already holds this exact content. This is what lets
+        candidate admission trust an ``artifact_id`` handed to it over the
+        wire: the content behind that id is whatever a real
+        ``run_offline_gate`` call wrote here, never whatever the admission
+        caller separately claims.
+        """
+
+        if not isinstance(artifact, ValidationArtifact):
+            raise StorageError("append_validation_artifact failed")
+        artifact_id = artifact.artifact_id
+
+        def write(connection: sqlite3.Connection) -> ValidationArtifact:
+            connection.execute(
+                """
+                INSERT INTO validation_artifacts (
+                  artifact_id, created_at, artifact_json
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(artifact_id) DO NOTHING
+                """,
+                (
+                    artifact_id,
+                    artifact.created_at.isoformat(),
+                    _dumps(artifact.to_dict()),
+                ),
+            )
+            connection.commit()
+            return artifact
+
+        return self._run("append_validation_artifact", write)
+
+    def load_validation_artifact(
+        self,
+        artifact_id: str,
+    ) -> ValidationArtifact | None:
+        """Look up a persisted artifact by content hash, or ``None``.
+
+        A missing, malformed, or tampered row (one whose recomputed
+        ``artifact_id`` disagrees with the row it was stored under) is
+        rejected the same way: ``None``, so a caller cannot distinguish
+        "never written" from "corrupt" and treat the latter as an
+        invitation to fall back to a caller-supplied document instead.
+        """
+
+        if not isinstance(artifact_id, str) or artifact_id == "":
+            raise StorageError("load_validation_artifact failed")
+
+        def read(connection: sqlite3.Connection) -> ValidationArtifact | None:
+            row = connection.execute(
+                """
+                SELECT artifact_json FROM validation_artifacts
+                WHERE artifact_id = ?
+                """,
+                (artifact_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                artifact = ValidationArtifact.from_dict(json.loads(row[0]))
+            except (RecordError, json.JSONDecodeError):
+                return None
+            if artifact.artifact_id != artifact_id:
+                return None
+            return artifact
+
+        return self._run("load_validation_artifact", read)
+
+    def append_monitor_metadata(self, record: MonitorMetadataRecord) -> None:
+        """Persist one observation's metadata, keyed by episode and signal.
+
+        Content-addressed by ``(episode_id, signal)`` rather than
+        auto-incremented: a signal is fed from one episode at most once
+        (``ProductionMonitor`` itself rejects a repeated episode/signal
+        pair), so a second call with the same key is a no-op replay of the
+        same content rather than a conflicting overwrite.
+        """
+
+        if not isinstance(record, MonitorMetadataRecord):
+            raise StorageError("append_monitor_metadata failed")
+
+        def write(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                INSERT INTO monitor_metadata (episode_id, signal, metadata_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(episode_id, signal) DO NOTHING
+                """,
+                (record.episode_id, record.signal, _dumps(record.to_dict())),
+            )
+            connection.commit()
+
+        self._run("append_monitor_metadata", write)
+
+    def load_monitor_metadata(
+        self,
+        episode_id: str,
+        signal: str,
+    ) -> MonitorMetadataRecord | None:
+        if not isinstance(episode_id, str) or episode_id == "":
+            raise StorageError("load_monitor_metadata failed")
+        if not isinstance(signal, str) or signal == "":
+            raise StorageError("load_monitor_metadata failed")
+
+        def read(connection: sqlite3.Connection) -> MonitorMetadataRecord | None:
+            row = connection.execute(
+                """
+                SELECT metadata_json FROM monitor_metadata
+                WHERE episode_id = ? AND signal = ?
+                """,
+                (episode_id, signal),
+            ).fetchone()
+            if row is None:
+                return None
+            return MonitorMetadataRecord.from_dict(json.loads(row[0]))
+
+        return self._run("load_monitor_metadata", read)
+
+    def load_monitor_metadata_for_episode(
+        self,
+        episode_id: str,
+    ) -> tuple[MonitorMetadataRecord, ...]:
+        if not isinstance(episode_id, str) or episode_id == "":
+            raise StorageError("load_monitor_metadata_for_episode failed")
+
+        def read(
+            connection: sqlite3.Connection,
+        ) -> tuple[MonitorMetadataRecord, ...]:
+            rows = connection.execute(
+                """
+                SELECT metadata_json FROM monitor_metadata
+                WHERE episode_id = ?
+                ORDER BY signal
+                """,
+                (episode_id,),
+            ).fetchall()
+            return tuple(
+                MonitorMetadataRecord.from_dict(json.loads(payload))
+                for (payload,) in rows
+            )
+
+        return self._run("load_monitor_metadata_for_episode", read)
 
     def close(self) -> None:
         with self._lock:

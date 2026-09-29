@@ -3,11 +3,17 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from llm_behavior_ci.config import MonitorSettings, StoppingRule
+from llm_behavior_ci.config import (
+    DistributionalMonitorSettings,
+    MonitorSettings,
+    StoppingRule,
+)
 from llm_behavior_ci.lifecycle.detectors import build_detector
 from llm_behavior_ci.lifecycle.monitoring import (
+    DistributionalMonitor,
     FrozenReference,
     LocalAlertSink,
+    MonitorRejected,
     ProductionMonitor,
     TaskMetadata,
     observation_from_episode,
@@ -19,8 +25,10 @@ from llm_behavior_ci.records import (
     EvaluatorOutcome,
     LocalTaskRef,
     ModelStep,
+    NamedCount,
     RunIdentity,
     TokenLogprob,
+    ToolSelectionObservation,
     assert_public_payload,
 )
 
@@ -283,6 +291,154 @@ class ProductionMonitorIntegrationTests(unittest.TestCase):
             clock_time["now"] = clock_time["now"] + timedelta(seconds=1)
         self.assertEqual(len(sink.delivered), 1)
         self.assertEqual(monitor.reference.baselines, reference.baselines)
+
+
+def _tool_selection(counts: dict[str, int], *, token: str) -> ToolSelectionObservation:
+    run = _run()
+    return ToolSelectionObservation(
+        episode=EpisodeIdentity(
+            episode_id=f"{run.run_id}.{token}",
+            run_id=run.run_id,
+            pair_id=None,
+        ),
+        run=run,
+        split="dev",
+        counts=tuple(
+            NamedCount(name=name, count=count)
+            for name, count in sorted(counts.items())
+        ),
+        observed_at=_END,
+        completion_index=0,
+    )
+
+
+class MixedMonitoringPeriodTests(unittest.TestCase):
+    """One monitoring period carrying a scalar signal and a distributional one.
+
+    ``ProductionMonitor`` (``task_success``) and ``DistributionalMonitor``
+    (``tool_selection``) are independent objects sharing one ``LocalAlertSink``
+    and one production period. Both alarm on the same underlying fault, each
+    through the detector-construction path its statistical type actually
+    uses, and a promotion resets both without leaking held state from the
+    old period into the new one.
+    """
+
+    def test_scalar_and_distributional_monitors_alarm_in_one_period_then_reset(
+        self,
+    ) -> None:
+        clock_time = {"now": _END + timedelta(seconds=1)}
+
+        def clock() -> datetime:
+            return clock_time["now"]
+
+        scalar_settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success",),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=50,
+                    threshold=0.5,
+                ),
+            ),
+        )
+        scalar_reference = FrozenReference(
+            configuration_hash=_HASH_A,
+            baselines=(("task_success", 0.9),),
+        )
+        scalar_monitor = ProductionMonitor(
+            scalar_settings,
+            scalar_reference,
+            clock=clock,
+            dedup_seconds=0.0,
+            period_id="period-a",
+        )
+
+        distributional_settings = DistributionalMonitorSettings(
+            signal="tool_selection",
+            reference_counts=(("calendar.lookup", 9), ("mail.send", 1)),
+            window_episodes=1,
+            alpha=0.01,
+            correction="none",
+        )
+        distributional_monitor = DistributionalMonitor(
+            distributional_settings,
+            reference_configuration_hash=_HASH_A,
+            clock=clock,
+            dedup_seconds=0.0,
+        )
+
+        sink = LocalAlertSink(dedup_seconds=0.0)
+
+        healthy_scalar = scalar_monitor.update(
+            observation_from_episode(
+                _episode(success=True, episode_token="2" * 32),
+                task_metadata=TaskMetadata(
+                    signal="task_success",
+                    completion_index=0,
+                ),
+            ),
+            period_id="period-a",
+        )
+        healthy_distributional = distributional_monitor.update(
+            _tool_selection({"calendar.lookup": 9, "mail.send": 1}, token="2" * 32)
+        )
+        self.assertEqual(healthy_scalar, ())
+        self.assertEqual(healthy_distributional, ())
+
+        faulty_scalar = scalar_monitor.update(
+            observation_from_episode(
+                _episode(success=False, episode_token="3" * 32),
+                task_metadata=TaskMetadata(
+                    signal="task_success",
+                    completion_index=1,
+                ),
+            ),
+            period_id="period-a",
+        )
+        faulty_distributional = distributional_monitor.update(
+            _tool_selection({"mail.send": 10}, token="3" * 32)
+        )
+        sink.deliver(faulty_scalar)
+        sink.deliver(faulty_distributional)
+        self.assertEqual(len(faulty_scalar), 1)
+        self.assertEqual(faulty_scalar[0].signal, "task_success")
+        self.assertEqual(len(faulty_distributional), 1)
+        self.assertEqual(faulty_distributional[0].signal, "tool_selection")
+        self.assertEqual(len(sink.delivered), 2)
+
+        scalar_monitor.reset_for_promotion(
+            FrozenReference(
+                configuration_hash=_HASH_B,
+                baselines=(("task_success", 0.8),),
+            )
+        )
+        distributional_monitor.reset()
+        with self.assertRaises(MonitorRejected):
+            scalar_monitor.update(
+                observation_from_episode(
+                    _episode(success=True, episode_token="4" * 32, config=_HASH_B),
+                    task_metadata=TaskMetadata(
+                        signal="task_success",
+                        completion_index=0,
+                    ),
+                ),
+                period_id="a-different-period",
+            )
+        healthy_after_promotion = scalar_monitor.update(
+            observation_from_episode(
+                _episode(success=True, episode_token="5" * 32, config=_HASH_B),
+                task_metadata=TaskMetadata(
+                    signal="task_success",
+                    completion_index=0,
+                ),
+            ),
+            period_id="period-a",
+        )
+        self.assertEqual(healthy_after_promotion, ())
+        self.assertEqual(scalar_monitor.reference.configuration_hash, _HASH_B)
 
 
 if __name__ == "__main__":

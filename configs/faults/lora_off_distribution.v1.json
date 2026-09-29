@@ -2,6 +2,14 @@
   "fault_id": "lora_off_distribution",
   "version": "1",
   "kind": "lora",
-  "patches": [],
-  "schema_request": "optional hashed leaves model.lora.repository and model.lora.revision, omitted from canonical JSON when unset"
+  "patches": [
+    {
+      "path": "model.lora.repository",
+      "value": "Qwen/Qwen3-4B-lora-off-distribution"
+    },
+    {
+      "path": "model.lora.revision",
+      "value": "dddddddddddddddddddddddddddddddddddddddd"
+    }
+  ]
 }

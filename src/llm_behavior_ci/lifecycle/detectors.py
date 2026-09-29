@@ -6,7 +6,12 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
-from llm_behavior_ci.config import MONITOR_SIGNALS, StoppingRule
+from llm_behavior_ci.config import (
+    DISTRIBUTIONAL_CORRECTIONS,
+    DISTRIBUTIONAL_SIGNALS,
+    MONITOR_SIGNALS,
+    StoppingRule,
+)
 from llm_behavior_ci.stats.adwin import ADWIN
 from llm_behavior_ci.stats.chi_square import ChiSquareError, chi_square_homogeneity
 from llm_behavior_ci.stats.confidence_sequence import BoundedMeanCS
@@ -16,7 +21,9 @@ from llm_behavior_ci.stats.evidence import Detector, Evidence, PairedSuccess, St
 from llm_behavior_ci.stats.harmful_shift import HarmfulShiftTest
 from llm_behavior_ci.stats.ks import KSError, ks_two_sample
 
-BOUNDED_SIGNALS = frozenset({"task_success", "requirement_fraction"})
+BOUNDED_SIGNALS = frozenset(
+    {"task_success", "requirement_fraction", "plan_quality_score"}
+)
 MONITOR_RULE_NAMES = frozenset({"cusum", "adwin", "e_detector", "bounded_mean_cs"})
 WINDOW_KINDS = frozenset({"ks", "chi_square"})
 CORRECTIONS = frozenset({"none", "bonferroni"})
@@ -287,6 +294,142 @@ def build_hourly_window_detector(
         baseline=baseline_value,
         correction=correction,
         kind=kind,
+    )
+
+
+class DistributionalWindowDetector:
+    """Windowed chi-square drift test over a named-category distribution.
+
+    Feeds ``tool_selection`` (the agent's own tool/API choices) or
+    ``task_mix`` (the incoming task composition), never a scalar. Each
+    ``update`` merges one observation's counts into the open window; once
+    the window reaches ``window_episodes`` observations, it is compared
+    against ``reference_counts`` with ``stats.chi_square.
+    chi_square_homogeneity`` over the union of category names seen on
+    either side (a name absent from one side counts as zero there, and a
+    reference category otherwise expected to be empty is floored at one
+    count so the test never divides by a zero expected total). The window
+    then clears, matching ``HourlyWindowDetector``'s non-overlapping
+    windows.
+    """
+
+    def __init__(
+        self,
+        *,
+        method: str,
+        reference_counts: Mapping[str, int],
+        window_episodes: int,
+        alpha: float,
+        correction: str,
+    ) -> None:
+        self._method = method
+        self._reference = dict(reference_counts)
+        self._window_episodes = window_episodes
+        self._alpha = alpha
+        self._correction = correction
+        self._window: dict[str, int] = {}
+        self._window_size = 0
+        self._looks = 0
+        self._sample_size = 0
+
+    def update(self, observation: Mapping[str, int]) -> Evidence:
+        for name, count in observation.items():
+            self._window[name] = self._window.get(name, 0) + int(count)
+        self._window_size += 1
+        self._sample_size += 1
+        alarm = False
+        p_value: float | None = None
+        if self._window_size >= self._window_episodes:
+            self._looks += 1
+            categories = sorted(set(self._reference) | set(self._window))
+            reference_vector = [
+                max(1, self._reference.get(name, 0)) for name in categories
+            ]
+            window_vector = [self._window.get(name, 0) for name in categories]
+            try:
+                result = chi_square_homogeneity(window_vector, reference_vector)
+                p_value = result.p_value
+            except ChiSquareError:
+                p_value = None
+            if p_value is not None:
+                if self._correction == "bonferroni":
+                    adjusted = min(1.0, p_value * self._looks)
+                    alarm = adjusted <= self._alpha
+                else:
+                    alarm = p_value <= self._alpha
+            self._window = {}
+            self._window_size = 0
+        return Evidence(
+            method=self._method,
+            estimate=0.0 if p_value is None else p_value,
+            sample_size=self._sample_size,
+            alarm=alarm,
+            boundary=self._alpha,
+            p_value=p_value,
+            details=(),
+        )
+
+    def reset(self) -> None:
+        self._window = {}
+        self._window_size = 0
+        self._looks = 0
+        self._sample_size = 0
+
+    def snapshot(self) -> Mapping[str, object]:
+        return {
+            "method": self._method,
+            "sample_size": self._sample_size,
+            "looks": self._looks,
+            "window_size": self._window_size,
+            "alarm": False,
+        }
+
+
+def build_distributional_detector(
+    *,
+    signal: str,
+    reference_counts: Mapping[str, int],
+    window_episodes: int,
+    alpha: float,
+    correction: str,
+) -> DistributionalWindowDetector:
+    if signal not in DISTRIBUTIONAL_SIGNALS:
+        raise DetectorConstructionError("signal must be tool_selection or task_mix")
+    if correction not in DISTRIBUTIONAL_CORRECTIONS:
+        raise DetectorConstructionError("correction must be none or bonferroni")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise DetectorConstructionError("alpha must be a finite float in (0, 1)")
+    alpha_value = float(alpha)
+    if not math.isfinite(alpha_value) or not 0.0 < alpha_value < 1.0:
+        raise DetectorConstructionError("alpha must be a finite float in (0, 1)")
+    if isinstance(window_episodes, bool) or not isinstance(window_episodes, int):
+        raise DetectorConstructionError("window_episodes must be an integer >= 1")
+    if window_episodes < 1:
+        raise DetectorConstructionError("window_episodes must be an integer >= 1")
+    if not isinstance(reference_counts, Mapping) or not reference_counts:
+        raise DetectorConstructionError(
+            "reference_counts must be a non-empty mapping of name to count"
+        )
+    counts: dict[str, int] = {}
+    for name, count in reference_counts.items():
+        if not isinstance(name, str) or name == "":
+            raise DetectorConstructionError("reference_counts names must be strings")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise DetectorConstructionError(
+                "reference_counts counts must be non-negative integers"
+            )
+        counts[name] = count
+    if sum(counts.values()) <= 0:
+        raise DetectorConstructionError("reference_counts must have a positive total")
+    method = (
+        "chi_square_hourly" if correction == "none" else "chi_square_hourly_bonferroni"
+    )
+    return DistributionalWindowDetector(
+        method=method,
+        reference_counts=counts,
+        window_episodes=window_episodes,
+        alpha=alpha_value,
+        correction=correction,
     )
 
 

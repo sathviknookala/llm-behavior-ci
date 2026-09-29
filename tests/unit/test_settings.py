@@ -65,6 +65,8 @@ def _canary() -> CanarySettings:
         outcome_delay_seconds=0.0,
         harm_margin=0.1,
         stopping_rule=_stopping_rule(threshold=-0.02),
+        metric_orientation="higher_is_better",
+        promotion_policy="horizon_reached_without_harm",
     )
 
 
@@ -116,6 +118,13 @@ class SettingsContractTests(unittest.TestCase):
             (CanarySettings, _canary().to_dict(), "fraction", 0.0),
             (CanarySettings, _canary().to_dict(), "harm_margin", 0.0),
             (CanarySettings, _canary().to_dict(), "outcome_delay_seconds", -1.0),
+            (CanarySettings, _canary().to_dict(), "metric_orientation", "sideways"),
+            (
+                CanarySettings,
+                _canary().to_dict(),
+                "promotion_policy",
+                "superior_evidence",
+            ),
             (StreamSettings, _stream().to_dict(), "arrival_rate_per_second", 0.0),
             (StreamSettings, _stream().to_dict(), "concurrency", True),
             (GateSettings, _gate().to_dict(), "mmd_alpha", 1.0),

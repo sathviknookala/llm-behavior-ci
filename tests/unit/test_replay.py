@@ -8,21 +8,26 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from llm_behavior_ci.config import (
+    DistributionalMonitorSettings,
     EpisodeIdentity,
     MonitorSettings,
     RunIdentity,
     StoppingRule,
 )
 from llm_behavior_ci.experiments.replay import (
+    ReplayError,
     ReplaySchedule,
+    distributional_detector_factories,
     monitoring_detector_factories,
     replay_detectors,
+    replay_distributional_detectors,
 )
 from llm_behavior_ci.lifecycle.detectors import (
     DetectorConstructionError,
     build_detector,
+    build_distributional_detector,
 )
-from llm_behavior_ci.lifecycle.monitoring import FrozenReference
+from llm_behavior_ci.lifecycle.monitoring import DistributionalMonitor, FrozenReference
 from llm_behavior_ci.records import MonitorObservation
 from llm_behavior_ci.stats.cusum import CUSUM
 from llm_behavior_ci.stats.evidence import Evidence
@@ -443,6 +448,78 @@ class ReplayUnitTests(unittest.TestCase):
                 ),
                 signal="task_success",
                 baseline=0.9,
+            )
+
+
+class DistributionalReplayTests(unittest.TestCase):
+    def test_shared_construction_matches_monitoring_distributional_monitor(
+        self,
+    ) -> None:
+        settings = DistributionalMonitorSettings(
+            signal="tool_selection",
+            reference_counts=(("calendar.lookup", 80), ("mail.send", 20)),
+            window_episodes=2,
+            alpha=0.01,
+            correction="none",
+        )
+        direct = build_distributional_detector(
+            signal=settings.signal,
+            reference_counts=dict(settings.reference_counts),
+            window_episodes=settings.window_episodes,
+            alpha=settings.alpha,
+            correction=settings.correction,
+        )
+        factories = distributional_detector_factories(settings)
+        self.assertEqual(list(factories), ["chi_square_hourly"])
+        via_replay = factories["chi_square_hourly"]()
+        self.assertEqual(direct.snapshot(), via_replay.snapshot())
+
+        live = DistributionalMonitor(
+            settings,
+            reference_configuration_hash="a" * 64,
+            clock=lambda: _START,
+            dedup_seconds=0.0,
+        )
+        self.assertEqual(live._detector.snapshot(), via_replay.snapshot())
+
+    def test_replay_distributional_detectors_detects_windowed_drift(self) -> None:
+        settings = DistributionalMonitorSettings(
+            signal="tool_selection",
+            reference_counts=(("calendar.lookup", 80), ("mail.send", 20)),
+            window_episodes=2,
+            alpha=0.01,
+            correction="none",
+        )
+        counts = [
+            {"calendar.lookup": 4, "mail.send": 1},
+            {"calendar.lookup": 4, "mail.send": 1},
+            {"mail.send": 10},
+            {"mail.send": 10},
+        ]
+        schedule = _schedule(len(counts), onset_index=2, horizon_episodes=2)
+        factories = distributional_detector_factories(settings)
+        results = replay_distributional_detectors(counts, factories, schedule=schedule)
+        result = results["chi_square_hourly"]
+        self.assertEqual(result.observations_applied, 4)
+        self.assertEqual(result.observations_withheld, 0)
+        self.assertFalse(result.missed_horizon)
+        self.assertEqual(result.detection_delay_episodes, 2)
+
+    def test_replay_distributional_detectors_rejects_malformed_counts(self) -> None:
+        settings = DistributionalMonitorSettings(
+            signal="task_mix",
+            reference_counts=(("easy", 9), ("hard", 1)),
+            window_episodes=1,
+            alpha=0.05,
+            correction="none",
+        )
+        factories = distributional_detector_factories(settings)
+        schedule = _schedule(1)
+        with self.assertRaises(ReplayError):
+            replay_distributional_detectors(
+                [{"hard": -1}],
+                factories,
+                schedule=schedule,
             )
 
 

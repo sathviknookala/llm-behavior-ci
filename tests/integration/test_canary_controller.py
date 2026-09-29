@@ -242,6 +242,8 @@ class CanaryControllerIntegrationTests(unittest.TestCase):
                 alpha=0.05,
                 horizon_episodes=2,
             ),
+            metric_orientation="higher_is_better",
+            promotion_policy="horizon_reached_without_harm",
         )
         controller = CanaryController(
             reference,
@@ -333,6 +335,8 @@ class CanaryControllerIntegrationTests(unittest.TestCase):
                     alpha=0.05,
                     horizon_episodes=1,
                 ),
+                metric_orientation="higher_is_better",
+                promotion_policy="horizon_reached_without_harm",
             ),
             clock=clock,
         )
@@ -399,6 +403,8 @@ class CanaryControllerIntegrationTests(unittest.TestCase):
                     alpha=0.05,
                     horizon_episodes=5,
                 ),
+                metric_orientation="higher_is_better",
+                promotion_policy="horizon_reached_without_harm",
             ),
             clock=clock,
         )
@@ -477,6 +483,8 @@ class CanaryControllerIntegrationTests(unittest.TestCase):
                     alpha=0.05,
                     horizon_episodes=1,
                 ),
+                metric_orientation="higher_is_better",
+                promotion_policy="horizon_reached_without_harm",
             ),
             clock=clock,
         )

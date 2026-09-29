@@ -77,10 +77,15 @@ ERROR_SOURCES = frozenset(
 DIFFICULTIES = frozenset({1, 2, 3})
 TIER_ACTIONS = {
     "offline_gate": frozenset({"allow_canary", "block"}),
-    "canary": frozenset({"continue", "rollback", "promote"}),
+    "canary": frozenset(
+        {"continue", "rollback", "promote_horizon_reached_without_harm"}
+    ),
     "production_monitor": frozenset({"alert", "no_alert"}),
 }
 TIERS = frozenset(TIER_ACTIONS)
+EVIDENCE_DIRECTIONS = frozenset(
+    {"harmful", "beneficial", "insufficient", "undirected"}
+)
 PROTECTED_FIELDS = frozenset(
     {
         "task_id",
@@ -786,6 +791,10 @@ class MonitorObservation(Record):
         _validate_signal_value(self.signal, self.value)
 
 
+_UNIT_INTERVAL_SIGNALS = frozenset({"requirement_fraction", "plan_quality_score"})
+_UNBOUNDED_SCALAR_SIGNALS = frozenset({"plan_kl_mean_nats"})
+
+
 def _validate_signal_value(signal: str, value: object) -> None:
     if signal == "task_success":
         if (
@@ -795,8 +804,11 @@ def _validate_signal_value(signal: str, value: object) -> None:
         ):
             raise RecordError("task_success must be 0 or 1")
         return
-    if signal == "requirement_fraction":
-        _closed_unit(value, "requirement_fraction")
+    if signal in _UNIT_INTERVAL_SIGNALS:
+        _closed_unit(value, signal)
+        return
+    if signal in _UNBOUNDED_SCALAR_SIGNALS:
+        _nonnegative_float(value, signal)
         return
     number = _nonnegative_float(value, signal)
     if not number.is_integer():
@@ -881,6 +893,11 @@ class StatisticalEvidence(Record):
     Interval fields are omitted together when the method reports no
     interval. ``threshold`` is the caller-supplied decision threshold
     when the method used one. No level or threshold is filled in.
+    ``direction`` is the evidence's harm/benefit reading: ``harmful``,
+    ``beneficial``, or ``insufficient`` for a method that distinguishes
+    them, and ``None`` for one that does not (a method that is not
+    reading a paired candidate against a reference at all, such as a
+    Tier 1 plan-quality check).
     """
 
     method: str
@@ -896,6 +913,7 @@ class StatisticalEvidence(Record):
     p_value: float | None = None
     threshold: float | None = None
     seed: int | None = None
+    direction: str | None = None
 
     def __post_init__(self) -> None:
         _token(self.method, "method")
@@ -921,6 +939,8 @@ class StatisticalEvidence(Record):
             _float(self.threshold, "threshold")
         if self.seed is not None:
             _integer(self.seed, "seed")
+        if self.direction is not None:
+            _choice(self.direction, EVIDENCE_DIRECTIONS, "direction")
 
 
 @dataclass(frozen=True)

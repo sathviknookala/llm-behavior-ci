@@ -20,14 +20,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from llm_behavior_ci.config import (
-    HASHED_FIELDS,
     CanarySettings,
     ConfigError,
+    DistributionalMonitorSettings,
     GateSettings,
     MonitorSettings,
     RunConfiguration,
     StreamSettings,
     TaskConfiguration,
+    hashed_values,
     run_configuration_hash,
 )
 from llm_behavior_ci.experiments.faults import (
@@ -36,10 +37,25 @@ from llm_behavior_ci.experiments.faults import (
     HarmLabel,
     apply_fault,
     fault_from_mapping,
+    fault_to_mapping,
 )
 from llm_behavior_ci.experiments.validation import (
     ValidationReport,
     public_validation_summary,
+)
+from llm_behavior_ci.lifecycle.offline_gate import (
+    PlanEvidenceInputs,
+    plan_evidence_to_dict,
+)
+from llm_behavior_ci.lifecycle.plan_features import PLAN_FEATURE_SCHEMA_VERSION
+from llm_behavior_ci.lifecycle.validation_artifact import (
+    GATE_VALIDATION_ARTIFACT_SCHEMA_VERSION,
+    ValidationArtifact,
+)
+from llm_behavior_ci.runtime.prompts import (
+    UnknownPromptVersion,
+    resolve_plan_format_template,
+    resolve_prompt_template,
 )
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 
@@ -111,7 +127,13 @@ class TaskSelectionAllowance:
 
 @dataclass(frozen=True)
 class GatedCandidateAdmission:
-    """Frozen record that a real gate PASS may serve a candidate configuration."""
+    """Frozen record that a real gate PASS may serve a candidate configuration.
+
+    ``evidence_artifact_id`` is the ``ValidationArtifact.artifact_id`` that
+    was verified to authorize this admission, so a caller that persists
+    the admission decision (``storage.DeploymentDecisionRecord``) can carry
+    that identity forward without recomputing it.
+    """
 
     outcome: str
     reference_configuration_hash: str
@@ -121,6 +143,7 @@ class GatedCandidateAdmission:
     train_task_set_hash: str
     allowed_task_selection_leaves: frozenset[str]
     served_candidate_configuration_hash: str
+    evidence_artifact_id: str
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -260,7 +283,17 @@ def _payload_reports_validated(reports: Sequence[object]) -> None:
 
 @dataclass(frozen=True)
 class ProtocolSettings:
-    """Caller-supplied lock inputs. No numeric defaults."""
+    """Caller-supplied lock inputs. No numeric defaults.
+
+    ``faults`` is every fault this lock authorizes for final-test
+    execution; ``authorize_faulted_candidate`` refuses a fault that is not
+    named here, with no bypass for an absent list. ``plan_evidence`` binds
+    the plan-quality features, MMD representation, and KL fidelity/
+    vocabulary settings the offline gate scores with, plus the exact
+    ``task_plan_specs`` metadata in use. ``distributional_monitors`` binds
+    the ``tool_selection``/``task_mix`` windowed categorical monitors, when
+    the deployment schedules either; it may be empty when neither is used.
+    """
 
     configurations: tuple[RunConfiguration, ...]
     task_selections: tuple[TaskConfiguration, ...]
@@ -272,6 +305,9 @@ class ProtocolSettings:
     stream: StreamSettings
     analysis_version: str
     seeds: tuple[int, ...]
+    faults: tuple[FaultSpec, ...]
+    plan_evidence: PlanEvidenceInputs
+    distributional_monitors: tuple[DistributionalMonitorSettings, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.configurations, tuple) or not self.configurations:
@@ -341,6 +377,38 @@ class ProtocolSettings:
             methods.append(report.method)
             if report.validated is not True:
                 raise ProtocolError("validation reports must all be validated")
+
+        if not isinstance(self.faults, tuple) or not self.faults:
+            raise ProtocolError("faults must be a non-empty tuple")
+        fault_versions: list[str] = []
+        for fault in self.faults:
+            if not isinstance(fault, FaultSpec):
+                raise ProtocolError("faults must contain FaultSpec")
+            if fault.fault_version in fault_versions:
+                raise ProtocolError(f"duplicate fault_version: {fault.fault_version}")
+            fault_versions.append(fault.fault_version)
+        for label in self.harm_labels:
+            if label.fault_version not in fault_versions:
+                raise ProtocolError(
+                    "harm label fault_version matches no declared fault"
+                )
+
+        if not isinstance(self.plan_evidence, PlanEvidenceInputs):
+            raise ProtocolError("plan_evidence must be PlanEvidenceInputs")
+
+        if not isinstance(self.distributional_monitors, tuple):
+            raise ProtocolError("distributional_monitors must be a tuple")
+        distributional_signals: list[str] = []
+        for entry in self.distributional_monitors:
+            if not isinstance(entry, DistributionalMonitorSettings):
+                raise ProtocolError(
+                    "distributional_monitors must contain DistributionalMonitorSettings"
+                )
+            if entry.signal in distributional_signals:
+                raise ProtocolError(
+                    f"duplicate distributional monitor signal: {entry.signal}"
+                )
+            distributional_signals.append(entry.signal)
 
 
 @dataclass(frozen=True)
@@ -414,6 +482,58 @@ class ProtocolLock:
         return tuple(flags)
 
 
+def _prompt_template_content_hash(
+    prompt_version: str,
+    plan_format_version: str,
+) -> str:
+    prompt = resolve_prompt_template(prompt_version)
+    plan_format = resolve_plan_format_template(plan_format_version)
+    document = {
+        "prompt_version": prompt.version,
+        "system_body": prompt.system_body,
+        "plan_format_version": plan_format.version,
+        "format_body": plan_format.format_body,
+    }
+    return hashlib.sha256(_canonical_json(document)).hexdigest()
+
+
+def _prompt_template_hashes(
+    configurations: Sequence[RunConfiguration],
+) -> list[dict[str, object]]:
+    """One content hash per distinct (prompt_version, plan_format_version) pair.
+
+    Binds the resolved system and plan-format *text*, not only the version
+    ids: editing ``runtime.prompts``' registry bodies without bumping a
+    version string would otherwise leave every hashed field, and this lock,
+    unaware that the prompt actually served changed.
+    """
+
+    seen: dict[tuple[str, str], str] = {}
+    for configuration in configurations:
+        prompt_version = configuration.agent.prompt.prompt_version
+        plan_format_version = configuration.agent.prompt.plan_format_version
+        key = (prompt_version, plan_format_version)
+        if key in seen:
+            continue
+        try:
+            seen[key] = _prompt_template_content_hash(
+                prompt_version,
+                plan_format_version,
+            )
+        except UnknownPromptVersion as error:
+            raise ProtocolError(str(error)) from error
+    return [
+        {
+            "prompt_version": prompt_version,
+            "plan_format_version": plan_format_version,
+            "content_hash": content_hash,
+        }
+        for (prompt_version, plan_format_version), content_hash in sorted(
+            seen.items()
+        )
+    ]
+
+
 def _build_payload(settings: ProtocolSettings) -> dict[str, object]:
     return {
         "analysis_version": settings.analysis_version,
@@ -421,9 +541,19 @@ def _build_payload(settings: ProtocolSettings) -> dict[str, object]:
         "configurations": [
             configuration.to_dict() for configuration in settings.configurations
         ],
+        "distributional_monitors": [
+            entry.to_dict() for entry in settings.distributional_monitors
+        ],
+        "faults": [fault_to_mapping(fault) for fault in settings.faults],
         "gate": settings.gate.to_dict(),
+        "gate_validation_artifact_schema_version": (
+            GATE_VALIDATION_ARTIFACT_SCHEMA_VERSION
+        ),
         "harm_labels": [_harm_label_dict(label) for label in settings.harm_labels],
         "monitor": settings.monitor.to_dict(),
+        "plan_evidence": plan_evidence_to_dict(settings.plan_evidence),
+        "plan_feature_schema_version": PLAN_FEATURE_SCHEMA_VERSION,
+        "prompt_template_hashes": _prompt_template_hashes(settings.configurations),
         "seeds": list(settings.seeds),
         "stream": settings.stream.to_dict(),
         "task_selections": [
@@ -438,6 +568,60 @@ def _build_payload(settings: ProtocolSettings) -> dict[str, object]:
 
 def _digest_for_payload(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
+
+
+def verify_runtime_bindings(lock: ProtocolLock) -> None:
+    """Fail closed when a locked runtime value no longer matches the code.
+
+    Recomputes ``PLAN_FEATURE_SCHEMA_VERSION``,
+    ``GATE_VALIDATION_ARTIFACT_SCHEMA_VERSION``, and every locked prompt
+    template's resolved content hash, and raises ``ProtocolError`` the
+    moment any of them has drifted from what this lock recorded. Called by
+    ``require_protocol_lock`` (every real lock load) and
+    ``admit_test_normal`` (every real test_normal admission), so a stale
+    lock cannot silently authorize a run under a runtime that has since
+    changed underneath it.
+    """
+
+    if not isinstance(lock, ProtocolLock):
+        raise ProtocolError("verify_runtime_bindings requires a protocol lock")
+    if lock.payload.get("plan_feature_schema_version") != PLAN_FEATURE_SCHEMA_VERSION:
+        raise ProtocolError(
+            "plan_feature_schema_version no longer matches the locked value"
+        )
+    if (
+        lock.payload.get("gate_validation_artifact_schema_version")
+        != GATE_VALIDATION_ARTIFACT_SCHEMA_VERSION
+    ):
+        raise ProtocolError(
+            "gate_validation_artifact_schema_version no longer matches the"
+            " locked value"
+        )
+    locked_hashes = lock.payload.get("prompt_template_hashes")
+    if not isinstance(locked_hashes, list):
+        raise ProtocolError("prompt_template_hashes must be a list")
+    for item in locked_hashes:
+        if not isinstance(item, Mapping):
+            raise ProtocolError("prompt_template_hashes entries must be objects")
+        prompt_version = item.get("prompt_version")
+        plan_format_version = item.get("plan_format_version")
+        content_hash = item.get("content_hash")
+        if not isinstance(prompt_version, str) or not isinstance(
+            plan_format_version, str
+        ):
+            raise ProtocolError("prompt_template_hashes entry is invalid")
+        try:
+            recomputed = _prompt_template_content_hash(
+                prompt_version,
+                plan_format_version,
+            )
+        except UnknownPromptVersion as error:
+            raise ProtocolError(str(error)) from error
+        if recomputed != content_hash:
+            raise ProtocolError(
+                "prompt template content changed since this lock was written:"
+                f" {prompt_version}/{plan_format_version}"
+            )
 
 
 def lock_protocol(settings: ProtocolSettings, path: Path) -> ProtocolLock:
@@ -526,7 +710,9 @@ def require_protocol_lock(path: Path) -> ProtocolLock:
     expected = _document_bytes(digest, payload)
     if raw != expected:
         raise ProtocolError("protocol lock bytes disagree with the canonical document")
-    return ProtocolLock(digest=digest, payload=dict(payload))
+    lock = ProtocolLock(digest=digest, payload=dict(payload))
+    verify_runtime_bindings(lock)
+    return lock
 
 
 def bind_protocol(config: RunConfiguration, lock: ProtocolLock) -> RunConfiguration:
@@ -569,6 +755,7 @@ def admit_test_normal(
     recomputed = _digest_for_payload(lock.payload)
     if recomputed != lock.digest:
         raise ProtocolError("protocol lock digest mismatch")
+    verify_runtime_bindings(lock)
 
     if config.task.split != "test_normal":
         raise ProtocolError("admit_test_normal requires a test_normal configuration")
@@ -589,16 +776,6 @@ def admit_test_normal(
     if not isinstance(reports, list):
         raise ProtocolError("validation_reports must be a list")
     _payload_reports_validated(reports)
-
-
-def _gate_attr(gate: object, name: str) -> object:
-    if isinstance(gate, Mapping):
-        if name not in gate:
-            raise ProtocolError(f"gate decision missing {name}")
-        return gate[name]
-    if not hasattr(gate, name):
-        raise ProtocolError(f"gate decision missing {name}")
-    return getattr(gate, name)
 
 
 def _leaf_value(document: Mapping[str, object], path: str) -> object:
@@ -622,11 +799,6 @@ def _set_leaf(document: dict[str, object], path: str, value: object) -> None:
     node[parts[-1]] = value
 
 
-def _hashed_values(configuration: RunConfiguration) -> dict[str, object]:
-    document = configuration.to_dict()
-    return {path: _leaf_value(document, path) for path in sorted(HASHED_FIELDS)}
-
-
 def _with_train_task_selection(
     configuration: RunConfiguration,
     allowance: TaskSelectionAllowance,
@@ -642,66 +814,44 @@ def _with_train_task_selection(
         ) from error
 
 
-def _require_pass_gate(gate: object) -> tuple[object, ...]:
-    outcome = _gate_attr(gate, "outcome")
-    reason_codes = _gate_attr(gate, "reason_codes")
-    reference_configuration_hash = _gate_attr(
-        gate, "reference_configuration_hash"
-    )
-    candidate_configuration_hash = _gate_attr(
-        gate, "candidate_configuration_hash"
-    )
-    task_set_hash = _gate_attr(gate, "task_set_hash")
-    reference_protocol_hash = _gate_attr(gate, "reference_protocol_hash")
-    candidate_protocol_hash = _gate_attr(gate, "candidate_protocol_hash")
-    if outcome != "PASS":
+def _require_pass_artifact(
+    artifact: object,
+    *,
+    allow_synthetic: bool,
+) -> tuple[str, str, str, str | None, str | None]:
+    if not isinstance(artifact, ValidationArtifact):
+        raise ProtocolError(
+            "candidate admission requires a ValidationArtifact, not a"
+            " free-form gate document"
+        )
+    if artifact.evidence_source == "synthetic_fixture" and not allow_synthetic:
+        raise ProtocolError(
+            "candidate admission refuses synthetic_fixture evidence;"
+            " call authorize_test_gated_candidate from a test"
+        )
+    if artifact.outcome != "PASS":
         raise ProtocolError("gate outcome must be PASS")
-    if reason_codes is None:
+    if artifact.reason_codes:
         raise ProtocolError("gate reason_codes must be empty")
-    try:
-        codes = tuple(reason_codes)
-    except TypeError as error:
-        raise ProtocolError("gate reason_codes must be empty") from error
-    if codes:
-        raise ProtocolError("gate reason_codes must be empty")
-    if not isinstance(reference_configuration_hash, str):
-        raise ProtocolError("gate reference_configuration_hash must be a string")
-    if not isinstance(candidate_configuration_hash, str):
-        raise ProtocolError("gate candidate_configuration_hash must be a string")
-    if not isinstance(task_set_hash, str):
-        raise ProtocolError("gate task_set_hash must be a string")
-    if reference_protocol_hash is not None and not isinstance(
-        reference_protocol_hash, str
-    ):
-        raise ProtocolError("gate reference_protocol_hash must be a string or null")
-    if candidate_protocol_hash is not None and not isinstance(
-        candidate_protocol_hash, str
-    ):
-        raise ProtocolError("gate candidate_protocol_hash must be a string or null")
+    if not artifact.statistics:
+        raise ProtocolError("gate evidence must include at least one statistic")
     return (
-        reference_configuration_hash,
-        candidate_configuration_hash,
-        task_set_hash,
-        reference_protocol_hash,
-        candidate_protocol_hash,
+        artifact.reference_configuration_hash,
+        artifact.candidate_configuration_hash,
+        artifact.task_set_hash,
+        artifact.reference_protocol_hash,
+        artifact.candidate_protocol_hash,
     )
 
 
-def authorize_gated_candidate(
-    gate: object,
+def _authorize_gated_candidate(
+    artifact: object,
     reference: RunConfiguration,
     candidate: RunConfiguration,
-    allowance: TaskSelectionAllowance | None = None,
+    allowance: TaskSelectionAllowance | None,
+    *,
+    allow_synthetic: bool,
 ) -> GatedCandidateAdmission:
-    """Authorize serving a candidate against a real gate decision.
-
-    Task-selection leaves may differ from the gate-approved configurations only
-    when ``allowance`` lists those leaves and supplies the train values the gate
-    saw. Every other hashed field, including sampling, prompt, and protocol
-    hash, must match the gate hashes after those leaves are restored. Does not
-    synthesize a replacement PASS document.
-    """
-
     if not isinstance(reference, RunConfiguration):
         raise ProtocolError("authorize_gated_candidate requires a reference configuration")
     if not isinstance(candidate, RunConfiguration):
@@ -717,7 +867,7 @@ def authorize_gated_candidate(
         gate_task_set_hash,
         gate_reference_protocol_hash,
         gate_candidate_protocol_hash,
-    ) = _require_pass_gate(gate)
+    ) = _require_pass_artifact(artifact, allow_synthetic=allow_synthetic)
 
     if reference.protocol_hash != gate_reference_protocol_hash:
         raise ProtocolError("reference protocol hash does not match the gate")
@@ -766,6 +916,66 @@ def authorize_gated_candidate(
         train_task_set_hash=train_task_set_hash,
         allowed_task_selection_leaves=allowed_leaves,
         served_candidate_configuration_hash=run_configuration_hash(candidate),
+        evidence_artifact_id=artifact.artifact_id,
+    )
+
+
+def authorize_gated_candidate(
+    artifact: ValidationArtifact,
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    allowance: TaskSelectionAllowance | None = None,
+) -> GatedCandidateAdmission:
+    """Authorize serving a candidate against a real ``ValidationArtifact``.
+
+    ``artifact`` must be a ``ValidationArtifact`` (see
+    ``lifecycle.validation_artifact``), not a free-form document: a
+    ``Mapping`` or duck-typed object with the right attribute names is
+    rejected, even if every hash inside it is correct, because nothing
+    about such an object proves an offline gate actually ran. Refuses
+    ``evidence_source == "synthetic_fixture"`` outright; call
+    ``authorize_test_gated_candidate`` from a test that needs to admit a
+    synthetic-fixture-backed artifact.
+
+    Task-selection leaves may differ from the gate-approved configurations only
+    when ``allowance`` lists those leaves and supplies the train values the gate
+    saw. Every other hashed field, including sampling, prompt, and protocol
+    hash, must match the gate hashes after those leaves are restored. Does not
+    synthesize a replacement PASS document.
+    """
+
+    return _authorize_gated_candidate(
+        artifact,
+        reference,
+        candidate,
+        allowance,
+        allow_synthetic=False,
+    )
+
+
+def authorize_test_gated_candidate(
+    artifact: ValidationArtifact,
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    allowance: TaskSelectionAllowance | None = None,
+) -> GatedCandidateAdmission:
+    """Test-only admission that also accepts ``synthetic_fixture`` evidence.
+
+    Identical to ``authorize_gated_candidate`` except that a
+    ``synthetic_fixture``-sourced artifact is accepted. Exists so CPU tests
+    and the CPU synthetic lifecycle harness can exercise the admission
+    contract end to end against a fixture-backed gate run, without
+    ``authorize_gated_candidate`` itself ever accepting synthetic evidence.
+    Production release admission (the HTTP ``/candidates`` route) must
+    never call this function.
+    """
+
+    return _authorize_gated_candidate(
+        artifact,
+        reference,
+        candidate,
+        allowance,
+        allow_synthetic=True,
     )
 
 
@@ -785,13 +995,19 @@ def _authorized_fault_versions(lock: ProtocolLock) -> set[str]:
 
 
 def _authorize_fault_against_lock(lock: ProtocolLock, fault: FaultSpec) -> None:
+    """Reject any fault not declared, byte-for-byte, in the lock's faults list.
+
+    There is no path that skips this check: an absent or empty
+    ``lock.payload["faults"]`` is a malformed lock (``require_protocol_lock``
+    and ``ProtocolSettings`` both refuse to produce one), never a reason to
+    admit an undeclared fault.
+    """
+
     if fault.fault_version not in _authorized_fault_versions(lock):
         raise ProtocolError("fault is not named in the protocol lock")
     raw_faults = lock.payload.get("faults")
-    if raw_faults is None:
-        return
-    if not isinstance(raw_faults, list):
-        raise ProtocolError("faults must be a list when present")
+    if not isinstance(raw_faults, list) or not raw_faults:
+        raise ProtocolError("protocol lock faults must be a non-empty list")
     matched: FaultSpec | None = None
     for item in raw_faults:
         try:
@@ -862,7 +1078,7 @@ def authorize_faulted_candidate(
         produced = apply_fault(reference, fault)
     except FaultError as error:
         raise ProtocolError(str(error)) from error
-    if _hashed_values(produced) != _hashed_values(candidate):
+    if hashed_values(produced) != hashed_values(candidate):
         raise ProtocolError("candidate is not the declared fault")
     try:
         verify_task_set(candidate.task, task_set)

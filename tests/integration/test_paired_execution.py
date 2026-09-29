@@ -24,7 +24,7 @@ from llm_behavior_ci.runtime.aa_capture import (
     repeated_schedule,
     write_local_capture,
 )
-from llm_behavior_ci.runtime.agent import AgentTurn, VLLMAgent
+from llm_behavior_ci.runtime.agent import AgentTurn, SmolagentsVLLMAgent
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
@@ -744,7 +744,7 @@ class PairedExecutionTests(unittest.TestCase):
         self.assertEqual(pair.reference.role, "reference")
         self.assertEqual(pair.candidate.role, "candidate")
         built = build_runtime(config, "http://127.0.0.1:8000")
-        self.assertIsInstance(built.agent, VLLMAgent)
+        self.assertIsInstance(built.agent, SmolagentsVLLMAgent)
         self.assertEqual(built.agent.base_url, "http://127.0.0.1:8000")
 
 

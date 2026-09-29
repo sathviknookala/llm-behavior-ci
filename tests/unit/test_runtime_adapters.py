@@ -8,16 +8,20 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import URLError
 
-from llm_behavior_ci.config import RunConfiguration
+from llm_behavior_ci.config import LoRASettings, RunConfiguration
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.agent import (
-    VLLMAgent,
+    AppWorldActionExecutor,
+    AppWorldExecuteTool,
+    SmolagentsVLLMAgent,
     action_execution_backend,
     bind_appworld_action_executor,
+    build_appworld_executor,
     check_model_identity,
     parse_model_output,
     reject_local_python_executor,
     resolve_action_interface,
+    served_model_id,
     validate_chat_request,
 )
 from llm_behavior_ci.runtime.appworld import (
@@ -199,7 +203,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(world.closed, 1)
 
     def test_completion_payload_contains_sampling_prompt_and_thinking(self) -> None:
-        agent = VLLMAgent("http://127.0.0.1:9")
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
         agent.begin(_context(), _config())
         payload = agent.completion_payload(agent.messages())
         self.assertEqual(payload["temperature"], 0.0)
@@ -223,7 +227,7 @@ class RuntimeAdapterTests(unittest.TestCase):
                 action_interface="code",
                 mode="execute",
             )
-        agent = VLLMAgent("http://127.0.0.1:9")
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
         config = replace(
             _config(),
             agent=replace(
@@ -252,7 +256,7 @@ class RuntimeAdapterTests(unittest.TestCase):
             text,
             "prompt_version=prompt-v1\nplan_format_version=plan-v1\n",
         )
-        agent = VLLMAgent("http://127.0.0.1:9")
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
         agent.set_mode("plan")
         agent.begin(_context(), _config())
         system = agent.messages()[0]["content"]
@@ -293,7 +297,7 @@ class RuntimeAdapterTests(unittest.TestCase):
             "serving.batch_invariant cannot be applied via chat completions",
         ):
             validate_chat_request(config)
-        agent = VLLMAgent("http://127.0.0.1:9")
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
         with self.assertRaisesRegex(RuntimeUnavailable, "batch_invariant"):
             agent.begin(_context(), config)
         eager = replace(
@@ -326,7 +330,7 @@ class RuntimeAdapterTests(unittest.TestCase):
     def test_teacher_force_plan_posts_frozen_plan_not_max_tokens_generation(
         self,
     ) -> None:
-        agent = VLLMAgent("http://127.0.0.1:9")
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
         agent.begin(_context(), _config())
         posted: list[dict[str, object]] = []
 
@@ -373,9 +377,104 @@ class RuntimeAdapterTests(unittest.TestCase):
             logprobs,
             ((TokenLogprob(token_id=3, logprob=-0.25, rank=0),),),
         )
+        self.assertIs(body["extra_body"]["return_token_ids"], True)
+
+    def test_teacher_force_plan_uses_prompt_token_ids_to_identify_the_forced_token(
+        self,
+    ) -> None:
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), _config())
+
+        def fake_urlopen(request, timeout=None):
+            del request, timeout
+            return _FakeResponse(
+                {
+                    "choices": [{"message": {"content": ""}, "logprobs": None}],
+                    "prompt_token_ids": [11, 3, 9],
+                    "prompt_logprobs": [
+                        None,
+                        {
+                            "3": {"logprob": -0.25, "rank": 2},
+                            "5": {"logprob": -0.1, "rank": 1},
+                            "1": {"logprob": -3.0, "rank": 3},
+                        },
+                        {
+                            "9": {"logprob": -0.4, "rank": 1},
+                        },
+                    ],
+                }
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            logprobs = agent.teacher_force_plan(
+                messages=[{"role": "user", "content": "plan"}],
+                plan_text="1. open the calendar",
+            )
+        self.assertEqual(
+            logprobs,
+            (
+                (
+                    TokenLogprob(token_id=3, logprob=-0.25, rank=0),
+                    TokenLogprob(token_id=1, logprob=-3.0, rank=1),
+                    TokenLogprob(token_id=5, logprob=-0.1, rank=2),
+                ),
+                (TokenLogprob(token_id=9, logprob=-0.4, rank=0),),
+            ),
+        )
+
+    def test_teacher_force_plan_without_prompt_token_ids_is_runtime_unavailable(
+        self,
+    ) -> None:
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), _config())
+
+        def fake_urlopen(request, timeout=None):
+            del request, timeout
+            return _FakeResponse(
+                {
+                    "choices": [{"message": {"content": ""}, "logprobs": None}],
+                    "prompt_logprobs": [
+                        None,
+                        {"3": {"logprob": -0.25, "rank": 1}},
+                    ],
+                }
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(RuntimeUnavailable):
+                agent.teacher_force_plan(
+                    messages=[{"role": "user", "content": "plan"}],
+                    plan_text="1. open the calendar",
+                )
+
+    def test_teacher_force_plan_missing_forced_token_is_runtime_unavailable(
+        self,
+    ) -> None:
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), _config())
+
+        def fake_urlopen(request, timeout=None):
+            del request, timeout
+            return _FakeResponse(
+                {
+                    "choices": [{"message": {"content": ""}, "logprobs": None}],
+                    "prompt_token_ids": [11, 3],
+                    "prompt_logprobs": [
+                        None,
+                        {"5": {"logprob": -0.1, "rank": 1}},
+                    ],
+                }
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(RuntimeUnavailable):
+                agent.teacher_force_plan(
+                    messages=[{"role": "user", "content": "plan"}],
+                    plan_text="1. open the calendar",
+                )
 
     def test_concurrent_begins_isolate_history(self) -> None:
-        agent = VLLMAgent("http://127.0.0.1:9")
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
         barrier = threading.Barrier(2)
         seen: dict[str, list[str]] = {"a": [], "b": []}
         errors: list[BaseException] = []
@@ -417,7 +516,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(parse_model_output("plain action"), ("plain action", None, None))
         self.assertEqual(
-            VLLMAgent("http://127.0.0.1:9").parse_model_output("STOP"),
+            SmolagentsVLLMAgent("http://127.0.0.1:9").parse_model_output("STOP"),
             (None, None, None),
         )
 
@@ -443,7 +542,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(score.mean_kl_nats, 0.25)
 
     def test_http_failure_is_runtime_unavailable(self) -> None:
-        agent = VLLMAgent("http://127.0.0.1:9")
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
         agent.begin(_context(), _config())
         with patch(
             "urllib.request.urlopen",
@@ -451,3 +550,144 @@ class RuntimeAdapterTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeUnavailable):
                 agent.next_turn(tool_output=None)
+
+    def test_generate_is_the_smolagents_model_call_next_turn_runs_on(self) -> None:
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), _config())
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=lambda request, timeout=None: _FakeResponse(
+                _completion_body("CALL calendar lookup\napp.lookup()")
+            ),
+        ):
+            chat_message = agent.generate(agent.messages())
+        self.assertEqual(chat_message.content, "CALL calendar lookup\napp.lookup()")
+        self.assertIn("choices", chat_message.raw)
+        action, app_name, api_name = parse_model_output(chat_message.content)
+        self.assertEqual((action, app_name, api_name), ("app.lookup()", "calendar", "lookup"))
+
+    def test_appworld_execute_tool_delegates_to_appworld_and_is_not_a_sandbox(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def execute(action: str) -> str:
+            calls.append(action)
+            return f"ok:{action}"
+
+        tool = AppWorldExecuteTool(execute)
+        self.assertEqual(tool.name, "appworld_execute")
+        self.assertEqual(tool.output_type, "object")
+        self.assertFalse(hasattr(tool, "authorized_imports"))
+        self.assertEqual(tool("calendar.lookup()"), "ok:calendar.lookup()")
+        self.assertEqual(calls, ["calendar.lookup()"])
+
+    def test_build_appworld_executor_selects_the_configured_action_interface(
+        self,
+    ) -> None:
+        executed: list[str] = []
+
+        def execute(action: str) -> str:
+            executed.append(action)
+            return f"ok:{action}"
+
+        code_executor = build_appworld_executor("code", execute)
+        self.assertIsInstance(code_executor, AppWorldActionExecutor)
+        self.assertEqual(code_executor("a()"), "ok:a()")
+
+        tool_executor = build_appworld_executor("tool_calling", execute)
+        self.assertIsInstance(tool_executor, AppWorldExecuteTool)
+        self.assertEqual(tool_executor("b()"), "ok:b()")
+
+        self.assertEqual(executed, ["a()", "b()"])
+        with self.assertRaisesRegex(RuntimeUnavailable, "unsupported action_interface"):
+            build_appworld_executor("local_python", execute)
+
+
+class LoRAServedModelTests(unittest.TestCase):
+    def test_served_model_id_is_the_base_repository_when_lora_is_unset(self) -> None:
+        config = _config()
+        self.assertIsNone(config.model.lora)
+        self.assertEqual(served_model_id(config), "Qwen/Qwen3-4B")
+
+    def test_served_model_id_is_the_adapter_repository_when_lora_is_set(self) -> None:
+        config = replace(
+            _config(),
+            model=replace(
+                _config().model,
+                lora=LoRASettings(
+                    repository="org/adapter",
+                    revision="d" * 40,
+                ),
+            ),
+        )
+        self.assertEqual(served_model_id(config), "org/adapter")
+
+    def test_completion_and_teacher_force_payloads_name_the_lora_adapter(self) -> None:
+        config = replace(
+            _config(),
+            model=replace(
+                _config().model,
+                lora=LoRASettings(
+                    repository="org/adapter",
+                    revision="d" * 40,
+                ),
+            ),
+        )
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), config)
+        completion_payload = agent.completion_payload(agent.messages())
+        self.assertEqual(completion_payload["model"], "org/adapter")
+        teacher_force_payload = agent.teacher_force_payload(
+            messages=agent.messages(),
+            plan_text="1. call calendar.lookup()",
+        )
+        self.assertEqual(teacher_force_payload["model"], "org/adapter")
+
+    def test_healthy_configuration_still_names_the_base_repository(self) -> None:
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), _config())
+        payload = agent.completion_payload(agent.messages())
+        self.assertEqual(payload["model"], "Qwen/Qwen3-4B")
+
+
+class ApiDocsCorruptionWiringTests(unittest.TestCase):
+    def test_messages_leave_documentation_unchanged_when_unset(self) -> None:
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), _config())
+        content = agent.messages()[1]["content"]
+        self.assertIn("docs", content)
+
+    def test_messages_apply_the_corruption_transform_when_configured(self) -> None:
+        context = TaskContext(
+            task_id="task-1",
+            instruction="solve the task",
+            api_documentation="calendar.lookup: start_time, end_time\n",
+        )
+        config = replace(
+            _config(),
+            agent=replace(
+                _config().agent,
+                api_docs_version="api-docs-corrupt-v1",
+                api_docs_app="calendar",
+            ),
+        )
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(context, config)
+        content = agent.messages()[1]["content"]
+        self.assertIn("calendar.lookup: [documentation removed]", content)
+        self.assertNotIn("start_time, end_time", content)
+
+    def test_unknown_api_docs_version_is_rejected(self) -> None:
+        config = replace(
+            _config(),
+            agent=replace(
+                _config().agent,
+                api_docs_version="api-docs-corrupt-does-not-exist",
+                api_docs_app="calendar",
+            ),
+        )
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), config)
+        with self.assertRaisesRegex(RuntimeUnavailable, "unknown api_docs_version"):
+            agent.messages()

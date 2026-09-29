@@ -11,13 +11,24 @@ from typing import Callable
 from llm_behavior_ci.config import CanarySettings, RunConfiguration, run_configuration_hash
 from llm_behavior_ci.records import LifecycleDecision, PairedResult, StatisticalEvidence
 from llm_behavior_ci.runtime.episode import pair_execution
-from llm_behavior_ci.stats.canary import SequentialCanaryTest
-from llm_behavior_ci.stats.confidence_sequence import PairedDifferenceCS
+from llm_behavior_ci.stats.canary import PairedDifferenceCanaryTest, SequentialCanaryTest
 from llm_behavior_ci.stats.evidence import Evidence, PairedSuccess
 
 _SUPPORTED_STOPPING_RULES = frozenset(
     {"sequential_canary", "paired_difference_cs", "fixed_window"}
 )
+
+_PROMOTION_DECISIONS = {
+    "horizon_reached_without_harm": "promote_horizon_reached_without_harm",
+}
+"""The public decision string for each ``CanarySettings.promotion_policy``.
+
+Keyed by policy name so the recorded ``LifecycleDecision.decision`` always
+names the policy that fired, never the generic word ``promote`` — which
+would leave a reader unable to tell a horizon-without-harm promotion
+apart from a (not yet implemented) promotion on evidence that the
+candidate is statistically superior.
+"""
 
 
 class CanaryRejected(ValueError):
@@ -123,6 +134,7 @@ class _FixedWindowCanary:
             boundary=-self._harm_margin,
             p_value=None,
             details=(("at_horizon", 1.0 if at_horizon else 0.0),),
+            direction="harmful" if alarm else "insufficient",
         )
 
 
@@ -200,11 +212,10 @@ class CanaryController:
                 horizon_episodes=rule.horizon_episodes,
             )
         elif rule.name == "paired_difference_cs":
-            detector = PairedDifferenceCS(
+            detector = PairedDifferenceCanaryTest(
                 alpha=rule.alpha,
-                lower=-1.0,
-                upper=1.0,
-                null_mean=-settings.harm_margin,
+                harm_margin=settings.harm_margin,
+                horizon_episodes=rule.horizon_episodes,
             )
         else:
             detector = _FixedWindowCanary(
@@ -559,21 +570,40 @@ class CanaryController:
         return now >= pair.candidate.ended_at + timedelta(seconds=delay)
 
     def _apply_detector(self, pair: PairedResult) -> Evidence | None:
+        """Feed the detector a paired observation, oriented so higher is better.
+
+        The evaluator's raw ``success`` is already higher-is-better. When
+        ``metric_orientation`` is ``lower_is_better`` the candidate and
+        reference values are swapped before reaching the detector, so
+        every detector downstream can keep computing a plain
+        ``candidate - reference`` and still have positive mean a
+        candidate that improved on the reference.
+        """
         reference_outcome = pair.reference.evaluator_outcome
         candidate_outcome = pair.candidate.evaluator_outcome
         if reference_outcome is None or candidate_outcome is None:
             return None
-        observation = PairedSuccess(
-            candidate=1.0 if candidate_outcome.success else 0.0,
-            reference=1.0 if reference_outcome.success else 0.0,
-        )
+        candidate_value = 1.0 if candidate_outcome.success else 0.0
+        reference_value = 1.0 if reference_outcome.success else 0.0
+        if self._settings.metric_orientation == "lower_is_better":
+            candidate_value, reference_value = reference_value, candidate_value
+        observation = PairedSuccess(candidate=candidate_value, reference=reference_value)
         evidence = self._detector.update(observation)
         self._detector_updates += 1
         return evidence
 
     def _action_from_evidence(self, evidence: Evidence) -> str:
+        """Map one look's evidence to continue, rollback, or promote.
+
+        Rollback requires both an alarm and a harmful direction, so a
+        two-sided test's alarm on the beneficial side can never reach
+        rollback. Promotion is the separately represented
+        horizon-reached-without-harm policy: it requires the configured
+        horizon with no harmful alarm along the way, never evidence that
+        the candidate is superior.
+        """
         rule = self._settings.stopping_rule
-        if evidence.alarm:
+        if evidence.alarm and evidence.direction == "harmful":
             return "rollback"
         if rule.name == "sequential_canary":
             details = dict(evidence.details)
@@ -581,7 +611,8 @@ class CanaryController:
                 return "promote"
             return "continue"
         if rule.name == "paired_difference_cs":
-            if self._detector_updates >= rule.horizon_episodes:
+            details = dict(evidence.details)
+            if details.get("stopped_at_horizon", 0.0) == 1.0:
                 return "promote"
             return "continue"
         if rule.name == "fixed_window":
@@ -597,6 +628,9 @@ class CanaryController:
         evidence: Evidence,
         decided_at: datetime,
     ) -> LifecycleDecision:
+        decision = action
+        if action == "promote":
+            decision = _PROMOTION_DECISIONS[self._settings.promotion_policy]
         statistical = StatisticalEvidence(
             method=evidence.method,
             split=self._candidate.task.split,
@@ -607,10 +641,11 @@ class CanaryController:
             reference_configuration_hash=self._reference_hash,
             p_value=evidence.p_value,
             threshold=-self._settings.harm_margin,
+            direction=evidence.direction,
         )
         return LifecycleDecision(
             tier="canary",
-            decision=action,
+            decision=decision,
             split=self._candidate.task.split,
             candidate_configuration_hash=self._candidate_hash,
             reference_configuration_hash=self._reference_hash,
