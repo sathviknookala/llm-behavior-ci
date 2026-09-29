@@ -163,3 +163,28 @@ class ExportTests(unittest.TestCase):
                     {"task_id": "task-a"},
                     output_path=destination,
                 )
+
+    def test_public_export_excludes_plan_text_instructions_and_trajectories(
+        self,
+    ) -> None:
+        episode = _episode()
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "public.json"
+            export_public_results(_results(), output_path=destination)
+            text = destination.read_text(encoding="utf-8")
+            decoded = json.loads(text)
+            keys = _keys(decoded)
+            self.assertTrue(PROTECTED_FIELDS.isdisjoint(keys))
+            for forbidden in (
+                "plan_text",
+                "prompt_text",
+                "instruction",
+                "output_text",
+                "model_steps",
+                "tool_steps",
+                "plan the task",
+                "open the app",
+                episode.task.task_id,
+            ):
+                self.assertNotIn(forbidden, text)
+            self.assertEqual(decoded["aggregates"][0]["visibility"], "public")

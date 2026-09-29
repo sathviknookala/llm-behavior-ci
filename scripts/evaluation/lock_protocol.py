@@ -250,7 +250,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
     if not args_list:
         return 2
-    parser = argparse.ArgumentParser(description="Lock or require a protocol document.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Lock or require a protocol document from caller-supplied settings. "
+            "A lock file is not preregistration."
+        )
+    )
     parser.add_argument("--settings")
     parser.add_argument("--output")
     parser.add_argument("--require")
@@ -268,12 +273,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
             lock = require_protocol_lock(Path(args.require))
             print(lock.digest)
+            print(
+                "protocol lock is caller-supplied settings, not preregistration",
+                file=sys.stderr,
+            )
             return 0
         if args.settings is None or args.output is None:
             return 2
         settings = _settings_from_mapping(_load_json(Path(args.settings)))
         lock = lock_protocol(settings, Path(args.output))
         print(lock.digest)
+        print(
+            "protocol lock is caller-supplied settings, not preregistration",
+            file=sys.stderr,
+        )
         return 0
     except ProtocolError as error:
         print(str(error) or "protocol lock failed", file=sys.stderr)

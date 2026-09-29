@@ -17,6 +17,7 @@ from llm_behavior_ci.experiments.benchmark import (
 from llm_behavior_ci.experiments.faults import FaultError, load_fault
 from llm_behavior_ci.experiments.protocol import ProtocolError, require_protocol_lock
 from llm_behavior_ci.lifecycle.monitoring import FrozenReference
+from llm_behavior_ci.lifecycle.offline_gate import GateExecutionError, PlanEvidenceInputs
 from llm_behavior_ci.runtime.episode import RuntimeDependencies
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
@@ -77,6 +78,30 @@ def _load_task_set(payload: object) -> TaskSet:
     return task_set
 
 
+def _load_plan_evidence(payload: object) -> PlanEvidenceInputs:
+    if not isinstance(payload, dict):
+        raise BenchmarkError("plan evidence must be an object")
+    try:
+        features = tuple(str(item) for item in payload["plan_quality_features"])
+        weights = tuple(float(item) for item in payload["plan_quality_weights"])
+        mmd_features = tuple(str(item) for item in payload["mmd_features"])
+        required = tuple(str(item) for item in payload["required_statistics"])
+        approximation = str(payload["kl_approximation"])
+        if approximation not in {"full", "top_k"}:
+            raise BenchmarkError("kl_approximation must be full or top_k")
+        return PlanEvidenceInputs(
+            plan_format_version=str(payload["plan_format_version"]),
+            plan_quality_features=features,
+            plan_quality_weights=weights,
+            mmd_features=mmd_features,
+            kl_approximation=approximation,  # type: ignore[arg-type]
+            required_statistics=required,
+            validation_provenance=str(payload["validation_provenance"]),
+        )
+    except (GateExecutionError, KeyError, TypeError, ValueError) as error:
+        raise BenchmarkError("plan evidence is incomplete") from error
+
+
 def _frozen_reference(payload: object) -> FrozenReference:
     if not isinstance(payload, dict):
         raise BenchmarkError("baselines must be an object")
@@ -134,12 +159,15 @@ def _load_runtime(spec: str) -> RuntimeDependencies:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if argv is None and len(sys.argv) <= 1:
+        return 2
     parser = argparse.ArgumentParser(description="Run the lifecycle benchmark.")
     parser.add_argument("--protocol", required=True)
     parser.add_argument("--fault", action="append", dest="faults", required=True)
     parser.add_argument("--train-tasks", required=True)
     parser.add_argument("--test-normal-tasks", required=True)
     parser.add_argument("--baselines", required=True)
+    parser.add_argument("--plan-evidence", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--export", default=None)
     try:
@@ -173,6 +201,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_tasks = _load_task_set(_load_json(Path(args.train_tasks)))
         test_normal_tasks = _load_task_set(_load_json(Path(args.test_normal_tasks)))
         baselines = _frozen_reference(_load_json(Path(args.baselines)))
+        plan_evidence = _load_plan_evidence(_load_json(Path(args.plan_evidence)))
+        if plan_evidence.validation_provenance != "synthetic_fixture":
+            if plan_evidence.validation_provenance != "validated":
+                raise BenchmarkError(
+                    "plan evidence validation_provenance must be synthetic_fixture or validated"
+                )
         runtime = _load_runtime(runtime_spec)
         result = run_lifecycle_benchmark(
             protocol,
@@ -182,6 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             test_normal_tasks=test_normal_tasks,
             reference_baselines=baselines,
             checkpoint_path=checkpoint,
+            plan_evidence=plan_evidence,
             export_path=export_path,
         )
     except SystemExit as error:
@@ -195,6 +230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         FaultError,
         ConfigError,
         SelectionError,
+        GateExecutionError,
     ) as error:
         print(str(error) or "lifecycle benchmark failed", file=sys.stderr)
         return 1
@@ -202,11 +238,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("lifecycle benchmark failed", file=sys.stderr)
         return 1
 
-    print(json.dumps({"status": result.status}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "status": result.status,
+                "agent_execution_seconds": result.agent_execution_seconds,
+                "detector_compute_seconds": result.detector_compute_seconds,
+                "wall_seconds": result.wall_seconds,
+                "gpu_memory_mib": result.gpu_memory_mib,
+                "gpu_hours": result.gpu_hours,
+            },
+            sort_keys=True,
+        )
+    )
     return 0 if result.status == "completed" else 1
 
 
 if __name__ == "__main__":
-    if len(sys.argv) <= 1:
-        raise SystemExit(2)
     raise SystemExit(main())

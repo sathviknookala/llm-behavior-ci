@@ -2,10 +2,16 @@
 
 Thresholds and stopping rules are explicit ``ProtocolSettings`` inputs.
 A lock written by tests is not a pre-registered protocol.
+
+Final-test execution must call ``authorize_faulted_candidate`` rather than
+``admit_test_normal`` then ``apply_fault``. Canary and service admission must
+call ``authorize_gated_candidate`` with the real gate decision rather than a
+manufactured PASS view.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -14,7 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from llm_behavior_ci.config import (
+    HASHED_FIELDS,
     CanarySettings,
+    ConfigError,
     GateSettings,
     MonitorSettings,
     RunConfiguration,
@@ -22,11 +30,18 @@ from llm_behavior_ci.config import (
     TaskConfiguration,
     run_configuration_hash,
 )
-from llm_behavior_ci.experiments.faults import HarmLabel
+from llm_behavior_ci.experiments.faults import (
+    FaultError,
+    FaultSpec,
+    HarmLabel,
+    apply_fault,
+    fault_from_mapping,
+)
 from llm_behavior_ci.experiments.validation import (
     ValidationReport,
     public_validation_summary,
 )
+from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 
 _REQUIRED_FIELDS_PATH = (
     Path(__file__).resolve().parents[3]
@@ -35,10 +50,96 @@ _REQUIRED_FIELDS_PATH = (
     / "required_fields.v1.json"
 )
 _TRAILING_NEWLINE = b"\n"
+_TASK_SELECTION_LEAVES = frozenset(
+    {
+        "task.split",
+        "task.selection_rule",
+        "task.selection_seed",
+        "task.task_count",
+        "task.task_set_hash",
+    }
+)
 
 
 class ProtocolError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class TaskSelectionAllowance:
+    """Explicit permission for task-selection leaves to differ from the gate."""
+
+    allowed_leaves: frozenset[str]
+    train_task_set_hash: str
+    train_values: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allowed_leaves, frozenset):
+            raise ProtocolError("allowed_leaves must be a frozenset")
+        unknown = self.allowed_leaves - _TASK_SELECTION_LEAVES
+        if unknown:
+            raise ProtocolError(
+                "allowed_leaves may only name task-selection fields: "
+                + ", ".join(sorted(unknown))
+            )
+        if (
+            not isinstance(self.train_task_set_hash, str)
+            or len(self.train_task_set_hash) != 64
+            or self.train_task_set_hash != self.train_task_set_hash.lower()
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.train_task_set_hash
+            )
+        ):
+            raise ProtocolError(
+                "train_task_set_hash must be a lowercase SHA-256 hex digest"
+            )
+        if not isinstance(self.train_values, Mapping):
+            raise ProtocolError("train_values must be an object")
+        values = dict(self.train_values)
+        object.__setattr__(self, "train_values", values)
+        if set(values) != set(self.allowed_leaves):
+            raise ProtocolError(
+                "train_values keys must equal allowed_leaves"
+            )
+        if "task.task_set_hash" in self.allowed_leaves:
+            if values["task.task_set_hash"] != self.train_task_set_hash:
+                raise ProtocolError(
+                    "train_values task.task_set_hash must equal train_task_set_hash"
+                )
+
+
+@dataclass(frozen=True)
+class GatedCandidateAdmission:
+    """Frozen record that a real gate PASS may serve a candidate configuration."""
+
+    outcome: str
+    reference_configuration_hash: str
+    candidate_configuration_hash: str
+    reference_protocol_hash: str | None
+    candidate_protocol_hash: str | None
+    train_task_set_hash: str
+    allowed_task_selection_leaves: frozenset[str]
+    served_candidate_configuration_hash: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "allowed_task_selection_leaves",
+            frozenset(self.allowed_task_selection_leaves),
+        )
+
+
+@dataclass(frozen=True)
+class FaultedCandidateAdmission:
+    """Frozen record that a lock authorizes one faulted test_normal candidate."""
+
+    protocol_digest: str
+    fault_version: str
+    fault_kind: str
+    reference_configuration_hash: str
+    candidate_configuration_hash: str
+    task_set_hash: str
 
 
 def _canonical_json(document: object) -> bytes:
@@ -488,3 +589,291 @@ def admit_test_normal(
     if not isinstance(reports, list):
         raise ProtocolError("validation_reports must be a list")
     _payload_reports_validated(reports)
+
+
+def _gate_attr(gate: object, name: str) -> object:
+    if isinstance(gate, Mapping):
+        if name not in gate:
+            raise ProtocolError(f"gate decision missing {name}")
+        return gate[name]
+    if not hasattr(gate, name):
+        raise ProtocolError(f"gate decision missing {name}")
+    return getattr(gate, name)
+
+
+def _leaf_value(document: Mapping[str, object], path: str) -> object:
+    node: object = document
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            raise ProtocolError(f"unknown hashed path {path}")
+        node = node[part]
+    return node
+
+
+def _set_leaf(document: dict[str, object], path: str, value: object) -> None:
+    parts = path.split(".")
+    node: object = document
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or part not in node:
+            raise ProtocolError(f"unknown hashed path {path}")
+        node = node[part]
+    if not isinstance(node, dict) or parts[-1] not in node:
+        raise ProtocolError(f"unknown hashed path {path}")
+    node[parts[-1]] = value
+
+
+def _hashed_values(configuration: RunConfiguration) -> dict[str, object]:
+    document = configuration.to_dict()
+    return {path: _leaf_value(document, path) for path in sorted(HASHED_FIELDS)}
+
+
+def _with_train_task_selection(
+    configuration: RunConfiguration,
+    allowance: TaskSelectionAllowance,
+) -> RunConfiguration:
+    document = copy.deepcopy(configuration.to_dict())
+    for path, value in allowance.train_values.items():
+        _set_leaf(document, path, value)
+    try:
+        return RunConfiguration.from_dict(document)
+    except ConfigError as error:
+        raise ProtocolError(
+            "task-selection allowance does not produce a valid configuration"
+        ) from error
+
+
+def _require_pass_gate(gate: object) -> tuple[object, ...]:
+    outcome = _gate_attr(gate, "outcome")
+    reason_codes = _gate_attr(gate, "reason_codes")
+    reference_configuration_hash = _gate_attr(
+        gate, "reference_configuration_hash"
+    )
+    candidate_configuration_hash = _gate_attr(
+        gate, "candidate_configuration_hash"
+    )
+    task_set_hash = _gate_attr(gate, "task_set_hash")
+    reference_protocol_hash = _gate_attr(gate, "reference_protocol_hash")
+    candidate_protocol_hash = _gate_attr(gate, "candidate_protocol_hash")
+    if outcome != "PASS":
+        raise ProtocolError("gate outcome must be PASS")
+    if reason_codes is None:
+        raise ProtocolError("gate reason_codes must be empty")
+    try:
+        codes = tuple(reason_codes)
+    except TypeError as error:
+        raise ProtocolError("gate reason_codes must be empty") from error
+    if codes:
+        raise ProtocolError("gate reason_codes must be empty")
+    if not isinstance(reference_configuration_hash, str):
+        raise ProtocolError("gate reference_configuration_hash must be a string")
+    if not isinstance(candidate_configuration_hash, str):
+        raise ProtocolError("gate candidate_configuration_hash must be a string")
+    if not isinstance(task_set_hash, str):
+        raise ProtocolError("gate task_set_hash must be a string")
+    if reference_protocol_hash is not None and not isinstance(
+        reference_protocol_hash, str
+    ):
+        raise ProtocolError("gate reference_protocol_hash must be a string or null")
+    if candidate_protocol_hash is not None and not isinstance(
+        candidate_protocol_hash, str
+    ):
+        raise ProtocolError("gate candidate_protocol_hash must be a string or null")
+    return (
+        reference_configuration_hash,
+        candidate_configuration_hash,
+        task_set_hash,
+        reference_protocol_hash,
+        candidate_protocol_hash,
+    )
+
+
+def authorize_gated_candidate(
+    gate: object,
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    allowance: TaskSelectionAllowance | None = None,
+) -> GatedCandidateAdmission:
+    """Authorize serving a candidate against a real gate decision.
+
+    Task-selection leaves may differ from the gate-approved configurations only
+    when ``allowance`` lists those leaves and supplies the train values the gate
+    saw. Every other hashed field, including sampling, prompt, and protocol
+    hash, must match the gate hashes after those leaves are restored. Does not
+    synthesize a replacement PASS document.
+    """
+
+    if not isinstance(reference, RunConfiguration):
+        raise ProtocolError("authorize_gated_candidate requires a reference configuration")
+    if not isinstance(candidate, RunConfiguration):
+        raise ProtocolError("authorize_gated_candidate requires a candidate configuration")
+    if allowance is not None and not isinstance(allowance, TaskSelectionAllowance):
+        raise ProtocolError(
+            "allowance must be TaskSelectionAllowance or None"
+        )
+
+    (
+        gate_reference_hash,
+        gate_candidate_hash,
+        gate_task_set_hash,
+        gate_reference_protocol_hash,
+        gate_candidate_protocol_hash,
+    ) = _require_pass_gate(gate)
+
+    if reference.protocol_hash != gate_reference_protocol_hash:
+        raise ProtocolError("reference protocol hash does not match the gate")
+    if candidate.protocol_hash != gate_candidate_protocol_hash:
+        raise ProtocolError("candidate protocol hash does not match the gate")
+
+    if allowance is None:
+        if run_configuration_hash(reference) != gate_reference_hash:
+            raise ProtocolError(
+                "reference configuration hash does not match the gate"
+            )
+        if run_configuration_hash(candidate) != gate_candidate_hash:
+            raise ProtocolError(
+                "candidate configuration hash does not match the gate"
+            )
+        if reference.task.task_set_hash != gate_task_set_hash:
+            raise ProtocolError("reference task_set_hash does not match the gate")
+        if candidate.task.task_set_hash != gate_task_set_hash:
+            raise ProtocolError("candidate task_set_hash does not match the gate")
+        allowed_leaves: frozenset[str] = frozenset()
+        train_task_set_hash = gate_task_set_hash
+    else:
+        if allowance.train_task_set_hash != gate_task_set_hash:
+            raise ProtocolError(
+                "allowance train_task_set_hash does not match the gate"
+            )
+        bound_reference = _with_train_task_selection(reference, allowance)
+        bound_candidate = _with_train_task_selection(candidate, allowance)
+        if run_configuration_hash(bound_reference) != gate_reference_hash:
+            raise ProtocolError(
+                "reference configuration hash does not match the gate"
+            )
+        if run_configuration_hash(bound_candidate) != gate_candidate_hash:
+            raise ProtocolError(
+                "candidate configuration hash does not match the gate"
+            )
+        allowed_leaves = allowance.allowed_leaves
+        train_task_set_hash = allowance.train_task_set_hash
+
+    return GatedCandidateAdmission(
+        outcome="PASS",
+        reference_configuration_hash=gate_reference_hash,
+        candidate_configuration_hash=gate_candidate_hash,
+        reference_protocol_hash=gate_reference_protocol_hash,
+        candidate_protocol_hash=gate_candidate_protocol_hash,
+        train_task_set_hash=train_task_set_hash,
+        allowed_task_selection_leaves=allowed_leaves,
+        served_candidate_configuration_hash=run_configuration_hash(candidate),
+    )
+
+
+def _authorized_fault_versions(lock: ProtocolLock) -> set[str]:
+    raw = lock.payload.get("harm_labels")
+    if not isinstance(raw, list):
+        raise ProtocolError("harm_labels must be a list")
+    versions: set[str] = set()
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ProtocolError("harm label must be an object")
+        fault_version = item.get("fault_version")
+        if not isinstance(fault_version, str) or fault_version == "":
+            raise ProtocolError("harm label fault_version is required")
+        versions.add(fault_version)
+    return versions
+
+
+def _authorize_fault_against_lock(lock: ProtocolLock, fault: FaultSpec) -> None:
+    if fault.fault_version not in _authorized_fault_versions(lock):
+        raise ProtocolError("fault is not named in the protocol lock")
+    raw_faults = lock.payload.get("faults")
+    if raw_faults is None:
+        return
+    if not isinstance(raw_faults, list):
+        raise ProtocolError("faults must be a list when present")
+    matched: FaultSpec | None = None
+    for item in raw_faults:
+        try:
+            listed = fault_from_mapping(item)
+        except FaultError as error:
+            raise ProtocolError(f"locked fault is invalid: {error}") from error
+        if listed.fault_version == fault.fault_version:
+            matched = listed
+            break
+    if matched is None:
+        raise ProtocolError("fault is not named in the protocol lock faults list")
+    if matched.kind != fault.kind:
+        raise ProtocolError("fault kind does not match the protocol lock")
+    if matched.patches != fault.patches:
+        raise ProtocolError("fault patches do not match the protocol lock")
+    if matched.control != fault.control:
+        raise ProtocolError("fault control does not match the protocol lock")
+    if matched.schema_request != fault.schema_request:
+        raise ProtocolError(
+            "fault schema_request does not match the protocol lock"
+        )
+
+
+def authorize_faulted_candidate(
+    protocol: ProtocolLock,
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    fault: FaultSpec,
+    task_set: TaskSet,
+) -> FaultedCandidateAdmission:
+    """Admit a faulted test_normal candidate against a protocol lock.
+
+    Keeps ``admit_test_normal`` template checks on ``reference``, then requires
+    the fault to be named by the lock and ``candidate`` to equal
+    ``apply_fault(reference, fault)`` on hashed behavior. Final-test execution
+    must call this instead of admitting a template and then applying a fault.
+    """
+
+    if not isinstance(protocol, ProtocolLock):
+        raise ProtocolError("authorize_faulted_candidate requires a protocol lock")
+    if not isinstance(reference, RunConfiguration):
+        raise ProtocolError(
+            "authorize_faulted_candidate requires a reference configuration"
+        )
+    if not isinstance(candidate, RunConfiguration):
+        raise ProtocolError(
+            "authorize_faulted_candidate requires a candidate configuration"
+        )
+    if not isinstance(fault, FaultSpec):
+        raise ProtocolError("authorize_faulted_candidate requires a fault spec")
+    if not isinstance(task_set, TaskSet):
+        raise ProtocolError("authorize_faulted_candidate requires a task set")
+
+    admit_test_normal(
+        protocol,
+        reference,
+        task_set_hash=task_set.task_set_hash,
+    )
+    try:
+        verify_task_set(reference.task, task_set)
+    except SelectionError as error:
+        raise ProtocolError(str(error)) from error
+
+    _authorize_fault_against_lock(protocol, fault)
+    if not fault.representable:
+        raise ProtocolError(str(fault.schema_request))
+    try:
+        produced = apply_fault(reference, fault)
+    except FaultError as error:
+        raise ProtocolError(str(error)) from error
+    if _hashed_values(produced) != _hashed_values(candidate):
+        raise ProtocolError("candidate is not the declared fault")
+    try:
+        verify_task_set(candidate.task, task_set)
+    except SelectionError as error:
+        raise ProtocolError(str(error)) from error
+
+    return FaultedCandidateAdmission(
+        protocol_digest=protocol.digest,
+        fault_version=fault.fault_version,
+        fault_kind=fault.kind,
+        reference_configuration_hash=run_configuration_hash(reference),
+        candidate_configuration_hash=run_configuration_hash(candidate),
+        task_set_hash=task_set.task_set_hash,
+    )

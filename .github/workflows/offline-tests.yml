@@ -12,7 +12,7 @@ permissions:
 jobs:
   offline-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     env:
       PYTHONPATH: src
     steps:
@@ -20,9 +20,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            fastapi==0.110.3 \
+            uvicorn==0.27.1 \
+            prometheus-client==0.26.0 \
+            scipy==1.18.1 \
+            river==0.26.1 \
+            pytest==8.4.2
       - run: python -m unittest discover -s tests/unit -p "test_*.py"
       - run: python -m unittest discover -s tests/ci -p "test_*.py"
       - run: python -m unittest discover -s tests/integration -p "test_*.py"
+      - name: CPU validity tests
+        run: python -m unittest discover -s tests/validity -p "test_*.py"
       - name: Bare offline gate exits 2
         run: |
           set +e
@@ -30,3 +42,33 @@ jobs:
           code=$?
           set -e
           test "$code" -eq 2
+      - name: Bare lifecycle benchmark exits 2
+        run: |
+          set +e
+          python scripts/benchmark/run_lifecycle_benchmark.py
+          code=$?
+          set -e
+          test "$code" -eq 2
+      - name: Bare detector replay exits 2
+        run: |
+          set +e
+          python scripts/replay/replay_detectors.py
+          code=$?
+          set -e
+          test "$code" -eq 2
+      - name: Bare service serve exits 2
+        run: |
+          set +e
+          python scripts/service/serve.py
+          code=$?
+          set -e
+          test "$code" -eq 2
+      - name: Bare protocol lock exits 2
+        run: |
+          set +e
+          python scripts/evaluation/lock_protocol.py
+          code=$?
+          set -e
+          test "$code" -eq 2
+      - name: Synthetic connected lifecycle
+        run: python scripts/synthetic/run_connected_lifecycle.py

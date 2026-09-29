@@ -16,6 +16,7 @@ from llm_behavior_ci.experiments.faults import (
     apply_fault,
     default_results_root,
     freeze_harm_label,
+    live_fault_available,
     load_fault,
     load_fault_catalog,
     main,
@@ -645,6 +646,7 @@ class FaultCatalogTests(unittest.TestCase):
         self.assertEqual(sampling.patches[0].value, 1.0)
         for fault in catalog:
             with self.subTest(fault_id=fault.fault_id):
+                self.assertTrue(fault.schema_supported)
                 if fault.fault_id in _SCHEMA_GAP_IDS:
                     self.assertFalse(fault.representable)
                     with self.assertRaises(FaultError):
@@ -705,6 +707,34 @@ class FaultCatalogTests(unittest.TestCase):
                         self.assertEqual(candidate.agent.sampling.max_tokens, 16)
                     elif fault.fault_id == "step_limit_reduced":
                         self.assertEqual(candidate.agent.step_limit, 4)
+
+    def test_live_unavailable_faults_reported_not_absent(self) -> None:
+        catalog = load_fault_catalog(_CATALOG)
+        by_id = {fault.fault_id: fault for fault in catalog}
+        self.assertEqual(set(by_id), set(_EXPECTED_FAULT_IDS))
+        unavailable = {
+            "api_documentation_one_app",
+            "lora_off_distribution",
+            "fp8_weights",
+            "nvfp4_weights",
+            "benign_batch_invariant",
+        }
+        for fault_id in unavailable:
+            with self.subTest(fault_id=fault_id):
+                availability = live_fault_available(by_id[fault_id])
+                self.assertFalse(availability.available)
+                self.assertIsNotNone(availability.reason)
+        live = live_fault_available(by_id["sampling_temperature_one"])
+        self.assertTrue(live.available)
+        self.assertIsNone(live.reason)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = main(["--catalog", str(_CATALOG)])
+        self.assertEqual(code, 0)
+        text = buffer.getvalue()
+        self.assertIn("fp8_weights:1\tquantization\tlive_unavailable", text)
+        self.assertIn("api_documentation_one_app:1\tapi_documentation\tschema_gap", text)
+        self.assertIn("sampling_temperature_one:1\tsampling\tlive", text)
 
 
 if __name__ == "__main__":

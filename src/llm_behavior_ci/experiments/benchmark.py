@@ -23,22 +23,35 @@ from llm_behavior_ci.config import (
     new_run_identity,
     run_configuration_hash,
 )
-from llm_behavior_ci.experiments.faults import FaultError, FaultSpec, HarmLabel, apply_fault
+from llm_behavior_ci.experiments.faults import (
+    FaultError,
+    FaultSpec,
+    HarmLabel,
+    apply_fault,
+    live_fault_available,
+)
 from llm_behavior_ci.experiments.protocol import (
     ProtocolError,
     ProtocolLock,
-    admit_test_normal,
+    TaskSelectionAllowance,
+    authorize_faulted_candidate,
+    authorize_gated_candidate,
     bind_protocol,
 )
 from llm_behavior_ci.export import AggregateResults, ExportError, export_public_results
-from llm_behavior_ci.lifecycle.canary import CanaryController, CanaryDecision
+from llm_behavior_ci.lifecycle.canary import CanaryController, CanaryDecision, CanaryRejected
 from llm_behavior_ci.lifecycle.monitoring import (
     FrozenReference,
     ProductionMonitor,
     TaskMetadata,
     observation_from_episode,
 )
-from llm_behavior_ci.lifecycle.offline_gate import GateDecision, GateExecutionError, run_offline_gate
+from llm_behavior_ci.lifecycle.offline_gate import (
+    GateDecision,
+    GateExecutionError,
+    PlanEvidenceInputs,
+    run_offline_gate,
+)
 from llm_behavior_ci.records import (
     AggregateRecord,
     LifecycleDecision,
@@ -56,6 +69,16 @@ from llm_behavior_ci.runtime.episode import (
 )
 from llm_behavior_ci.tasks.selection import TaskSet
 from llm_behavior_ci.tasks.streams import generate_stream
+
+_TASK_SELECTION_LEAVES = frozenset(
+    {
+        "task.split",
+        "task.selection_rule",
+        "task.selection_seed",
+        "task.task_count",
+        "task.task_set_hash",
+    }
+)
 
 
 class BenchmarkError(ValueError):
@@ -87,8 +110,11 @@ class GateTierOutcome:
     outcome: str | None
     classification: str | None
     compute_seconds: float | None
+    agent_execution_seconds: float | None
+    detector_compute_seconds: float | None
     public_decision: LifecycleDecision | None
     statistics: tuple[StatisticalEvidence, ...]
+    validation_provenance: str | None
 
 
 @dataclass(frozen=True)
@@ -101,6 +127,8 @@ class CanaryTierOutcome:
     served_before_rollback: int | None
     in_flight_at_rollback: int | None
     compute_seconds: float | None
+    agent_execution_seconds: float | None
+    detector_compute_seconds: float | None
     public_decision: LifecycleDecision | None
 
 
@@ -112,6 +140,8 @@ class MonitorTierOutcome:
     miss: bool
     false_alarm: bool
     compute_seconds: float | None
+    agent_execution_seconds: float | None
+    detector_compute_seconds: float | None
 
 
 @dataclass(frozen=True)
@@ -139,26 +169,11 @@ class BenchmarkResult:
     canary_not_reached_count: int
     monitor_not_reached_count: int
     compute_seconds: float
+    agent_execution_seconds: float
+    detector_compute_seconds: float
+    wall_seconds: float
     gpu_memory_mib: float | None
     gpu_hours: float | None
-
-
-@dataclass(frozen=True)
-class _CanaryGateView:
-    """Duck-typed PASS gate for canary start with test_normal hashes.
-
-    Offline-gate hashes are train hashes; CanaryController.start requires the
-    controller configuration hashes. The PASS outcome is preserved from the
-    train gate; hashes are taken from the admitted test_normal configs.
-    """
-
-    outcome: str
-    reason_codes: tuple[str, ...]
-    reference_configuration_hash: str
-    candidate_configuration_hash: str
-    task_set_hash: str
-    reference_protocol_hash: str | None
-    candidate_protocol_hash: str | None
 
 
 def _under_results(path: Path) -> bool:
@@ -292,40 +307,91 @@ def _validate_task_bindings(
         raise BenchmarkError("stream task_set_hash must match test_normal_tasks")
 
 
-def _not_representable_gate() -> GateTierOutcome:
+def _not_representable_gate(reason: str | None = None) -> GateTierOutcome:
     return GateTierOutcome(
         status="not_representable",
-        reason=None,
+        reason=reason,
         outcome=None,
         classification=None,
         compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
         public_decision=None,
         statistics=(),
+        validation_provenance=None,
     )
 
 
-def _not_representable_canary() -> CanaryTierOutcome:
+def _not_representable_canary(reason: str | None = None) -> CanaryTierOutcome:
     return CanaryTierOutcome(
         status="not_representable",
-        reason=None,
+        reason=reason,
         rollback_delay_episodes=None,
         candidate_episodes_served=None,
         candidate_episodes_failed=None,
         served_before_rollback=None,
         in_flight_at_rollback=None,
         compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
         public_decision=None,
     )
 
 
-def _not_representable_monitor() -> MonitorTierOutcome:
+def _not_representable_monitor(reason: str | None = None) -> MonitorTierOutcome:
     return MonitorTierOutcome(
         status="not_representable",
-        reason=None,
+        reason=reason,
         delay_episodes=None,
         miss=False,
         false_alarm=False,
         compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
+    )
+
+
+def _unavailable_gate(reason: str) -> GateTierOutcome:
+    return GateTierOutcome(
+        status="unavailable",
+        reason=reason,
+        outcome=None,
+        classification=None,
+        compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
+        public_decision=None,
+        statistics=(),
+        validation_provenance=None,
+    )
+
+
+def _unavailable_canary(reason: str) -> CanaryTierOutcome:
+    return CanaryTierOutcome(
+        status="unavailable",
+        reason=reason,
+        rollback_delay_episodes=None,
+        candidate_episodes_served=None,
+        candidate_episodes_failed=None,
+        served_before_rollback=None,
+        in_flight_at_rollback=None,
+        compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
+        public_decision=None,
+    )
+
+
+def _unavailable_monitor(reason: str) -> MonitorTierOutcome:
+    return MonitorTierOutcome(
+        status="unavailable",
+        reason=reason,
+        delay_episodes=None,
+        miss=False,
+        false_alarm=False,
+        compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
     )
 
 
@@ -339,6 +405,8 @@ def _not_reached_canary(reason: str) -> CanaryTierOutcome:
         served_before_rollback=None,
         in_flight_at_rollback=None,
         compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
         public_decision=None,
     )
 
@@ -351,6 +419,8 @@ def _not_reached_monitor(reason: str) -> MonitorTierOutcome:
         miss=False,
         false_alarm=False,
         compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
     )
 
 
@@ -360,6 +430,41 @@ def _gate_classification(outcome: str, harmful: bool) -> str | None:
     if harmful:
         return "catch"
     return "false_block"
+
+
+def _plan_evidence_to_dict(plan_evidence: PlanEvidenceInputs) -> dict[str, object]:
+    return {
+        "plan_format_version": plan_evidence.plan_format_version,
+        "plan_quality_features": list(plan_evidence.plan_quality_features),
+        "plan_quality_weights": list(plan_evidence.plan_quality_weights),
+        "mmd_features": list(plan_evidence.mmd_features),
+        "kl_approximation": plan_evidence.kl_approximation,
+        "required_statistics": list(plan_evidence.required_statistics),
+        "validation_provenance": plan_evidence.validation_provenance,
+    }
+
+
+def _plan_evidence_from_dict(payload: Mapping[str, object]) -> PlanEvidenceInputs:
+    features = payload.get("plan_quality_features")
+    weights = payload.get("plan_quality_weights")
+    mmd_features = payload.get("mmd_features")
+    required = payload.get("required_statistics")
+    if not isinstance(features, list) or not isinstance(weights, list):
+        raise BenchmarkError("plan evidence features are invalid")
+    if not isinstance(mmd_features, list) or not isinstance(required, list):
+        raise BenchmarkError("plan evidence feature lists are invalid")
+    try:
+        return PlanEvidenceInputs(
+            plan_format_version=str(payload["plan_format_version"]),
+            plan_quality_features=tuple(str(item) for item in features),
+            plan_quality_weights=tuple(float(item) for item in weights),
+            mmd_features=tuple(str(item) for item in mmd_features),
+            kl_approximation=str(payload["kl_approximation"]),  # type: ignore[arg-type]
+            required_statistics=tuple(str(item) for item in required),
+            validation_provenance=str(payload["validation_provenance"]),
+        )
+    except (GateExecutionError, KeyError, TypeError, ValueError) as error:
+        raise BenchmarkError("plan evidence is invalid") from error
 
 
 def _gate_decision_to_dict(decision: GateDecision) -> dict[str, object]:
@@ -378,6 +483,7 @@ def _gate_decision_to_dict(decision: GateDecision) -> dict[str, object]:
             if decision.public_decision is not None
             else None
         ),
+        "validation_provenance": decision.validation_provenance,
     }
 
 
@@ -393,6 +499,9 @@ def _gate_decision_from_dict(payload: Mapping[str, object]) -> GateDecision:
     reason_codes = payload.get("reason_codes")
     if not isinstance(reason_codes, list):
         raise BenchmarkError("checkpoint gate reason_codes are invalid")
+    provenance = payload.get("validation_provenance")
+    if not isinstance(provenance, str) or provenance == "":
+        raise BenchmarkError("checkpoint gate validation_provenance is invalid")
     return GateDecision(
         outcome=str(payload["outcome"]),
         reason_codes=tuple(str(item) for item in reason_codes),
@@ -412,6 +521,7 @@ def _gate_decision_from_dict(payload: Mapping[str, object]) -> GateDecision:
         thresholds=GateSettings.from_dict(payload["thresholds"]),
         statistics=statistics,
         public_decision=public_decision,
+        validation_provenance=provenance,
     )
 
 
@@ -510,11 +620,19 @@ def _replicate_key(fault_version: str, seed: int) -> str:
     return f"{fault_version}|{seed}"
 
 
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
 def _gate_outcome_from_decision(
     decision: GateDecision,
     *,
     harmful: bool,
     compute_seconds: float,
+    agent_execution_seconds: float,
+    detector_compute_seconds: float,
 ) -> GateTierOutcome:
     return GateTierOutcome(
         status="completed",
@@ -522,8 +640,11 @@ def _gate_outcome_from_decision(
         outcome=decision.outcome,
         classification=_gate_classification(decision.outcome, harmful),
         compute_seconds=compute_seconds,
+        agent_execution_seconds=agent_execution_seconds,
+        detector_compute_seconds=detector_compute_seconds,
         public_decision=decision.public_decision,
         statistics=decision.statistics,
+        validation_provenance=decision.validation_provenance,
     )
 
 
@@ -531,6 +652,8 @@ def _canary_outcome_from_decision(
     decision: CanaryDecision,
     *,
     compute_seconds: float,
+    agent_execution_seconds: float,
+    detector_compute_seconds: float,
 ) -> CanaryTierOutcome:
     snapshot = decision.snapshot
     if decision.action == "promote":
@@ -543,6 +666,8 @@ def _canary_outcome_from_decision(
             served_before_rollback=None,
             in_flight_at_rollback=None,
             compute_seconds=compute_seconds,
+            agent_execution_seconds=agent_execution_seconds,
+            detector_compute_seconds=detector_compute_seconds,
             public_decision=decision.public_decision,
         )
     if decision.action == "rollback":
@@ -555,6 +680,8 @@ def _canary_outcome_from_decision(
             served_before_rollback=snapshot.served_before_rollback,
             in_flight_at_rollback=snapshot.in_flight_at_rollback,
             compute_seconds=compute_seconds,
+            agent_execution_seconds=agent_execution_seconds,
+            detector_compute_seconds=detector_compute_seconds,
             public_decision=decision.public_decision,
         )
     raise BenchmarkError("canary finished without rollback or promote")
@@ -570,6 +697,8 @@ def _serialize_canary_outcome(outcome: CanaryTierOutcome) -> dict[str, object]:
         "served_before_rollback": outcome.served_before_rollback,
         "in_flight_at_rollback": outcome.in_flight_at_rollback,
         "compute_seconds": outcome.compute_seconds,
+        "agent_execution_seconds": outcome.agent_execution_seconds,
+        "detector_compute_seconds": outcome.detector_compute_seconds,
         "public_decision": _lifecycle_decision_to_dict(outcome.public_decision),
     }
 
@@ -582,6 +711,8 @@ def _serialize_monitor_outcome(outcome: MonitorTierOutcome) -> dict[str, object]
         "miss": outcome.miss,
         "false_alarm": outcome.false_alarm,
         "compute_seconds": outcome.compute_seconds,
+        "agent_execution_seconds": outcome.agent_execution_seconds,
+        "detector_compute_seconds": outcome.detector_compute_seconds,
     }
 
 
@@ -596,10 +727,13 @@ def _serialize_replicate(outcome: ReplicateOutcome) -> dict[str, object]:
             "outcome": outcome.gate.outcome,
             "classification": outcome.gate.classification,
             "compute_seconds": outcome.gate.compute_seconds,
+            "agent_execution_seconds": outcome.gate.agent_execution_seconds,
+            "detector_compute_seconds": outcome.gate.detector_compute_seconds,
             "public_decision": _lifecycle_decision_to_dict(
                 outcome.gate.public_decision
             ),
             "statistics": [item.to_dict() for item in outcome.gate.statistics],
+            "validation_provenance": outcome.gate.validation_provenance,
         },
         "canary": _serialize_canary_outcome(outcome.canary),
         "monitor": _serialize_monitor_outcome(outcome.monitor),
@@ -626,14 +760,21 @@ def _deserialize_replicate(payload: Mapping[str, object]) -> ReplicateOutcome:
                 if gate.get("classification") is None
                 else str(gate["classification"])
             ),
-            compute_seconds=(
-                None
-                if gate.get("compute_seconds") is None
-                else float(gate["compute_seconds"])
+            compute_seconds=_optional_float(gate.get("compute_seconds")),
+            agent_execution_seconds=_optional_float(
+                gate.get("agent_execution_seconds")
+            ),
+            detector_compute_seconds=_optional_float(
+                gate.get("detector_compute_seconds")
             ),
             public_decision=_lifecycle_decision_from_dict(gate.get("public_decision")),
             statistics=tuple(
                 StatisticalEvidence.from_dict(item) for item in statistics_raw
+            ),
+            validation_provenance=(
+                None
+                if gate.get("validation_provenance") is None
+                else str(gate["validation_provenance"])
             ),
         ),
         canary=CanaryTierOutcome(
@@ -644,10 +785,12 @@ def _deserialize_replicate(payload: Mapping[str, object]) -> ReplicateOutcome:
             candidate_episodes_failed=canary.get("candidate_episodes_failed"),
             served_before_rollback=canary.get("served_before_rollback"),
             in_flight_at_rollback=canary.get("in_flight_at_rollback"),
-            compute_seconds=(
-                None
-                if canary.get("compute_seconds") is None
-                else float(canary["compute_seconds"])
+            compute_seconds=_optional_float(canary.get("compute_seconds")),
+            agent_execution_seconds=_optional_float(
+                canary.get("agent_execution_seconds")
+            ),
+            detector_compute_seconds=_optional_float(
+                canary.get("detector_compute_seconds")
             ),
             public_decision=_lifecycle_decision_from_dict(
                 canary.get("public_decision")
@@ -659,10 +802,12 @@ def _deserialize_replicate(payload: Mapping[str, object]) -> ReplicateOutcome:
             delay_episodes=monitor.get("delay_episodes"),
             miss=bool(monitor.get("miss", False)),
             false_alarm=bool(monitor.get("false_alarm", False)),
-            compute_seconds=(
-                None
-                if monitor.get("compute_seconds") is None
-                else float(monitor["compute_seconds"])
+            compute_seconds=_optional_float(monitor.get("compute_seconds")),
+            agent_execution_seconds=_optional_float(
+                monitor.get("agent_execution_seconds")
+            ),
+            detector_compute_seconds=_optional_float(
+                monitor.get("detector_compute_seconds")
             ),
         ),
     )
@@ -673,7 +818,7 @@ def _monitor_horizon(settings: MonitorSettings) -> int:
 
 
 def _is_complete_replicate(item: ReplicateOutcome) -> bool:
-    if item.gate.status == "not_representable":
+    if item.gate.status in {"not_representable", "unavailable"}:
         return True
     if item.gate.status != "completed":
         return False
@@ -686,7 +831,14 @@ def _is_complete_replicate(item: ReplicateOutcome) -> bool:
     return False
 
 
-def _aggregate(replicates: Sequence[ReplicateOutcome], *, status: str) -> BenchmarkResult:
+def _aggregate(
+    replicates: Sequence[ReplicateOutcome],
+    *,
+    status: str,
+    wall_seconds: float,
+    gpu_memory_mib: float | None,
+    gpu_hours: float | None,
+) -> BenchmarkResult:
     scored = [item for item in replicates if _is_complete_replicate(item)]
     gate_catch = 0
     gate_false_block = 0
@@ -699,6 +851,8 @@ def _aggregate(replicates: Sequence[ReplicateOutcome], *, status: str) -> Benchm
     canary_not_reached = 0
     monitor_not_reached = 0
     compute = 0.0
+    agent_execution = 0.0
+    detector_compute = 0.0
 
     for item in scored:
         if item.gate.classification == "catch":
@@ -729,6 +883,10 @@ def _aggregate(replicates: Sequence[ReplicateOutcome], *, status: str) -> Benchm
         for tier in (item.gate, item.canary, item.monitor):
             if tier.compute_seconds is not None:
                 compute += tier.compute_seconds
+            if tier.agent_execution_seconds is not None:
+                agent_execution += tier.agent_execution_seconds
+            if tier.detector_compute_seconds is not None:
+                detector_compute += tier.detector_compute_seconds
 
     return BenchmarkResult(
         status=status,
@@ -748,8 +906,11 @@ def _aggregate(replicates: Sequence[ReplicateOutcome], *, status: str) -> Benchm
         canary_not_reached_count=canary_not_reached,
         monitor_not_reached_count=monitor_not_reached,
         compute_seconds=compute,
-        gpu_memory_mib=None,
-        gpu_hours=None,
+        agent_execution_seconds=agent_execution,
+        detector_compute_seconds=detector_compute,
+        wall_seconds=wall_seconds,
+        gpu_memory_mib=gpu_memory_mib,
+        gpu_hours=gpu_hours,
     )
 
 
@@ -947,29 +1108,119 @@ def _export_aggregates(
     )
 
 
-def _bind_and_admit_test_normal(
+def _task_selection_allowance(
+    train_template: RunConfiguration,
+) -> TaskSelectionAllowance:
+    train_values = {
+        "task.split": train_template.task.split,
+        "task.selection_rule": train_template.task.selection_rule,
+        "task.selection_seed": train_template.task.selection_seed,
+        "task.task_count": train_template.task.task_count,
+        "task.task_set_hash": train_template.task.task_set_hash,
+    }
+    try:
+        return TaskSelectionAllowance(
+            allowed_leaves=_TASK_SELECTION_LEAVES,
+            train_task_set_hash=train_template.task.task_set_hash,
+            train_values=train_values,
+        )
+    except ProtocolError as error:
+        raise BenchmarkError(str(error)) from error
+
+
+def _authorize_faulted_test_normal(
     protocol: ProtocolLock,
     template: RunConfiguration,
     task_set: TaskSet,
     fault: FaultSpec,
 ) -> tuple[RunConfiguration, RunConfiguration]:
-    """Bind and admit the locked template, then apply the declared fault.
-
-    ``admit_test_normal`` rejects a configuration that is not a lock
-    template. The faulted candidate therefore cannot be admitted. The
-    lock's dev harm label for ``fault.fault_version`` is the authorization
-    for that candidate.
-    """
-
     try:
         reference = bind_protocol(template, protocol)
-        admit_test_normal(
-            protocol, reference, task_set_hash=task_set.task_set_hash
-        )
         candidate = apply_fault(reference, fault)
+        authorize_faulted_candidate(
+            protocol,
+            reference,
+            candidate,
+            fault,
+            task_set,
+        )
     except (ProtocolError, FaultError) as error:
         raise BenchmarkError(str(error)) from error
     return reference, candidate
+
+
+def _checkpoint_identity(
+    *,
+    protocol: ProtocolLock,
+    train_bound: RunConfiguration,
+    test_normal_bound: RunConfiguration,
+    faults: Sequence[FaultSpec],
+    plan_evidence: PlanEvidenceInputs,
+) -> dict[str, object]:
+    return {
+        "protocol_digest": protocol.digest,
+        "train_configuration_hash": run_configuration_hash(train_bound),
+        "test_normal_configuration_hash": run_configuration_hash(test_normal_bound),
+        "fault_versions": [fault.fault_version for fault in faults],
+        "plan_evidence": _plan_evidence_to_dict(plan_evidence),
+    }
+
+
+def _validate_checkpoint_identity(
+    document: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> None:
+    stored = document.get("identity")
+    if stored is None:
+        return
+    if not isinstance(stored, Mapping):
+        raise BenchmarkError("checkpoint identity is invalid")
+    for key, value in expected.items():
+        if stored.get(key) != value:
+            raise BenchmarkError(
+                "checkpoint identity does not match protocol, configuration, or fault"
+            )
+
+
+def _start_canary_controller(
+    controller: CanaryController,
+    *,
+    gate_decision: GateDecision,
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    allowance: TaskSelectionAllowance,
+) -> None:
+    try:
+        admission = authorize_gated_candidate(
+            gate_decision,
+            reference,
+            candidate,
+            allowance,
+        )
+    except ProtocolError as error:
+        raise BenchmarkError(str(error)) from error
+    starter = getattr(controller, "start_from_admission", None)
+    if callable(starter):
+        try:
+            starter(admission)
+        except CanaryRejected as error:
+            raise BenchmarkError(str(error)) from error
+        return
+    served_reference = run_configuration_hash(reference)
+    served_candidate = run_configuration_hash(candidate)
+    if (
+        served_reference == gate_decision.reference_configuration_hash
+        and served_candidate == gate_decision.candidate_configuration_hash
+    ):
+        try:
+            controller.start(gate_decision)
+        except CanaryRejected as error:
+            raise BenchmarkError(str(error)) from error
+        return
+    raise BenchmarkError(
+        "CanaryController.start_from_admission is required when served "
+        "configuration hashes differ from the gate"
+    )
 
 
 def run_lifecycle_benchmark(
@@ -981,8 +1232,12 @@ def run_lifecycle_benchmark(
     test_normal_tasks: TaskSet,
     reference_baselines: FrozenReference,
     checkpoint_path: Path,
+    plan_evidence: PlanEvidenceInputs,
     export_path: Path | None = None,
     should_interrupt: Callable[[BenchmarkProgress], bool] | None = None,
+    candidate_runtime: RuntimeDependencies | None = None,
+    gpu_memory_mib: float | None = None,
+    gpu_hours: float | None = None,
 ) -> BenchmarkResult:
     """Run the three-tier lifecycle benchmark for each fault and lock seed."""
 
@@ -990,6 +1245,12 @@ def run_lifecycle_benchmark(
         raise BenchmarkError("run_lifecycle_benchmark requires a protocol lock")
     if not isinstance(runtime, RuntimeDependencies):
         raise BenchmarkError("run_lifecycle_benchmark requires runtime dependencies")
+    if candidate_runtime is not None and not isinstance(
+        candidate_runtime, RuntimeDependencies
+    ):
+        raise BenchmarkError("candidate_runtime must be RuntimeDependencies when set")
+    if not isinstance(plan_evidence, PlanEvidenceInputs):
+        raise BenchmarkError("run_lifecycle_benchmark requires plan evidence inputs")
     if not isinstance(train_tasks, TaskSet) or not isinstance(
         test_normal_tasks, TaskSet
     ):
@@ -1023,11 +1284,22 @@ def run_lifecycle_benchmark(
 
     seeds = _seeds_from_lock(protocol)
     document = _load_checkpoint(checkpoint)
+    train_bound_for_export = bind_protocol(train_template, protocol)
+    test_normal_bound_for_export = bind_protocol(test_normal_template, protocol)
+    identity = _checkpoint_identity(
+        protocol=protocol,
+        train_bound=train_bound_for_export,
+        test_normal_bound=test_normal_bound_for_export,
+        faults=faults,
+        plan_evidence=plan_evidence,
+    )
+    _validate_checkpoint_identity(document, identity)
+    document["identity"] = identity
     replicates_doc: dict[str, Any] = document.setdefault("replicates", {})
     outcomes: list[ReplicateOutcome] = []
     interrupted = False
-    train_bound_for_export = bind_protocol(train_template, protocol)
-    test_normal_bound_for_export = bind_protocol(test_normal_template, protocol)
+    wall_started = time.perf_counter()
+    allowance = _task_selection_allowance(train_template)
 
     for fault in faults:
         if not isinstance(fault, FaultSpec):
@@ -1048,13 +1320,38 @@ def run_lifecycle_benchmark(
                 continue
 
             if not fault.representable:
+                reason = (
+                    None
+                    if fault.schema_request is None
+                    else str(fault.schema_request)
+                )
                 outcome = ReplicateOutcome(
                     fault_version=fault.fault_version,
                     replicate_seed=seed,
                     harmful=label.harmful,
-                    gate=_not_representable_gate(),
-                    canary=_not_representable_canary(),
-                    monitor=_not_representable_monitor(),
+                    gate=_not_representable_gate(reason),
+                    canary=_not_representable_canary(reason),
+                    monitor=_not_representable_monitor(reason),
+                )
+                outcomes.append(outcome)
+                stored["outcome"] = _serialize_replicate(outcome)
+                _write_checkpoint(checkpoint, document)
+                continue
+
+            availability = live_fault_available(fault)
+            if not availability.available:
+                reason = (
+                    "live fault unavailable"
+                    if availability.reason is None
+                    else availability.reason
+                )
+                outcome = ReplicateOutcome(
+                    fault_version=fault.fault_version,
+                    replicate_seed=seed,
+                    harmful=label.harmful,
+                    gate=_unavailable_gate(reason),
+                    canary=_unavailable_canary(reason),
+                    monitor=_unavailable_monitor(reason),
                 )
                 outcomes.append(outcome)
                 stored["outcome"] = _serialize_replicate(outcome)
@@ -1079,6 +1376,7 @@ def run_lifecycle_benchmark(
                 train_tasks=train_tasks,
                 gate_settings=gate_settings,
                 runtime=runtime,
+                plan_evidence=plan_evidence,
                 harmful=label.harmful,
                 stored=stored,
                 checkpoint=checkpoint,
@@ -1122,6 +1420,9 @@ def run_lifecycle_benchmark(
                 canary_settings=canary_settings,
                 stream_settings=stream_settings,
                 runtime=runtime,
+                candidate_runtime=candidate_runtime,
+                gate_decision=gate_decision,
+                allowance=allowance,
                 seed=seed,
                 stored=stored,
                 checkpoint=checkpoint,
@@ -1145,6 +1446,8 @@ def run_lifecycle_benchmark(
                             miss=False,
                             false_alarm=False,
                             compute_seconds=None,
+                            agent_execution_seconds=None,
+                            detector_compute_seconds=None,
                         ),
                     )
                 )
@@ -1188,6 +1491,8 @@ def run_lifecycle_benchmark(
                             miss=False,
                             false_alarm=False,
                             compute_seconds=None,
+                            agent_execution_seconds=None,
+                            detector_compute_seconds=None,
                         ),
                     )
                 )
@@ -1202,6 +1507,7 @@ def run_lifecycle_benchmark(
                 stream_settings=stream_settings,
                 reference_baselines=reference_baselines,
                 runtime=runtime,
+                candidate_runtime=candidate_runtime,
                 seed=seed,
                 harmful=label.harmful,
                 stored=stored,
@@ -1237,7 +1543,14 @@ def run_lifecycle_benchmark(
             _write_checkpoint(checkpoint, document)
 
     status = "interrupted" if interrupted else "completed"
-    result = _aggregate(outcomes, status=status)
+    wall_seconds = time.perf_counter() - wall_started
+    result = _aggregate(
+        outcomes,
+        status=status,
+        wall_seconds=wall_seconds,
+        gpu_memory_mib=gpu_memory_mib,
+        gpu_hours=gpu_hours,
+    )
     if status == "completed" and export_path is not None:
         try:
             export_public_results(
@@ -1263,6 +1576,7 @@ def _run_or_resume_gate(
     train_tasks: TaskSet,
     gate_settings: GateSettings,
     runtime: RuntimeDependencies,
+    plan_evidence: PlanEvidenceInputs,
     harmful: bool,
     stored: dict[str, Any],
     checkpoint: Path,
@@ -1273,10 +1587,22 @@ def _run_or_resume_gate(
         decision = _gate_decision_from_dict(
             _require_mapping(gate_blob["decision"], "gate decision")
         )
+        if decision.validation_provenance != plan_evidence.validation_provenance:
+            raise BenchmarkError(
+                "checkpoint gate validation_provenance does not match plan evidence"
+            )
         compute_seconds = float(gate_blob.get("compute_seconds", 0.0))
+        agent_seconds = float(
+            gate_blob.get("agent_execution_seconds", compute_seconds)
+        )
+        detector_seconds = float(gate_blob.get("detector_compute_seconds", 0.0))
         return (
             _gate_outcome_from_decision(
-                decision, harmful=harmful, compute_seconds=compute_seconds
+                decision,
+                harmful=harmful,
+                compute_seconds=compute_seconds,
+                agent_execution_seconds=agent_seconds,
+                detector_compute_seconds=detector_seconds,
             ),
             decision,
         )
@@ -1295,6 +1621,7 @@ def _run_or_resume_gate(
             train_tasks,
             settings=gate_settings,
             runtime=runtime,
+            plan_evidence=plan_evidence,
         )
     except GateExecutionError as error:
         raise BenchmarkError(str(error)) from error
@@ -1302,11 +1629,20 @@ def _run_or_resume_gate(
     stored["gate"] = {
         "decision": _gate_decision_to_dict(decision),
         "compute_seconds": compute_seconds,
+        "agent_execution_seconds": compute_seconds,
+        "detector_compute_seconds": 0.0,
+        "fault_version": fault.fault_version,
+        "reference_configuration_hash": run_configuration_hash(reference),
+        "candidate_configuration_hash": run_configuration_hash(candidate),
     }
     _write_checkpoint(checkpoint, document)
     return (
         _gate_outcome_from_decision(
-            decision, harmful=harmful, compute_seconds=compute_seconds
+            decision,
+            harmful=harmful,
+            compute_seconds=compute_seconds,
+            agent_execution_seconds=compute_seconds,
+            detector_compute_seconds=0.0,
         ),
         decision,
     )
@@ -1321,6 +1657,9 @@ def _run_or_resume_canary(
     canary_settings: CanarySettings,
     stream_settings: StreamSettings,
     runtime: RuntimeDependencies,
+    candidate_runtime: RuntimeDependencies | None,
+    gate_decision: GateDecision,
+    allowance: TaskSelectionAllowance,
     seed: int,
     stored: dict[str, Any],
     checkpoint: Path,
@@ -1328,7 +1667,7 @@ def _run_or_resume_canary(
     should_interrupt: Callable[[BenchmarkProgress], bool] | None,
     fault_version: str,
 ) -> dict[str, Any]:
-    reference, candidate = _bind_and_admit_test_normal(
+    reference, candidate = _authorize_faulted_test_normal(
         protocol, test_normal_template, test_normal_tasks, fault
     )
 
@@ -1350,10 +1689,12 @@ def _run_or_resume_canary(
             candidate_episodes_failed=final.get("candidate_episodes_failed"),
             served_before_rollback=final.get("served_before_rollback"),
             in_flight_at_rollback=final.get("in_flight_at_rollback"),
-            compute_seconds=(
-                None
-                if final.get("compute_seconds") is None
-                else float(final["compute_seconds"])
+            compute_seconds=_optional_float(final.get("compute_seconds")),
+            agent_execution_seconds=_optional_float(
+                final.get("agent_execution_seconds")
+            ),
+            detector_compute_seconds=_optional_float(
+                final.get("detector_compute_seconds")
             ),
             public_decision=_lifecycle_decision_from_dict(
                 final.get("public_decision")
@@ -1367,20 +1708,20 @@ def _run_or_resume_canary(
         settings=canary_settings,
         clock=runtime.clock,
     )
-    controller.start(
-        _CanaryGateView(
-            outcome="PASS",
-            reason_codes=(),
-            reference_configuration_hash=run_configuration_hash(reference),
-            candidate_configuration_hash=run_configuration_hash(candidate),
-            task_set_hash=reference.task.task_set_hash,
-            reference_protocol_hash=reference.protocol_hash,
-            candidate_protocol_hash=candidate.protocol_hash,
-        )
+    _start_canary_controller(
+        controller,
+        gate_decision=gate_decision,
+        reference=reference,
+        candidate=candidate,
+        allowance=allowance,
     )
 
     started = time.perf_counter()
     compute_base = float(canary_blob.get("compute_seconds", 0.0))
+    agent_base = float(canary_blob.get("agent_execution_seconds", 0.0))
+    detector_base = float(canary_blob.get("detector_compute_seconds", 0.0))
+    agent_delta = 0.0
+    detector_delta = 0.0
     stored_indexes = {
         int(item["stream_index"])
         for item in items_raw
@@ -1395,14 +1736,23 @@ def _run_or_resume_canary(
         )
         restore_pair_execution(execution)
         controller.begin_candidate_episode()
+        detector_started = time.perf_counter()
         decision = controller.observe(pair)
+        detector_delta += time.perf_counter() - detector_started
         if decision.action in {"rollback", "promote"}:
             compute_seconds = compute_base + (time.perf_counter() - started)
+            agent_seconds = agent_base + agent_delta
+            detector_seconds = detector_base + detector_delta
             outcome = _canary_outcome_from_decision(
-                decision, compute_seconds=compute_seconds
+                decision,
+                compute_seconds=compute_seconds,
+                agent_execution_seconds=agent_seconds,
+                detector_compute_seconds=detector_seconds,
             )
             canary_blob["final"] = _serialize_canary_outcome(outcome)
             canary_blob["compute_seconds"] = compute_seconds
+            canary_blob["agent_execution_seconds"] = agent_seconds
+            canary_blob["detector_compute_seconds"] = detector_seconds
             _write_checkpoint(checkpoint, document)
             return {"interrupted": False, "outcome": outcome}
 
@@ -1433,9 +1783,10 @@ def _run_or_resume_canary(
             stream_index=arrival.index,
         )
         if should_interrupt is not None and should_interrupt(progress):
-            canary_blob["compute_seconds"] = compute_base + (
-                time.perf_counter() - started
-            )
+            compute_seconds = compute_base + (time.perf_counter() - started)
+            canary_blob["compute_seconds"] = compute_seconds
+            canary_blob["agent_execution_seconds"] = agent_base + agent_delta
+            canary_blob["detector_compute_seconds"] = detector_base + detector_delta
             _write_checkpoint(checkpoint, document)
             snap = controller.snapshot()
             return {
@@ -1448,12 +1799,15 @@ def _run_or_resume_canary(
                     candidate_episodes_failed=snap.candidate_episodes_failed,
                     served_before_rollback=None,
                     in_flight_at_rollback=None,
-                    compute_seconds=float(canary_blob["compute_seconds"]),
+                    compute_seconds=compute_seconds,
+                    agent_execution_seconds=agent_base + agent_delta,
+                    detector_compute_seconds=detector_base + detector_delta,
                     public_decision=None,
                 ),
             }
 
         controller.begin_candidate_episode()
+        agent_started = time.perf_counter()
         pair = run_pair(
             arrival.task_id,
             reference,
@@ -1463,8 +1817,12 @@ def _run_or_resume_canary(
             runtime=runtime,
             mode="execute",
             scenario_id=arrival.scenario_id,
+            candidate_runtime=candidate_runtime,
         )
+        agent_delta += time.perf_counter() - agent_started
+        detector_started = time.perf_counter()
         decision = controller.observe(pair)
+        detector_delta += time.perf_counter() - detector_started
         execution = pair_execution(pair)
         items_raw.append(
             {
@@ -1474,14 +1832,17 @@ def _run_or_resume_canary(
                 "action": decision.action,
             }
         )
-        canary_blob["compute_seconds"] = compute_base + (
-            time.perf_counter() - started
-        )
+        compute_seconds = compute_base + (time.perf_counter() - started)
+        canary_blob["compute_seconds"] = compute_seconds
+        canary_blob["agent_execution_seconds"] = agent_base + agent_delta
+        canary_blob["detector_compute_seconds"] = detector_base + detector_delta
         _write_checkpoint(checkpoint, document)
         if decision.action in {"rollback", "promote"}:
-            compute_seconds = float(canary_blob["compute_seconds"])
             outcome = _canary_outcome_from_decision(
-                decision, compute_seconds=compute_seconds
+                decision,
+                compute_seconds=compute_seconds,
+                agent_execution_seconds=agent_base + agent_delta,
+                detector_compute_seconds=detector_base + detector_delta,
             )
             canary_blob["final"] = _serialize_canary_outcome(outcome)
             _write_checkpoint(checkpoint, document)
@@ -1500,6 +1861,7 @@ def _run_or_resume_monitor(
     stream_settings: StreamSettings,
     reference_baselines: FrozenReference,
     runtime: RuntimeDependencies,
+    candidate_runtime: RuntimeDependencies | None,
     seed: int,
     harmful: bool,
     stored: dict[str, Any],
@@ -1508,9 +1870,10 @@ def _run_or_resume_monitor(
     should_interrupt: Callable[[BenchmarkProgress], bool] | None,
     fault_version: str,
 ) -> dict[str, Any]:
-    _reference, candidate = _bind_and_admit_test_normal(
+    _reference, candidate = _authorize_faulted_test_normal(
         protocol, test_normal_template, test_normal_tasks, fault
     )
+    active_runtime = runtime if candidate_runtime is None else candidate_runtime
 
     monitor_blob = stored.setdefault("monitor", {})
     if not isinstance(monitor_blob, dict):
@@ -1525,10 +1888,12 @@ def _run_or_resume_monitor(
                 delay_episodes=final.get("delay_episodes"),
                 miss=bool(final.get("miss", False)),
                 false_alarm=bool(final.get("false_alarm", False)),
-                compute_seconds=(
-                    None
-                    if final.get("compute_seconds") is None
-                    else float(final["compute_seconds"])
+                compute_seconds=_optional_float(final.get("compute_seconds")),
+                agent_execution_seconds=_optional_float(
+                    final.get("agent_execution_seconds")
+                ),
+                detector_compute_seconds=_optional_float(
+                    final.get("detector_compute_seconds")
                 ),
             ),
         }
@@ -1546,6 +1911,10 @@ def _run_or_resume_monitor(
     )
     started = time.perf_counter()
     compute_base = float(monitor_blob.get("compute_seconds", 0.0))
+    agent_base = float(monitor_blob.get("agent_execution_seconds", 0.0))
+    detector_base = float(monitor_blob.get("detector_compute_seconds", 0.0))
+    agent_delta = 0.0
+    detector_delta = 0.0
     first_alert_index: int | None = monitor_blob.get("first_alert_index")
     if first_alert_index is not None:
         first_alert_index = int(first_alert_index)
@@ -1564,7 +1933,9 @@ def _run_or_resume_monitor(
             raise BenchmarkError("checkpoint monitor observations are invalid")
         for observation_payload in observations:
             observation = MonitorObservation.from_dict(observation_payload)
+            detector_started = time.perf_counter()
             alerts = monitor.update(observation)
+            detector_delta += time.perf_counter() - detector_started
             if alerts and first_alert_index is None:
                 first_alert_index = int(item["stream_index"])
                 alerted = True
@@ -1593,9 +1964,10 @@ def _run_or_resume_monitor(
             stream_index=arrival.index,
         )
         if should_interrupt is not None and should_interrupt(progress):
-            monitor_blob["compute_seconds"] = compute_base + (
-                time.perf_counter() - started
-            )
+            compute_seconds = compute_base + (time.perf_counter() - started)
+            monitor_blob["compute_seconds"] = compute_seconds
+            monitor_blob["agent_execution_seconds"] = agent_base + agent_delta
+            monitor_blob["detector_compute_seconds"] = detector_base + detector_delta
             if first_alert_index is not None:
                 monitor_blob["first_alert_index"] = first_alert_index
             _write_checkpoint(checkpoint, document)
@@ -1611,18 +1983,22 @@ def _run_or_resume_monitor(
                     ),
                     miss=False,
                     false_alarm=False,
-                    compute_seconds=float(monitor_blob["compute_seconds"]),
+                    compute_seconds=compute_seconds,
+                    agent_execution_seconds=agent_base + agent_delta,
+                    detector_compute_seconds=detector_base + detector_delta,
                 ),
             }
 
+        agent_started = time.perf_counter()
         episode = run_episode(
             arrival.task_id,
             candidate,
             "execute",
             run=run,
-            runtime=runtime,
+            runtime=active_runtime,
             scenario_id=arrival.scenario_id,
         )
+        agent_delta += time.perf_counter() - agent_started
         observation_payloads: list[dict[str, object]] = []
         new_alerts = False
         for signal in monitor_settings.signals:
@@ -1633,7 +2009,9 @@ def _run_or_resume_monitor(
                     completion_index=arrival.index,
                 ),
             )
+            detector_started = time.perf_counter()
             alerts = monitor.update(observation)
+            detector_delta += time.perf_counter() - detector_started
             observation_payloads.append(observation.to_dict())
             if alerts:
                 new_alerts = True
@@ -1648,12 +2026,15 @@ def _run_or_resume_monitor(
         )
         if first_alert_index is not None:
             monitor_blob["first_alert_index"] = first_alert_index
-        monitor_blob["compute_seconds"] = compute_base + (
-            time.perf_counter() - started
-        )
+        compute_seconds = compute_base + (time.perf_counter() - started)
+        monitor_blob["compute_seconds"] = compute_seconds
+        monitor_blob["agent_execution_seconds"] = agent_base + agent_delta
+        monitor_blob["detector_compute_seconds"] = detector_base + detector_delta
         _write_checkpoint(checkpoint, document)
 
     compute_seconds = compute_base + (time.perf_counter() - started)
+    agent_seconds = agent_base + agent_delta
+    detector_seconds = detector_base + detector_delta
     delay = None if first_alert_index is None else first_alert_index + 1
     miss = bool(harmful and not alerted)
     false_alarm = bool((not harmful) and alerted)
@@ -1664,8 +2045,12 @@ def _run_or_resume_monitor(
         miss=miss,
         false_alarm=false_alarm,
         compute_seconds=compute_seconds,
+        agent_execution_seconds=agent_seconds,
+        detector_compute_seconds=detector_seconds,
     )
     monitor_blob["final"] = _serialize_monitor_outcome(outcome)
     monitor_blob["compute_seconds"] = compute_seconds
+    monitor_blob["agent_execution_seconds"] = agent_seconds
+    monitor_blob["detector_compute_seconds"] = detector_seconds
     _write_checkpoint(checkpoint, document)
     return {"interrupted": False, "outcome": outcome}

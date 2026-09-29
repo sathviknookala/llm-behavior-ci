@@ -1,0 +1,23 @@
+{
+  "plan_format_version": "plan-v1",
+  "plan_quality_features": [
+    "numbered_step_count",
+    "token_count"
+  ],
+  "plan_quality_weights": [
+    1.0,
+    0.1
+  ],
+  "mmd_features": [
+    "char_count",
+    "numbered_step_count",
+    "model_step_count"
+  ],
+  "kl_approximation": "top_k",
+  "required_statistics": [
+    "plan_quality",
+    "kl",
+    "mmd"
+  ],
+  "validation_provenance": "synthetic_fixture"
+}

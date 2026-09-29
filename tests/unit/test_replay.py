@@ -7,11 +7,22 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from llm_behavior_ci.config import EpisodeIdentity, RunIdentity
+from llm_behavior_ci.config import (
+    EpisodeIdentity,
+    MonitorSettings,
+    RunIdentity,
+    StoppingRule,
+)
 from llm_behavior_ci.experiments.replay import (
     ReplaySchedule,
+    monitoring_detector_factories,
     replay_detectors,
 )
+from llm_behavior_ci.lifecycle.detectors import (
+    DetectorConstructionError,
+    build_detector,
+)
+from llm_behavior_ci.lifecycle.monitoring import FrozenReference
 from llm_behavior_ci.records import MonitorObservation
 from llm_behavior_ci.stats.cusum import CUSUM
 from llm_behavior_ci.stats.evidence import Evidence
@@ -387,6 +398,52 @@ class ReplayUnitTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(completed.returncode, 2)
+
+    def test_monitoring_factories_use_shared_detector_parameters(self) -> None:
+        rule = StoppingRule(
+            name="cusum",
+            alpha=0.1,
+            horizon_episodes=20,
+            threshold=0.75,
+        )
+        settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success",),
+            stopping_rules=(rule,),
+        )
+        reference = FrozenReference(
+            configuration_hash=_HASH_A,
+            baselines=(("task_success", 0.85),),
+        )
+        factories = monitoring_detector_factories(
+            settings,
+            reference,
+            signal="task_success",
+            alpha=0.05,
+            window_episodes=2,
+            reference_sample=(1.0, 1.0, 0.0),
+            harm_margin=0.05,
+            corrections=("none", "bonferroni"),
+        )
+        shared = build_detector(rule, signal="task_success", baseline=0.85)
+        from_replay = factories["cusum"]()
+        self.assertEqual(shared.snapshot(), from_replay.snapshot())
+        self.assertIn("ks_hourly_none", factories)
+        self.assertIn("chi_square_hourly_bonferroni", factories)
+        with self.assertRaises(DetectorConstructionError):
+            build_detector(rule, signal="task_mix", baseline=0.5)
+        with self.assertRaises(DetectorConstructionError):
+            build_detector(
+                StoppingRule(
+                    name="unknown_rule",
+                    alpha=0.1,
+                    horizon_episodes=1,
+                    threshold=0.1,
+                ),
+                signal="task_success",
+                baseline=0.9,
+            )
 
 
 if __name__ == "__main__":

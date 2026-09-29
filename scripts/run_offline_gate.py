@@ -2,20 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections.abc import Sequence
-from datetime import datetime, timezone
 from pathlib import Path
 
 from llm_behavior_ci.config import ConfigError, GateSettings, RunConfiguration
 from llm_behavior_ci.lifecycle.offline_gate import (
     GateDecision,
     GateExecutionError,
+    PlanEvidenceInputs,
     run_offline_gate,
 )
 from llm_behavior_ci.records import assert_public_payload, public_record_dict
-from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.runtime.episode import RuntimeDependencies, build_runtime
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
     TaskSet,
@@ -68,19 +67,101 @@ def _load_task_set(payload: object) -> TaskSet:
     return task_set
 
 
-def _live_runtime() -> RuntimeDependencies:
-    base_url = os.environ.get("LLM_BEHAVIOR_CI_VLLM_BASE_URL")
-    if not base_url:
-        raise GateExecutionError("live runtime requires LLM_BEHAVIOR_CI_VLLM_BASE_URL")
-    from llm_behavior_ci.runtime.agent import VLLMAgent
-    from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
+def _load_plan_evidence(payload: object) -> PlanEvidenceInputs:
+    if not isinstance(payload, dict):
+        raise GateExecutionError("plan evidence must be an object")
+    try:
+        features = tuple(str(item) for item in payload["plan_quality_features"])
+        weights = tuple(float(item) for item in payload["plan_quality_weights"])
+        mmd_features = tuple(str(item) for item in payload["mmd_features"])
+        required = tuple(str(item) for item in payload["required_statistics"])
+        approximation = str(payload["kl_approximation"])
+        if approximation not in {"full", "top_k"}:
+            raise GateExecutionError("kl_approximation must be full or top_k")
+        return PlanEvidenceInputs(
+            plan_format_version=str(payload["plan_format_version"]),
+            plan_quality_features=features,
+            plan_quality_weights=weights,
+            mmd_features=mmd_features,
+            kl_approximation=approximation,  # type: ignore[arg-type]
+            required_statistics=required,
+            validation_provenance=str(payload["validation_provenance"]),
+        )
+    except (GateExecutionError, KeyError, TypeError, ValueError) as error:
+        raise GateExecutionError("plan evidence is incomplete") from error
 
-    agent = VLLMAgent(base_url)
-    agent.set_mode("plan")
+
+class _SwitchingAgent:
+    def __init__(
+        self,
+        *,
+        reference_agent: object,
+        candidate_agent: object,
+        reference_hash: str,
+        candidate_hash: str,
+    ) -> None:
+        self._reference_agent = reference_agent
+        self._candidate_agent = candidate_agent
+        self._reference_hash = reference_hash
+        self._candidate_hash = candidate_hash
+        self._active = reference_agent
+
+    def begin(self, context: object, config: RunConfiguration) -> None:
+        from llm_behavior_ci.config import run_configuration_hash
+
+        digest = run_configuration_hash(config)
+        if digest == self._reference_hash:
+            self._active = self._reference_agent
+        elif digest == self._candidate_hash:
+            self._active = self._candidate_agent
+        else:
+            raise GateExecutionError("live runtime configuration is not registered")
+        self._active.begin(context, config)
+
+    def messages(self, tool_output: str | None = None) -> object:
+        return self._active.messages(tool_output=tool_output)
+
+    def next_turn(self, *, tool_output: str | None) -> object:
+        return self._active.next_turn(tool_output=tool_output)
+
+    def teacher_force_plan(self, **kwargs: object) -> object:
+        method = getattr(self._active, "teacher_force_plan", None)
+        if not callable(method):
+            raise AttributeError("teacher_force_plan")
+        return method(**kwargs)
+
+    def set_mode(self, mode: str) -> None:
+        for agent in (self._reference_agent, self._candidate_agent):
+            setter = getattr(agent, "set_mode", None)
+            if callable(setter):
+                setter(mode)
+
+
+def _live_runtime(
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    *,
+    reference_endpoint: str,
+    candidate_endpoint: str,
+) -> RuntimeDependencies:
+    from llm_behavior_ci.config import run_configuration_hash
+
+    if reference_endpoint.strip() == "" or candidate_endpoint.strip() == "":
+        raise GateExecutionError("live runtime requires reference and candidate endpoints")
+    if reference_endpoint == candidate_endpoint:
+        raise GateExecutionError("live runtime endpoints must be distinct")
+    reference_runtime = build_runtime(reference, reference_endpoint, mode="plan")
+    candidate_runtime = build_runtime(candidate, candidate_endpoint, mode="plan")
+    agent = _SwitchingAgent(
+        reference_agent=reference_runtime.agent,
+        candidate_agent=candidate_runtime.agent,
+        reference_hash=run_configuration_hash(reference),
+        candidate_hash=run_configuration_hash(candidate),
+    )
     return RuntimeDependencies(
-        session_factory=LiveAppWorldSession,
+        session_factory=reference_runtime.session_factory,
         agent=agent,
-        clock=lambda: datetime.now(timezone.utc),
+        clock=reference_runtime.clock,
     )
 
 
@@ -102,6 +183,7 @@ def _public_document(decision: GateDecision) -> dict[str, object]:
             if decision.public_decision is not None
             else None
         ),
+        "validation_provenance": decision.validation_provenance,
     }
     assert_public_payload(document)
     return document
@@ -112,11 +194,22 @@ def main(
     *,
     runtime: RuntimeDependencies | None = None,
 ) -> int:
-    parser = argparse.ArgumentParser(description="Run the plan-only offline gate.")
+    if argv is None and len(sys.argv) <= 1:
+        return 2
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the plan-only offline gate. CPU use injects runtime in-process. "
+            "Live endpoints require --live-runtime."
+        )
+    )
     parser.add_argument("--reference", required=True)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--task-set", required=True)
     parser.add_argument("--settings", required=True)
+    parser.add_argument("--plan-evidence", required=True)
+    parser.add_argument("--live-runtime", action="store_true")
+    parser.add_argument("--reference-endpoint", default=None)
+    parser.add_argument("--candidate-endpoint", default=None)
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
     except SystemExit as error:
@@ -130,13 +223,36 @@ def main(
         candidate = RunConfiguration.from_dict(_load_json(args.candidate))
         task_set = _load_task_set(_load_json(args.task_set))
         settings = GateSettings.from_dict(_load_json(args.settings))
-        active_runtime = runtime if runtime is not None else _live_runtime()
+        plan_evidence = _load_plan_evidence(_load_json(args.plan_evidence))
+        if runtime is not None:
+            if args.live_runtime:
+                raise GateExecutionError(
+                    "injected runtime cannot be combined with --live-runtime"
+                )
+            active_runtime = runtime
+        elif args.live_runtime:
+            if args.reference_endpoint is None or args.candidate_endpoint is None:
+                raise GateExecutionError(
+                    "--live-runtime requires --reference-endpoint and --candidate-endpoint"
+                )
+            active_runtime = _live_runtime(
+                reference,
+                candidate,
+                reference_endpoint=args.reference_endpoint,
+                candidate_endpoint=args.candidate_endpoint,
+            )
+        else:
+            raise GateExecutionError(
+                "runtime required: inject runtime for CPU or pass --live-runtime "
+                "with --reference-endpoint and --candidate-endpoint"
+            )
         decision = run_offline_gate(
             reference,
             candidate,
             task_set,
             settings=settings,
             runtime=active_runtime,
+            plan_evidence=plan_evidence,
         )
     except (GateExecutionError, ConfigError, SelectionError) as error:
         print(str(error) or "offline gate execution failed", file=sys.stderr)

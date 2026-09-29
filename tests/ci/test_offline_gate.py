@@ -1,23 +1,24 @@
+import copy
 import math
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from llm_behavior_ci.config import GateSettings, RunConfiguration
-from llm_behavior_ci.lifecycle.offline_gate import run_offline_gate
+from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs, run_offline_gate
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
 from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.runtime.scoring import score_top_k
 from llm_behavior_ci.stats.bootstrap import clustered_paired_bootstrap, paired_bootstrap
-from llm_behavior_ci.stats.kl import NextTokenKLError, next_token_kl, truncated_next_token_kl
+from llm_behavior_ci.stats.kl import NextTokenKLError, next_token_kl
 from llm_behavior_ci.stats.mmd import MMDError, mmd_permutation_test
 from llm_behavior_ci.tasks.selection import (
     TaskSet,
     canonical_task_set_bytes,
     task_set_hash_from_bytes,
 )
-from datetime import datetime, timedelta, timezone
-import copy
 
 _START = datetime(2026, 9, 27, 15, 0, tzinfo=timezone.utc)
 _PLAN = "1. open the calendar"
@@ -138,6 +139,18 @@ def _settings() -> GateSettings:
     )
 
 
+def _evidence() -> PlanEvidenceInputs:
+    return PlanEvidenceInputs(
+        plan_format_version="plan-v1",
+        plan_quality_features=("numbered_step_count", "token_count"),
+        plan_quality_weights=(1.0, 0.1),
+        mmd_features=("char_count", "numbered_step_count", "model_step_count"),
+        kl_approximation="top_k",
+        required_statistics=("plan_quality", "kl", "mmd"),
+        validation_provenance="synthetic_fixture",
+    )
+
+
 class FakeSession:
     def __init__(self, task_id: str) -> None:
         self.task_id = task_id
@@ -164,10 +177,25 @@ class PlanAgent:
     def __init__(self, clock) -> None:
         self._clock = clock
         self.config = None
+        self._context = None
 
     def begin(self, context: TaskContext, config: RunConfiguration) -> None:
-        del context
+        self._context = context
         self.config = config
+
+    def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
+        del tool_output
+        assert self._context is not None
+        return [
+            {"role": "system", "content": "Emit a plan."},
+            {
+                "role": "user",
+                "content": (
+                    f"{self._context.instruction}\n"
+                    f"{self._context.api_documentation}"
+                ),
+            },
+        ]
 
     def next_turn(self, *, tool_output: str | None) -> AgentTurn:
         del tool_output
@@ -181,6 +209,15 @@ class PlanAgent:
             app_name=None,
             api_name=None,
         )
+
+    def teacher_force_plan(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        plan_text: str,
+    ) -> tuple[tuple[TokenLogprob, ...], ...]:
+        del messages, plan_text
+        return _LOGPROBS
 
 
 def _clock():
@@ -282,8 +319,8 @@ class OfflineGateTests(unittest.TestCase):
                 wraps=clustered_paired_bootstrap,
             ) as bootstrap_call,
             patch(
-                "llm_behavior_ci.lifecycle.offline_gate.truncated_next_token_kl",
-                wraps=truncated_next_token_kl,
+                "llm_behavior_ci.lifecycle.offline_gate.score_top_k",
+                wraps=score_top_k,
             ) as kl_call,
             patch(
                 "llm_behavior_ci.lifecycle.offline_gate.mmd_permutation_test",
@@ -296,10 +333,12 @@ class OfflineGateTests(unittest.TestCase):
                 task_set,
                 settings=_settings(),
                 runtime=runtime,
+                plan_evidence=_evidence(),
             )
         bootstrap_call.assert_called_once()
         kl_call.assert_called_once()
         mmd_call.assert_called_once()
+        self.assertEqual(mmd_call.call_args.kwargs["clusters"], ("scenario-1", "task-b"))
         self.assertEqual(decision.outcome, "PASS")
         self.assertEqual(decision.reason_codes, ())
 
@@ -328,6 +367,7 @@ class OfflineGateTests(unittest.TestCase):
                 plan_format_version="plan-v1",
             ),
             runtime=runtime,
+            plan_evidence=_evidence(),
         )
         self.assertEqual(decision.outcome, "BLOCK")
         self.assertIn("plan_quality_margin", decision.reason_codes)

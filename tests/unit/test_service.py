@@ -9,8 +9,10 @@ from tempfile import TemporaryDirectory
 
 try:
     from fastapi.testclient import TestClient
-except ImportError:
-    TestClient = None
+except ImportError as error:
+    raise ImportError(
+        "fastapi is required for tests.unit.test_service"
+    ) from error
 
 from llm_behavior_ci.config import (
     CanarySettings,
@@ -255,9 +257,32 @@ class SpyStore(EpisodeStore):
         self._ensure()
         return super().load_episode(episode_id)
 
+    def load_open_episode(self, episode_id: str):
+        self._ensure()
+        return super().load_open_episode(episode_id)
+
     def append_pair(self, pair) -> None:
         self._ensure()
         return super().append_pair(pair)
+
+    def append_alert_with_status(self, alert, *, dedup_seconds: float = 0.0):
+        self._ensure()
+        return super().append_alert_with_status(
+            alert,
+            dedup_seconds=dedup_seconds,
+        )
+
+    def append_deployment_decision(self, decision):
+        self._ensure()
+        return super().append_deployment_decision(decision)
+
+    def load_alerts(self, *, signal=None):
+        self._ensure()
+        return super().load_alerts(signal=signal)
+
+    def load_deployment_decisions(self):
+        self._ensure()
+        return super().load_deployment_decisions()
 
     def close(self) -> None:
         self.close_calls += 1
@@ -278,9 +303,9 @@ class SpyMonitor(ProductionMonitor):
         super().__init__(*args, **kwargs)
         self.updates: list[object] = []
 
-    def update(self, observation):
+    def update(self, observation, **kwargs):
         self.updates.append(observation)
-        return super().update(observation)
+        return super().update(observation, **kwargs)
 
 
 def _canary_settings() -> CanarySettings:
@@ -328,7 +353,6 @@ def _metadata_for(episode) -> TaskMetadata:
     return TaskMetadata(signal="task_success", completion_index=0)
 
 
-@unittest.skipUnless(TestClient is not None, "fastapi is not installed")
 class ServiceUnitTests(unittest.TestCase):
     def setUp(self) -> None:
         from llm_behavior_ci.service import (
@@ -404,6 +428,7 @@ class ServiceUnitTests(unittest.TestCase):
             shutdown_timeout_seconds=shutdown_timeout_seconds,
             metadata_for=_metadata_for,
             canary_settings=_canary_settings(),
+            canary_assignment_seed=0,
         )
 
     def _client(self, dependencies=None):
@@ -673,6 +698,7 @@ class ServiceUnitTests(unittest.TestCase):
                 task_id="task-1",
                 mode="plan",
                 role="production",
+                assignment_key=None,
             )
 
             def first() -> None:

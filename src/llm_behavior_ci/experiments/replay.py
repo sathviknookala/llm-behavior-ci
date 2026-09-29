@@ -19,23 +19,20 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from llm_behavior_ci.config import MonitorSettings, StoppingRule
+from llm_behavior_ci.lifecycle.detectors import (
+    BOUNDED_SIGNALS,
+    CORRECTIONS,
+    MONITOR_RULE_NAMES,
+    DetectorConstructionError,
+    build_detector,
+    build_harmful_shift_adapter,
+    build_hourly_window_detector,
+)
 from llm_behavior_ci.lifecycle.monitoring import FrozenReference
 from llm_behavior_ci.records import MonitorObservation
-from llm_behavior_ci.stats.adwin import ADWIN
-from llm_behavior_ci.stats.chi_square import ChiSquareError, chi_square_homogeneity
-from llm_behavior_ci.stats.confidence_sequence import BoundedMeanCS
-from llm_behavior_ci.stats.cusum import CUSUM
-from llm_behavior_ci.stats.e_detector import BettingEDetector
-from llm_behavior_ci.stats.evidence import Detector, Evidence, PairedSuccess, StatisticsError
-from llm_behavior_ci.stats.harmful_shift import HarmfulShiftTest
-from llm_behavior_ci.stats.ks import KSError, ks_two_sample
+from llm_behavior_ci.stats.evidence import Detector
 
-_DELAYED_SIGNALS = frozenset({"task_success", "requirement_fraction"})
-_BOUNDED_SIGNALS = _DELAYED_SIGNALS
-_MONITOR_RULE_NAMES = frozenset(
-    {"cusum", "adwin", "e_detector", "bounded_mean_cs"}
-)
-_CORRECTIONS = frozenset({"none", "bonferroni"})
+_DELAYED_SIGNALS = BOUNDED_SIGNALS
 
 
 class ReplayError(ValueError):
@@ -353,54 +350,6 @@ def replay_detectors(
     return results
 
 
-def _bounds(signal: str, baseline: float) -> tuple[float, float]:
-    if signal in _BOUNDED_SIGNALS:
-        return (0.0, 1.0)
-    return (0.0, max(baseline * 4.0, 1.0))
-
-
-def _build_monitor_detector(
-    rule: StoppingRule,
-    *,
-    signal: str,
-    baseline: float,
-) -> Detector:
-    if rule.name == "cusum":
-        if rule.threshold is None:
-            raise ReplayError("cusum requires a threshold")
-        direction = "decrease" if signal in _BOUNDED_SIGNALS else "increase"
-        return CUSUM(
-            target=baseline,
-            slack=0.0,
-            threshold=rule.threshold,
-            direction=direction,
-        )
-    if rule.name == "adwin":
-        return ADWIN(delta=rule.alpha)
-    lower, upper = _bounds(signal, baseline)
-    if rule.name == "e_detector":
-        if not lower < baseline < upper:
-            raise ReplayError(
-                "e_detector null_mean must lie strictly inside (lower, upper)"
-            )
-        direction = "below" if signal in _BOUNDED_SIGNALS else "above"
-        return BettingEDetector(
-            null_mean=baseline,
-            alpha=rule.alpha,
-            lower=lower,
-            upper=upper,
-            direction=direction,
-        )
-    if rule.name == "bounded_mean_cs":
-        return BoundedMeanCS(
-            alpha=rule.alpha,
-            lower=lower,
-            upper=upper,
-            null_mean=baseline,
-        )
-    raise ReplayError(f"unknown stopping rule: {rule.name}")
-
-
 def _baseline_for_signal(
     reference: FrozenReference,
     signal: str,
@@ -448,122 +397,6 @@ def _finite_sample(values: Sequence[float], name: str) -> tuple[float, ...]:
     return tuple(converted)
 
 
-def _histogram(values: Sequence[float], baseline: float) -> tuple[int, int]:
-    low = 0
-    high = 0
-    for value in values:
-        if value <= baseline:
-            low += 1
-        else:
-            high += 1
-    return (low, high)
-
-
-class _HourlyWindowDetector:
-    """Fixed-episode-window adapter over ``ks_two_sample`` or chi-square."""
-
-    def __init__(
-        self,
-        *,
-        method: str,
-        alpha: float,
-        window_episodes: int,
-        reference_sample: Sequence[float],
-        baseline: float,
-        correction: str,
-        kind: str,
-    ) -> None:
-        self._method = method
-        self._alpha = alpha
-        self._window_episodes = window_episodes
-        self._reference = tuple(float(item) for item in reference_sample)
-        self._baseline = baseline
-        self._correction = correction
-        self._kind = kind
-        self._window: list[float] = []
-        self._looks = 0
-        self._sample_size = 0
-
-    def _p_value(self) -> float | None:
-        if not self._window:
-            return None
-        if self._kind == "ks":
-            try:
-                return ks_two_sample(self._reference, self._window).p_value
-            except KSError:
-                return None
-        left = _histogram(self._reference, self._baseline)
-        right = _histogram(self._window, self._baseline)
-        try:
-            return chi_square_homogeneity(left, right).p_value
-        except ChiSquareError:
-            return None
-
-    def update(self, observation: float) -> Evidence:
-        self._window.append(float(observation))
-        self._sample_size += 1
-        alarm = False
-        p_value: float | None = None
-        if len(self._window) >= self._window_episodes:
-            self._looks += 1
-            p_value = self._p_value()
-            if p_value is not None:
-                if self._correction == "bonferroni":
-                    adjusted = min(1.0, p_value * self._looks)
-                    alarm = adjusted <= self._alpha
-                else:
-                    alarm = p_value <= self._alpha
-            self._window.clear()
-        return Evidence(
-            method=self._method,
-            estimate=0.0 if p_value is None else p_value,
-            sample_size=self._sample_size,
-            alarm=alarm,
-            boundary=self._alpha,
-            p_value=p_value,
-            details=(),
-        )
-
-    def reset(self) -> None:
-        self._window.clear()
-        self._looks = 0
-        self._sample_size = 0
-
-    def snapshot(self) -> Mapping[str, object]:
-        return {
-            "method": self._method,
-            "sample_size": self._sample_size,
-            "looks": self._looks,
-            "window_size": len(self._window),
-            "alarm": False,
-        }
-
-
-class _HarmfulShiftFloatAdapter:
-    """Map a paired difference float onto ``HarmfulShiftTest``."""
-
-    def __init__(self, *, alpha: float, harm_margin: float) -> None:
-        self._test = HarmfulShiftTest(alpha=alpha, harm_margin=harm_margin)
-
-    def update(self, observation: float) -> Evidence:
-        if isinstance(observation, bool) or not isinstance(observation, (int, float)):
-            raise StatisticsError("paired difference must be a finite float in [-1, 1]")
-        value = float(observation)
-        if not math.isfinite(value) or not -1.0 <= value <= 1.0:
-            raise StatisticsError("paired difference must be a finite float in [-1, 1]")
-        paired = PairedSuccess(
-            candidate=max(value, 0.0),
-            reference=max(-value, 0.0),
-        )
-        return self._test.update(paired)
-
-    def reset(self) -> None:
-        self._test.reset()
-
-    def snapshot(self) -> Mapping[str, object]:
-        return self._test.snapshot()
-
-
 def monitoring_detector_factories(
     settings: MonitorSettings,
     reference: FrozenReference,
@@ -577,8 +410,8 @@ def monitoring_detector_factories(
 ) -> dict[str, Callable[[], Detector]]:
     """Build fresh detector factories for one monitor signal.
 
-    Parameter mapping for cusum, adwin, e_detector, and bounded_mean_cs
-    duplicates ``lifecycle.monitoring`` ``_build_detector`` and ``_bounds``.
+    Scalar sequential detectors and fixed-window adapters are built
+    through ``lifecycle.detectors``.
     """
 
     if not isinstance(settings, MonitorSettings):
@@ -604,13 +437,13 @@ def monitoring_detector_factories(
     if not isinstance(corrections, tuple):
         raise ReplayError("corrections must be a tuple")
     for item in corrections:
-        if item not in _CORRECTIONS:
+        if item not in CORRECTIONS:
             raise ReplayError("corrections may contain only none and/or bonferroni")
     baseline = _baseline_for_signal(reference, signal)
     factories: dict[str, Callable[[], Detector]] = {}
     seen_rules: set[str] = set()
     for rule in settings.stopping_rules:
-        if rule.name not in _MONITOR_RULE_NAMES:
+        if rule.name not in MONITOR_RULE_NAMES:
             continue
         if rule.name in seen_rules:
             raise ReplayError(f"duplicate stopping rule name: {rule.name}")
@@ -622,39 +455,67 @@ def monitoring_detector_factories(
             bound_signal: str = signal,
             bound_baseline: float = baseline,
         ) -> Detector:
-            return _build_monitor_detector(
-                bound_rule,
-                signal=bound_signal,
-                baseline=bound_baseline,
-            )
+            try:
+                return build_detector(
+                    bound_rule,
+                    signal=bound_signal,
+                    baseline=bound_baseline,
+                )
+            except DetectorConstructionError as error:
+                raise ReplayError(str(error)) from error
 
         factories[rule.name] = _factory
     unique_corrections = tuple(dict.fromkeys(corrections))
     for correction in unique_corrections:
-        for kind, method, prefix in (
-            ("ks", "ks_hourly", "ks_hourly"),
-            ("chi_square", "chi_square_hourly", "chi_square_hourly"),
+        if correction == "none":
+            correction_token: str = "none"
+        else:
+            correction_token = "bonferroni"
+        for kind, prefix in (
+            ("ks", "ks_hourly"),
+            ("chi_square", "chi_square_hourly"),
         ):
-            name = f"{prefix}_{correction}"
+            name = f"{prefix}_{correction_token}"
 
             def _window_factory(
-                bound_method: str = method,
                 bound_kind: str = kind,
-                bound_correction: str = correction,
+                bound_correction: str = correction_token,
                 bound_alpha: float = alpha_value,
                 bound_window: int = window_value,
                 bound_sample: tuple[float, ...] = sample,
                 bound_baseline: float = baseline,
+                bound_signal: str = signal,
             ) -> Detector:
-                return _HourlyWindowDetector(
-                    method=bound_method,
-                    alpha=bound_alpha,
-                    window_episodes=bound_window,
-                    reference_sample=bound_sample,
-                    baseline=bound_baseline,
-                    correction=bound_correction,
-                    kind=bound_kind,
-                )
+                try:
+                    if bound_kind == "ks":
+                        return build_hourly_window_detector(
+                            kind="ks",
+                            correction=(
+                                "none"
+                                if bound_correction == "none"
+                                else "bonferroni"
+                            ),
+                            alpha=bound_alpha,
+                            window_episodes=bound_window,
+                            reference_sample=bound_sample,
+                            baseline=bound_baseline,
+                            signal=bound_signal,
+                        )
+                    return build_hourly_window_detector(
+                        kind="chi_square",
+                        correction=(
+                            "none"
+                            if bound_correction == "none"
+                            else "bonferroni"
+                        ),
+                        alpha=bound_alpha,
+                        window_episodes=bound_window,
+                        reference_sample=bound_sample,
+                        baseline=bound_baseline,
+                        signal=bound_signal,
+                    )
+                except DetectorConstructionError as error:
+                    raise ReplayError(str(error)) from error
 
             factories[name] = _window_factory
 
@@ -662,7 +523,13 @@ def monitoring_detector_factories(
         bound_alpha: float = alpha_value,
         bound_margin: float = margin,
     ) -> Detector:
-        return _HarmfulShiftFloatAdapter(alpha=bound_alpha, harm_margin=bound_margin)
+        try:
+            return build_harmful_shift_adapter(
+                alpha=bound_alpha,
+                harm_margin=bound_margin,
+            )
+        except DetectorConstructionError as error:
+            raise ReplayError(str(error)) from error
 
     factories["harmful_shift"] = _harmful_factory
     return factories

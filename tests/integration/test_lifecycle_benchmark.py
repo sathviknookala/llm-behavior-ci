@@ -19,10 +19,11 @@ from llm_behavior_ci.experiments.benchmark import (
     BenchmarkProgress,
     run_lifecycle_benchmark,
 )
-from llm_behavior_ci.experiments.faults import FaultPatch, FaultSpec, HarmLabel
+from llm_behavior_ci.experiments.faults import FaultPatch, FaultSpec, HarmLabel, load_fault
 from llm_behavior_ci.experiments.protocol import ProtocolSettings, lock_protocol
 from llm_behavior_ci.experiments.validation import AADependenceReport, ValidationReport
 from llm_behavior_ci.lifecycle.monitoring import FrozenReference
+from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs
 from llm_behavior_ci.records import TokenLogprob, assert_public_payload
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
@@ -32,6 +33,8 @@ from llm_behavior_ci.tasks.selection import (
     canonical_task_set_bytes,
     task_set_hash_from_bytes,
 )
+
+_CATALOG = Path(__file__).resolve().parents[2] / "configs" / "faults"
 
 _START = datetime(2026, 9, 27, 15, 0, tzinfo=timezone.utc)
 _PLAN = "1. open the calendar"
@@ -190,10 +193,25 @@ class BenchmarkAgent:
         self._clock = clock
         self._block_on_temperature = block_on_temperature
         self._config: RunConfiguration | None = None
+        self._context: TaskContext | None = None
 
     def begin(self, context: TaskContext, config: RunConfiguration) -> None:
-        del context
+        self._context = context
         self._config = config
+
+    def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
+        del tool_output
+        assert self._context is not None
+        return [
+            {"role": "system", "content": "Emit a plan."},
+            {
+                "role": "user",
+                "content": (
+                    f"{self._context.instruction}\n"
+                    f"{self._context.api_documentation}"
+                ),
+            },
+        ]
 
     def next_turn(self, *, tool_output: str | None) -> AgentTurn:
         del tool_output
@@ -210,6 +228,27 @@ class BenchmarkAgent:
             app_name=None,
             api_name=None,
         )
+
+    def teacher_force_plan(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        plan_text: str,
+    ) -> tuple[tuple[TokenLogprob, ...], ...]:
+        del messages, plan_text
+        return _LOGPROBS
+
+
+def _plan_evidence() -> PlanEvidenceInputs:
+    return PlanEvidenceInputs(
+        plan_format_version="plan-v1",
+        plan_quality_features=("numbered_step_count", "token_count"),
+        plan_quality_weights=(1.0, 0.1),
+        mmd_features=("char_count", "numbered_step_count", "model_step_count"),
+        kl_approximation="top_k",
+        required_statistics=("plan_quality", "kl", "mmd"),
+        validation_provenance="synthetic_fixture",
+    )
 
 
 class CountingFactory:
@@ -420,7 +459,7 @@ def _sets():
     return train_tasks, dev_tasks, test_tasks
 
 
-_GATE_WORLDS = 4
+_GATE_WORLDS = 6
 
 
 class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
@@ -452,6 +491,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 train_tasks=train_tasks,
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
                 checkpoint_path=root / "checkpoint.json",
                 export_path=root / "export.json",
             )
@@ -460,6 +500,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
         self.assertEqual(replicate.gate.status, "completed")
         self.assertEqual(replicate.gate.outcome, "BLOCK")
         self.assertEqual(replicate.gate.classification, "catch")
+        self.assertEqual(replicate.gate.validation_provenance, "synthetic_fixture")
         self.assertEqual(replicate.canary.status, "not_reached")
         self.assertEqual(replicate.canary.reason, "gate_block")
         self.assertEqual(replicate.monitor.status, "not_reached")
@@ -498,6 +539,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 train_tasks=train_tasks,
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
                 checkpoint_path=root / "checkpoint.json",
             )
         replicate = result.replicates[0]
@@ -541,6 +583,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 train_tasks=train_tasks,
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
                 checkpoint_path=root / "checkpoint.json",
             )
         replicate = result.replicates[0]
@@ -586,6 +629,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 train_tasks=train_tasks,
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
                 checkpoint_path=root / "checkpoint.json",
             )
         replicate = result.replicates[0]
@@ -633,12 +677,18 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 train_tasks=train_tasks,
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
                 checkpoint_path=checkpoint,
                 should_interrupt=lambda progress: progress.tier == "canary"
                 and progress.stream_index >= 1,
             )
             self.assertEqual(first.status, "interrupted")
             self.assertTrue(checkpoint.exists())
+            checkpoint_doc = json.loads(checkpoint.read_text(encoding="utf-8"))
+            canary_items = checkpoint_doc["replicates"][
+                "sampling_temperature_one:1|7"
+            ]["canary"]["items"]
+            first_item_count = len(canary_items)
 
             second = run_lifecycle_benchmark(
                 lock,
@@ -647,6 +697,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 train_tasks=train_tasks,
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
                 checkpoint_path=checkpoint,
                 should_interrupt=None,
                 export_path=root / "export.json",
@@ -656,6 +707,13 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
             self.assertEqual(replicate.canary.status, "promoted")
             self.assertEqual(replicate.canary.candidate_episodes_served, 3)
             self.assertEqual(second.candidate_episodes_served, 3)
+            resumed = json.loads(checkpoint.read_text(encoding="utf-8"))
+            resumed_items = resumed["replicates"]["sampling_temperature_one:1|7"][
+                "canary"
+            ]["items"]
+            self.assertGreaterEqual(len(resumed_items), first_item_count)
+            indexes = [item["stream_index"] for item in resumed_items]
+            self.assertEqual(len(indexes), len(set(indexes)))
 
     def test_public_export_and_skip_on_interrupt(self) -> None:
         train_tasks, dev_tasks, test_tasks = _sets()
@@ -686,16 +744,23 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 train_tasks=train_tasks,
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
                 checkpoint_path=root / "checkpoint.json",
                 export_path=export_path,
             )
             self.assertEqual(result.status, "completed")
             self.assertTrue(export_path.exists())
-            payload = json.loads(export_path.read_text(encoding="utf-8"))
+            raw = export_path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
             assert_public_payload(payload)
             metrics = {item["metric"] for item in payload["aggregates"]}
             self.assertIn("canary_not_reached_count", metrics)
             self.assertIn("monitor_not_reached_count", metrics)
+            self.assertNotIn("plan_text", raw)
+            self.assertNotIn("instruction", raw)
+            self.assertNotIn(_PLAN, raw)
+            self.assertNotIn("solve the task", raw)
+            self.assertNotIn("calendar docs", raw)
 
             lock2, baselines2 = _build_lock(
                 root / "lock2",
@@ -727,6 +792,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 train_tasks=train_tasks,
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines2,
+                plan_evidence=_plan_evidence(),
                 checkpoint_path=root / "checkpoint2.json",
                 export_path=interrupt_export,
                 should_interrupt=lambda progress: progress.tier == "canary"
@@ -735,6 +801,119 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
             self.assertEqual(interrupted.status, "interrupted")
             self.assertFalse(interrupt_export.exists())
 
+    def test_live_unavailable_fault_reported_not_omitted(self) -> None:
+        train_tasks, dev_tasks, test_tasks = _sets()
+        fault = load_fault(_CATALOG / "fp8_weights.v1.json")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            train = RunConfiguration.from_dict(
+                _payload(split="train", task_set=train_tasks)
+            )
+            dev = RunConfiguration.from_dict(_payload(split="dev", task_set=dev_tasks))
+            test_normal = RunConfiguration.from_dict(
+                _payload(split="test_normal", task_set=test_tasks)
+            )
+            reference_hash = run_configuration_hash(test_normal)
+            settings = ProtocolSettings(
+                configurations=(train, dev, test_normal),
+                task_selections=(train.task, dev.task, test_normal.task),
+                harm_labels=(
+                    HarmLabel(
+                        fault_version=fault.fault_version,
+                        base_configuration_hash=_HASH_A,
+                        candidate_configuration_hash=_HASH_B,
+                        task_set_hash=dev_tasks.task_set_hash,
+                        effect_estimate=-0.2,
+                        interval_low=-0.25,
+                        interval_high=-0.15,
+                        margin=0.1,
+                        harmful=True,
+                        split="dev",
+                        confidence_level=0.9,
+                        resamples=25,
+                        seed=3,
+                    ),
+                ),
+                validation_reports=(_report(),),
+                gate=GateSettings(
+                    confidence_level=0.9,
+                    bootstrap_resamples=20,
+                    score_margin=-0.02,
+                    kl_limit_nats=0.05,
+                    mmd_bandwidth=1.0,
+                    mmd_permutations=19,
+                    mmd_alpha=0.05,
+                    plan_format_version="plan-v1",
+                ),
+                canary=CanarySettings(
+                    fraction=1.0,
+                    outcome_delay_seconds=0.0,
+                    harm_margin=0.1,
+                    stopping_rule=StoppingRule(
+                        name="sequential_canary",
+                        alpha=0.5,
+                        horizon_episodes=3,
+                    ),
+                ),
+                monitor=MonitorSettings(
+                    reference_configuration_hash=reference_hash,
+                    outcome_delay_seconds=0.0,
+                    signals=("task_success",),
+                    stopping_rules=(
+                        StoppingRule(
+                            name="cusum",
+                            alpha=0.1,
+                            horizon_episodes=2,
+                            threshold=0.5,
+                        ),
+                    ),
+                ),
+                stream=StreamSettings(
+                    split=test_tasks.split,
+                    selection_rule=test_tasks.selection_rule,
+                    selection_seed=test_tasks.selection_seed,
+                    task_set_hash=test_tasks.task_set_hash,
+                    stream_seed=3,
+                    arrival_rate_per_second=1.0,
+                    concurrency=1,
+                    with_replacement=True,
+                    task_mix_rule="uniform",
+                ),
+                analysis_version="benchmark-test-v1",
+                seeds=(7,),
+            )
+            lock = lock_protocol(settings, root / "protocol.lock.json")
+            baselines = FrozenReference(
+                configuration_hash=reference_hash,
+                baselines=(("task_success", 0.9),),
+            )
+            clock = Clock()
+            runtime = RuntimeDependencies(
+                session_factory=lambda task_id: World(task_id, success=True),
+                agent=BenchmarkAgent(clock, block_on_temperature=False),
+                clock=clock,
+            )
+            result = run_lifecycle_benchmark(
+                lock,
+                (fault,),
+                runtime=runtime,
+                train_tasks=train_tasks,
+                test_normal_tasks=test_tasks,
+                reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
+                checkpoint_path=root / "checkpoint.json",
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(result.replicates), 1)
+        replicate = result.replicates[0]
+        self.assertEqual(replicate.fault_version, fault.fault_version)
+        self.assertEqual(replicate.gate.status, "unavailable")
+        self.assertIsNotNone(replicate.gate.reason)
+        self.assertIn("quantization", replicate.gate.reason)
+        self.assertEqual(replicate.canary.status, "unavailable")
+        self.assertEqual(replicate.monitor.status, "unavailable")
+
 
 if __name__ == "__main__":
     unittest.main()
+

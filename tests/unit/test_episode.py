@@ -14,9 +14,12 @@ from llm_behavior_ci.runtime.appworld import (
     TaskContext,
     ToolResult,
 )
+from llm_behavior_ci.runtime.agent import VLLMAgent, action_execution_backend
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
     RuntimeDependencies,
+    RuntimeUnavailable,
+    build_runtime,
     run_episode,
 )
 
@@ -452,3 +455,39 @@ class EpisodeRunnerTests(unittest.TestCase):
         self.assertEqual(result.tool_steps[0].error.message, "missing")
         self.assertEqual(agent.tool_outputs[1], "missing")
         self.assertTrue(result.evaluator_outcome.success)
+
+    def test_execute_mode_sends_actions_through_session_execute(self) -> None:
+        config = _config()
+        clock = _clock()
+        session = FakeSession()
+        agent = FakeAgent(
+            [
+                _turn(_ACTION, action=_ACTION),
+                _turn("STOP", action=None),
+            ],
+            clock=clock,
+        )
+        run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(session.actions, [_ACTION])
+        self.assertEqual(action_execution_backend(), "appworld_session.execute")
+
+    def test_build_runtime_uses_endpoint_and_rejects_unknown_prompt(self) -> None:
+        config = _config()
+        runtime = build_runtime(config, "http://127.0.0.1:9", mode="plan")
+        self.assertIsInstance(runtime.agent, VLLMAgent)
+        self.assertEqual(runtime.agent.base_url, "http://127.0.0.1:9")
+        bad = replace(
+            config,
+            agent=replace(
+                config.agent,
+                prompt=replace(config.agent.prompt, prompt_version="prompt-missing"),
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeUnavailable, "unknown prompt_version"):
+            build_runtime(bad, "http://127.0.0.1:9")

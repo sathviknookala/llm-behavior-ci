@@ -4,12 +4,15 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from llm_behavior_ci.config import MonitorSettings, StoppingRule
+from llm_behavior_ci.lifecycle.detectors import build_detector
 from llm_behavior_ci.lifecycle.monitoring import (
     FrozenReference,
+    LocalAlertSink,
     ProductionMonitor,
     TaskMetadata,
     observation_from_episode,
 )
+from llm_behavior_ci.experiments.replay import monitoring_detector_factories
 from llm_behavior_ci.records import (
     EpisodeIdentity,
     EpisodeResult,
@@ -221,6 +224,65 @@ class ProductionMonitorIntegrationTests(unittest.TestCase):
         self.assertEqual(promoted[0].reference_configuration_hash, _HASH_B)
         self.assertEqual(promoted[0].configuration_hash, _HASH_B)
         assert_public_payload(promoted[0].to_public_dict())
+
+    def test_shared_factory_and_local_sink_on_alarm_stream(self) -> None:
+        rule = StoppingRule(
+            name="cusum",
+            alpha=0.1,
+            horizon_episodes=50,
+            threshold=0.5,
+        )
+        settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success",),
+            stopping_rules=(rule,),
+        )
+        reference = FrozenReference(
+            configuration_hash=_HASH_A,
+            baselines=(("task_success", 0.9),),
+        )
+        shared = build_detector(rule, signal="task_success", baseline=0.9)
+        factories = monitoring_detector_factories(
+            settings,
+            reference,
+            signal="task_success",
+            alpha=0.05,
+            window_episodes=2,
+            reference_sample=(1.0, 0.0),
+            harm_margin=0.1,
+            corrections=("none",),
+        )
+        self.assertEqual(shared.snapshot(), factories["cusum"]().snapshot())
+        clock_time = {"now": _END + timedelta(seconds=1)}
+
+        def clock() -> datetime:
+            return clock_time["now"]
+
+        monitor = ProductionMonitor(
+            settings,
+            reference,
+            clock=clock,
+            dedup_seconds=60.0,
+            period_id="production-window",
+        )
+        sink = LocalAlertSink(dedup_seconds=60.0)
+        for index, token in enumerate(("2" * 32, "3" * 32)):
+            alerts = monitor.update(
+                observation_from_episode(
+                    _episode(success=False, episode_token=token),
+                    task_metadata=TaskMetadata(
+                        signal="task_success",
+                        completion_index=index,
+                    ),
+                ),
+                completion_index=index,
+                period_id="production-window",
+            )
+            sink.deliver(alerts)
+            clock_time["now"] = clock_time["now"] + timedelta(seconds=1)
+        self.assertEqual(len(sink.delivered), 1)
+        self.assertEqual(monitor.reference.baselines, reference.baselines)
 
 
 if __name__ == "__main__":

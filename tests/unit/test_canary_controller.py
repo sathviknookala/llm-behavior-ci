@@ -9,7 +9,11 @@ from llm_behavior_ci.config import (
     new_run_identity,
     run_configuration_hash,
 )
-from llm_behavior_ci.lifecycle.canary import CanaryController, CanaryRejected
+from llm_behavior_ci.lifecycle.canary import (
+    CanaryController,
+    CanaryRejected,
+    assign_canary,
+)
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import (
     EvaluationResult,
@@ -504,6 +508,184 @@ class CanaryControllerTests(unittest.TestCase):
             controller.observe(forged)
         after = controller.snapshot()
         self.assertEqual(after, before)
+
+    def test_assign_canary_stable_and_tracks_fraction(self) -> None:
+        key = "task-42:scenario-a"
+        first = assign_canary(key, fraction=0.5, seed=17)
+        second = assign_canary(key, fraction=0.5, seed=17)
+        self.assertEqual(first, second)
+        self.assertTrue(
+            any(
+                assign_canary(f"key-{index}", fraction=0.5, seed=17)
+                != assign_canary(f"key-{index}", fraction=0.5, seed=18)
+                for index in range(64)
+            )
+        )
+        with self.assertRaises(CanaryRejected):
+            assign_canary(key, fraction=0.0, seed=1)
+        with self.assertRaises(CanaryRejected):
+            assign_canary(key, fraction=1.1, seed=1)
+        hits = sum(
+            1
+            for index in range(400)
+            if assign_canary(f"key-{index}", fraction=0.5, seed=99)
+        )
+        self.assertGreater(hits, 50)
+        self.assertLess(hits, 350)
+
+    def test_manual_and_automatic_rollback_share_transition(self) -> None:
+        reference_hash = run_configuration_hash(_reference())
+
+        manual, reference, candidate, _clock = _controller(
+            settings=_settings(
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=5,
+                )
+            )
+        )
+        manual.start(_passing_gate(reference, candidate))
+        manual.begin_candidate_episode()
+        before = manual.snapshot()
+        self.assertEqual(before.outstanding, 1)
+        decision = manual.rollback("operator_request", manual=True)
+        self.assertEqual(decision.action, "rollback")
+        self.assertEqual(decision.state, "ROLLED_BACK")
+        snap = decision.snapshot
+        self.assertTrue(snap.rollback_manual)
+        self.assertEqual(snap.rollback_reason, "operator_request")
+        self.assertEqual(snap.serving_configuration_hash, reference_hash)
+        self.assertEqual(snap.previous_production_configuration_hash, reference_hash)
+        self.assertEqual(snap.in_flight_at_rollback, 1)
+        self.assertEqual(snap.served_before_rollback, 1)
+        with self.assertRaises(CanaryRejected):
+            manual.begin_candidate_episode()
+
+        automatic, reference, candidate, clock = _controller()
+        automatic.start(_passing_gate(reference, candidate))
+        automatic.begin_candidate_episode()
+        automatic.begin_candidate_episode()
+        pair = _run_execute_pair(
+            reference,
+            candidate,
+            clock,
+            candidate_success=False,
+        )
+        auto_decision = automatic.observe(pair)
+        self.assertEqual(auto_decision.action, "rollback")
+        auto_snap = auto_decision.snapshot
+        self.assertFalse(auto_snap.rollback_manual)
+        self.assertEqual(auto_snap.rollback_reason, "stopping_rule_alarm")
+        self.assertEqual(auto_snap.serving_configuration_hash, reference_hash)
+        with self.assertRaises(CanaryRejected):
+            automatic.begin_candidate_episode()
+
+    def test_complete_outstanding_after_rollback_does_not_double_count(self) -> None:
+        controller, reference, candidate, clock = _controller(
+            settings=_settings(
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=5,
+                )
+            )
+        )
+        controller.start(_passing_gate(reference, candidate))
+        controller.begin_candidate_episode()
+        controller.begin_candidate_episode()
+        first = _run_execute_pair(reference, candidate, clock)
+        decision = controller.observe(first)
+        self.assertEqual(decision.action, "continue")
+        rolled = controller.rollback("operator_request", manual=True)
+        self.assertEqual(rolled.snapshot.outstanding, 1)
+        self.assertEqual(rolled.snapshot.candidate_episodes_served, 1)
+        second = _run_execute_pair(reference, candidate, clock)
+        after = controller.complete_outstanding(second)
+        self.assertEqual(after.outstanding, 0)
+        self.assertEqual(after.candidate_episodes_served, 2)
+        self.assertEqual(after.state, "ROLLED_BACK")
+        with self.assertRaises(CanaryRejected):
+            controller.complete_outstanding(second)
+        self.assertEqual(controller.snapshot().candidate_episodes_served, 2)
+        self.assertEqual(controller.snapshot().outstanding, 0)
+
+    def test_abort_outstanding_clears_begin_without_pair(self) -> None:
+        controller, reference, candidate, _clock = _controller(
+            settings=_settings(
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=5,
+                )
+            )
+        )
+        controller.start(_passing_gate(reference, candidate))
+        controller.begin_candidate_episode()
+        self.assertEqual(controller.snapshot().outstanding, 1)
+        after = controller.abort_outstanding()
+        self.assertEqual(after.outstanding, 0)
+        self.assertEqual(after.candidate_episodes_served, 0)
+        self.assertEqual(after.candidate_episodes_failed, 0)
+        self.assertEqual(after.candidate_episodes_evaluator_unsuccessful, 0)
+        self.assertEqual(after.state, "CANARY_ACTIVE")
+
+    def test_evaluator_and_runtime_failures_use_separate_counters(self) -> None:
+        controller, reference, candidate, clock = _controller(
+            settings=_settings(
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=5,
+                )
+            )
+        )
+        controller.start(_passing_gate(reference, candidate))
+        controller.begin_candidate_episode()
+        runtime_pair = _run_execute_pair(
+            reference,
+            candidate,
+            clock,
+            candidate_fail=True,
+        )
+        runtime_decision = controller.observe(runtime_pair)
+        self.assertEqual(runtime_decision.action, "continue")
+        runtime_snap = runtime_decision.snapshot
+        self.assertEqual(runtime_snap.candidate_episodes_failed, 1)
+        self.assertEqual(runtime_snap.candidate_episodes_evaluator_unsuccessful, 0)
+
+        controller.begin_candidate_episode()
+        eval_pair = _run_execute_pair(
+            reference,
+            candidate,
+            clock,
+            candidate_success=False,
+        )
+        self.assertEqual(eval_pair.candidate.status, "completed")
+        self.assertIsNotNone(eval_pair.candidate.evaluator_outcome)
+        assert eval_pair.candidate.evaluator_outcome is not None
+        self.assertFalse(eval_pair.candidate.evaluator_outcome.success)
+        eval_decision = controller.observe(eval_pair)
+        self.assertEqual(eval_decision.action, "continue")
+        eval_snap = eval_decision.snapshot
+        self.assertEqual(eval_snap.candidate_episodes_failed, 1)
+        self.assertEqual(eval_snap.candidate_episodes_evaluator_unsuccessful, 1)
+
+    def test_promotion_records_monitor_reset_identity(self) -> None:
+        controller, reference, candidate, clock = _controller()
+        reference_hash = run_configuration_hash(reference)
+        candidate_hash = run_configuration_hash(candidate)
+        controller.start(_passing_gate(reference, candidate))
+        controller.begin_candidate_episode()
+        decision = controller.observe(_run_execute_pair(reference, candidate, clock))
+        self.assertEqual(decision.action, "promote")
+        snap = decision.snapshot
+        self.assertTrue(snap.monitoring_reset_required)
+        self.assertEqual(snap.previous_production_configuration_hash, reference_hash)
+        self.assertEqual(snap.promoted_configuration_hash, candidate_hash)
+        self.assertEqual(snap.serving_configuration_hash, candidate_hash)
+        with self.assertRaises(CanaryRejected):
+            controller.begin_candidate_episode()
 
 
 if __name__ == "__main__":

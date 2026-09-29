@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from llm_behavior_ci.config import (
     EpisodeIdentity,
@@ -9,9 +11,15 @@ from llm_behavior_ci.config import (
     RunIdentity,
     StoppingRule,
 )
+from llm_behavior_ci.experiments.replay import monitoring_detector_factories
+from llm_behavior_ci.lifecycle.detectors import (
+    DetectorConstructionError,
+    build_detector,
+)
 from llm_behavior_ci.lifecycle.monitoring import (
     Alert,
     FrozenReference,
+    LocalAlertSink,
     MissingEvaluatorOutcome,
     MonitorRejected,
     NormalizedEpisode,
@@ -21,17 +29,21 @@ from llm_behavior_ci.lifecycle.monitoring import (
     UndefinedRequirementFraction,
     normalize_episode,
     observation_from_episode,
+    task_mix_observation_from_episode,
+    tool_selection_observation_from_episode,
 )
 from llm_behavior_ci.records import (
     EpisodeResult,
     EvaluatorOutcome,
     LocalTaskRef,
     ModelStep,
+    RecordError,
     RecordedError,
     TokenLogprob,
     ToolStep,
     assert_public_payload,
 )
+from llm_behavior_ci.storage import EpisodeStore
 
 _HASH_A = "a" * 64
 _HASH_B = "b" * 64
@@ -324,6 +336,224 @@ class ProductionMonitorUnitTests(unittest.TestCase):
         self.assertEqual(payload["slice_name"], "task_success")
         self.assertNotIn("task_id", payload)
         self.assertNotIn("episode_id", payload)
+
+    def test_shared_factory_matches_replay_and_rejects_unsupported(self) -> None:
+        rule = StoppingRule(
+            name="cusum",
+            alpha=0.1,
+            horizon_episodes=20,
+            threshold=0.5,
+        )
+        left = build_detector(rule, signal="task_success", baseline=0.9)
+        settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success",),
+            stopping_rules=(rule,),
+        )
+        reference = FrozenReference(
+            configuration_hash=_HASH_A,
+            baselines=(("task_success", 0.9),),
+        )
+        factories = monitoring_detector_factories(
+            settings,
+            reference,
+            signal="task_success",
+            alpha=0.05,
+            window_episodes=2,
+            reference_sample=(1.0, 0.0),
+            harm_margin=0.1,
+            corrections=("none",),
+        )
+        right = factories["cusum"]()
+        self.assertEqual(left.snapshot(), right.snapshot())
+        with self.assertRaises(DetectorConstructionError):
+            build_detector(rule, signal="tool_selection", baseline=0.9)
+
+    def test_distributional_observation_rejected_as_scalar(self) -> None:
+        episode = _episode(
+            tool_steps=(_tool_step(1),),
+        )
+        with self.assertRaises(MonitorRejected):
+            observation_from_episode(
+                episode,
+                task_metadata=_metadata("tool_selection"),
+            )
+        with self.assertRaises(RecordError):
+            from llm_behavior_ci.records import MonitorObservation
+
+            MonitorObservation(
+                episode=episode.episode,
+                run=episode.run,
+                split=episode.task.split,
+                signal="tool_selection",
+                value=1.0,
+                observed_at=_END,
+            )
+        selection = tool_selection_observation_from_episode(
+            episode,
+            task_metadata=_metadata(task_mix="difficulty:2"),
+        )
+        mix = task_mix_observation_from_episode(
+            episode,
+            task_metadata=_metadata(task_mix="difficulty:2"),
+        )
+        settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success",),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=20,
+                    threshold=0.5,
+                ),
+            ),
+        )
+        monitor = ProductionMonitor(
+            settings,
+            FrozenReference(
+                configuration_hash=_HASH_A,
+                baselines=(("task_success", 0.9),),
+            ),
+            clock=lambda: _END,
+            dedup_seconds=0.0,
+        )
+        with self.assertRaises(MonitorRejected):
+            monitor.update(selection)  # type: ignore[arg-type]
+        with self.assertRaises(MonitorRejected):
+            monitor.update(mix)  # type: ignore[arg-type]
+
+    def test_baseline_unchanged_after_updates(self) -> None:
+        settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success",),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=20,
+                    threshold=0.5,
+                ),
+            ),
+        )
+        reference = FrozenReference(
+            configuration_hash=_HASH_A,
+            baselines=(("task_success", 0.9),),
+        )
+        monitor = ProductionMonitor(
+            settings,
+            reference,
+            clock=lambda: _END + timedelta(seconds=1),
+            dedup_seconds=0.0,
+        )
+        original = reference.baselines
+        monitor.update(
+            observation_from_episode(
+                _episode(
+                    evaluator_outcome=EvaluatorOutcome(
+                        success=False,
+                        passed_requirements=0,
+                        total_requirements=2,
+                        difficulty=2,
+                    )
+                ),
+                task_metadata=_metadata("task_success"),
+            )
+        )
+        monitor.update(
+            observation_from_episode(
+                _episode(
+                    episode_token="3" * 32,
+                    evaluator_outcome=EvaluatorOutcome(
+                        success=True,
+                        passed_requirements=2,
+                        total_requirements=2,
+                        difficulty=2,
+                    ),
+                ),
+                task_metadata=_metadata("task_success"),
+            )
+        )
+        self.assertEqual(monitor.reference.baselines, original)
+        self.assertIs(monitor.reference, reference)
+
+    def test_period_mismatch_rejected(self) -> None:
+        settings = MonitorSettings(
+            reference_configuration_hash=_HASH_A,
+            outcome_delay_seconds=0.0,
+            signals=("task_success",),
+            stopping_rules=(
+                StoppingRule(
+                    name="cusum",
+                    alpha=0.1,
+                    horizon_episodes=20,
+                    threshold=0.5,
+                ),
+            ),
+        )
+        monitor = ProductionMonitor(
+            settings,
+            FrozenReference(
+                configuration_hash=_HASH_A,
+                baselines=(("task_success", 0.9),),
+            ),
+            clock=lambda: _END,
+            dedup_seconds=0.0,
+            period_id="production-1",
+        )
+        observation = observation_from_episode(
+            _episode(
+                evaluator_outcome=EvaluatorOutcome(
+                    success=True,
+                    passed_requirements=2,
+                    total_requirements=2,
+                    difficulty=2,
+                )
+            ),
+            task_metadata=_metadata("task_success"),
+        )
+        with self.assertRaises(MonitorRejected):
+            monitor.update(observation, period_id="canary-1")
+        accepted = monitor.update(observation, period_id="production-1")
+        self.assertEqual(accepted, ())
+
+    def test_local_alert_sink_delivery_and_store_dedup(self) -> None:
+        alert = Alert(
+            configuration_hash=_HASH_A,
+            reference_configuration_hash=_HASH_B,
+            signal="task_success",
+            slice_name="task_success",
+            method="cusum",
+            estimate=1.0,
+            boundary=0.5,
+            sample_size=2,
+            raised_at=_END,
+        )
+        duplicate = Alert(
+            configuration_hash=_HASH_A,
+            reference_configuration_hash=_HASH_B,
+            signal="task_success",
+            slice_name="task_success",
+            method="cusum",
+            estimate=3.0,
+            boundary=0.5,
+            sample_size=4,
+            raised_at=_END + timedelta(seconds=1),
+        )
+        with TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "alerts.sqlite")
+            sink = LocalAlertSink(store, dedup_seconds=60.0)
+            first = sink.deliver((alert,))
+            second = sink.deliver((duplicate,))
+            self.assertEqual(first, (alert,))
+            self.assertEqual(second, (alert,))
+            self.assertEqual(sink.delivered, (alert, alert))
+            self.assertEqual(store.load_alerts(), (alert.to_record(),))
+            self.assertEqual(len(store.load_deployment_decisions()), 1)
+            store.close()
 
 
 if __name__ == "__main__":

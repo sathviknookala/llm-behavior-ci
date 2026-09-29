@@ -804,6 +804,77 @@ def _validate_signal_value(signal: str, value: object) -> None:
 
 
 @dataclass(frozen=True)
+class NamedCount(Record):
+    """One named non-negative count for a distributional observation."""
+
+    name: str
+    count: int
+
+    def __post_init__(self) -> None:
+        _line(self.name, "name")
+        _nonnegative_int(self.count, "count")
+
+
+@dataclass(frozen=True)
+class ToolSelectionObservation(Record):
+    """Local tool-selection counts for one episode.
+
+    Not a ``MONITOR_SIGNALS`` scalar. Counts stay typed and are never
+    coerced into ``MonitorObservation.value``.
+    """
+
+    episode: EpisodeIdentity
+    run: RunIdentity
+    split: str
+    counts: tuple[NamedCount, ...]
+    observed_at: datetime
+    completion_index: int | None = None
+
+    def __post_init__(self) -> None:
+        _kind(self.episode, EpisodeIdentity, "episode")
+        _kind(self.run, RunIdentity, "run")
+        if self.episode.run_id != self.run.run_id:
+            raise RecordError("episode run_id must match the run identity")
+        _choice(self.split, SPLITS, "split")
+        items = _instances(self.counts, NamedCount, "counts")
+        names = [item.name for item in items]
+        if len(names) != len(set(names)):
+            raise RecordError("counts repeats a name")
+        if names != sorted(names):
+            raise RecordError("counts must be sorted by name")
+        _timestamp(self.observed_at, "observed_at")
+        if self.completion_index is not None:
+            _nonnegative_int(self.completion_index, "completion_index")
+
+
+@dataclass(frozen=True)
+class TaskMixObservation(Record):
+    """Local task-mix label for one episode.
+
+    Not a ``MONITOR_SIGNALS`` scalar. The label is caller-supplied and is
+    never coerced into ``MonitorObservation.value``.
+    """
+
+    episode: EpisodeIdentity
+    run: RunIdentity
+    split: str
+    label: str
+    observed_at: datetime
+    completion_index: int | None = None
+
+    def __post_init__(self) -> None:
+        _kind(self.episode, EpisodeIdentity, "episode")
+        _kind(self.run, RunIdentity, "run")
+        if self.episode.run_id != self.run.run_id:
+            raise RecordError("episode run_id must match the run identity")
+        _choice(self.split, SPLITS, "split")
+        _line(self.label, "label")
+        _timestamp(self.observed_at, "observed_at")
+        if self.completion_index is not None:
+            _nonnegative_int(self.completion_index, "completion_index")
+
+
+@dataclass(frozen=True)
 class StatisticalEvidence(Record):
     """A public aggregate from one statistical method.
 
@@ -974,6 +1045,9 @@ _mark(LocalTaskRef, LOCAL, "local task")
 _mark(EpisodeResult, LOCAL, "episode result")
 _mark(PairedResult, LOCAL, "paired result")
 _mark(MonitorObservation, LOCAL, "monitor observation")
+_mark(NamedCount, LOCAL, "named count")
+_mark(ToolSelectionObservation, LOCAL, "tool selection observation")
+_mark(TaskMixObservation, LOCAL, "task mix observation")
 _mark(StatisticalEvidence, PUBLIC, "statistical evidence")
 _mark(LifecycleDecision, PUBLIC, "lifecycle decision")
 _mark(AggregateRecord, PUBLIC, "aggregate record")

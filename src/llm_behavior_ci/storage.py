@@ -1,13 +1,17 @@
 """Local episode log.
 
-Steps are committed as they arrive. An open episode is not an EpisodeResult.
+Steps are committed as they arrive under one writer lock. An open episode
+is not an EpisodeResult. Interrupted open episodes reload with the steps
+already appended. Alert and deployment-decision rows are local only.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -30,11 +34,165 @@ class OpenEpisode:
     steps: tuple[ModelStep | ToolStep, ...]
 
 
+@dataclass(frozen=True)
+class AlertRecord:
+    configuration_hash: str
+    reference_configuration_hash: str
+    signal: str
+    slice_name: str
+    method: str
+    estimate: float
+    boundary: float | None
+    sample_size: int
+    raised_at: datetime
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "configuration_hash": self.configuration_hash,
+            "reference_configuration_hash": self.reference_configuration_hash,
+            "signal": self.signal,
+            "slice_name": self.slice_name,
+            "method": self.method,
+            "estimate": self.estimate,
+            "boundary": self.boundary,
+            "sample_size": self.sample_size,
+            "raised_at": self.raised_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> AlertRecord:
+        if not isinstance(payload, dict):
+            raise StorageError("alert record must be an object")
+        raised_at = payload.get("raised_at")
+        if not isinstance(raised_at, str):
+            raise StorageError("alert record raised_at is invalid")
+        try:
+            parsed = datetime.fromisoformat(raised_at)
+        except ValueError as error:
+            raise StorageError("alert record raised_at is invalid") from error
+        boundary = payload.get("boundary")
+        if boundary is not None and (
+            isinstance(boundary, bool) or not isinstance(boundary, (int, float))
+        ):
+            raise StorageError("alert record boundary is invalid")
+        estimate = payload.get("estimate")
+        sample_size = payload.get("sample_size")
+        if isinstance(estimate, bool) or not isinstance(estimate, (int, float)):
+            raise StorageError("alert record estimate is invalid")
+        if isinstance(sample_size, bool) or not isinstance(sample_size, int):
+            raise StorageError("alert record sample_size is invalid")
+        for key in (
+            "configuration_hash",
+            "reference_configuration_hash",
+            "signal",
+            "slice_name",
+            "method",
+        ):
+            value = payload.get(key)
+            if not isinstance(value, str) or value == "":
+                raise StorageError(f"alert record {key} is invalid")
+        return cls(
+            configuration_hash=str(payload["configuration_hash"]),
+            reference_configuration_hash=str(
+                payload["reference_configuration_hash"]
+            ),
+            signal=str(payload["signal"]),
+            slice_name=str(payload["slice_name"]),
+            method=str(payload["method"]),
+            estimate=float(estimate),
+            boundary=None if boundary is None else float(boundary),
+            sample_size=sample_size,
+            raised_at=parsed,
+        )
+
+
+@dataclass(frozen=True)
+class DeploymentDecisionRecord:
+    configuration_hash: str
+    reference_configuration_hash: str
+    signal: str
+    slice_name: str
+    decision: str
+    method: str
+    estimate: float
+    boundary: float | None
+    sample_size: int
+    decided_at: datetime
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "configuration_hash": self.configuration_hash,
+            "reference_configuration_hash": self.reference_configuration_hash,
+            "signal": self.signal,
+            "slice_name": self.slice_name,
+            "decision": self.decision,
+            "method": self.method,
+            "estimate": self.estimate,
+            "boundary": self.boundary,
+            "sample_size": self.sample_size,
+            "decided_at": self.decided_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> DeploymentDecisionRecord:
+        if not isinstance(payload, dict):
+            raise StorageError("deployment decision must be an object")
+        decided_at = payload.get("decided_at")
+        if not isinstance(decided_at, str):
+            raise StorageError("deployment decision decided_at is invalid")
+        try:
+            parsed = datetime.fromisoformat(decided_at)
+        except ValueError as error:
+            raise StorageError("deployment decision decided_at is invalid") from error
+        boundary = payload.get("boundary")
+        if boundary is not None and (
+            isinstance(boundary, bool) or not isinstance(boundary, (int, float))
+        ):
+            raise StorageError("deployment decision boundary is invalid")
+        estimate = payload.get("estimate")
+        sample_size = payload.get("sample_size")
+        if isinstance(estimate, bool) or not isinstance(estimate, (int, float)):
+            raise StorageError("deployment decision estimate is invalid")
+        if isinstance(sample_size, bool) or not isinstance(sample_size, int):
+            raise StorageError("deployment decision sample_size is invalid")
+        for key in (
+            "configuration_hash",
+            "reference_configuration_hash",
+            "signal",
+            "slice_name",
+            "decision",
+            "method",
+        ):
+            value = payload.get(key)
+            if not isinstance(value, str) or value == "":
+                raise StorageError(f"deployment decision {key} is invalid")
+        return cls(
+            configuration_hash=str(payload["configuration_hash"]),
+            reference_configuration_hash=str(
+                payload["reference_configuration_hash"]
+            ),
+            signal=str(payload["signal"]),
+            slice_name=str(payload["slice_name"]),
+            decision=str(payload["decision"]),
+            method=str(payload["method"]),
+            estimate=float(estimate),
+            boundary=None if boundary is None else float(boundary),
+            sample_size=sample_size,
+            decided_at=parsed,
+        )
+
+
 def _dumps(payload: object) -> str:
     return json.dumps(payload, **_DUMP)
 
 
 class EpisodeStore:
+    """SQLite episode log for one writer.
+
+    All mutating and reading methods take the process-local writer lock.
+    Concurrent writers are unsupported; one thread should own the store.
+    """
+
     def __init__(self, path: Path) -> None:
         if not path.parent.is_dir():
             raise StorageError("parent directory does not exist")
@@ -78,19 +236,44 @@ class EpisodeStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alerts (
+                  alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  signal TEXT NOT NULL,
+                  slice_name TEXT NOT NULL,
+                  method TEXT NOT NULL,
+                  raised_at TEXT NOT NULL,
+                  alert_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deployment_decisions (
+                  decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  decided_at TEXT NOT NULL,
+                  decision_json TEXT NOT NULL
+                )
+                """
+            )
             connection.commit()
         except sqlite3.Error as error:
             raise StorageError("open failed") from error
         self._connection: sqlite3.Connection | None = connection
+        self._lock = threading.Lock()
 
     def _run(self, operation: str, callback: Callable[[sqlite3.Connection], _T]) -> _T:
-        connection = self._connection
-        if connection is None:
-            raise StorageError(f"{operation} failed")
-        try:
-            return callback(connection)
-        except sqlite3.Error as error:
-            raise StorageError(f"{operation} failed") from error
+        with self._lock:
+            connection = self._connection
+            if connection is None:
+                raise StorageError(f"{operation} failed")
+            try:
+                return callback(connection)
+            except StorageError:
+                raise
+            except sqlite3.Error as error:
+                raise StorageError(f"{operation} failed") from error
 
     def start_episode(
         self,
@@ -280,12 +463,142 @@ class EpisodeStore:
 
         return self._run("load_pair", read)
 
+    def append_alert(
+        self,
+        alert: AlertRecord,
+        *,
+        dedup_seconds: float,
+    ) -> AlertRecord:
+        record, _inserted = self.append_alert_with_status(
+            alert,
+            dedup_seconds=dedup_seconds,
+        )
+        return record
+
+    def append_alert_with_status(
+        self,
+        alert: AlertRecord,
+        *,
+        dedup_seconds: float,
+    ) -> tuple[AlertRecord, bool]:
+        if not isinstance(alert, AlertRecord):
+            raise StorageError("append_alert failed")
+        if isinstance(dedup_seconds, bool) or not isinstance(
+            dedup_seconds, (int, float)
+        ):
+            raise StorageError("append_alert failed")
+        window = float(dedup_seconds)
+        if window != window or window < 0.0:
+            raise StorageError("append_alert failed")
+
+        def write(connection: sqlite3.Connection) -> tuple[AlertRecord, bool]:
+            if window > 0.0:
+                rows = connection.execute(
+                    """
+                    SELECT alert_json FROM alerts
+                    WHERE signal = ? AND slice_name = ? AND method = ?
+                    ORDER BY alert_id DESC
+                    """,
+                    (alert.signal, alert.slice_name, alert.method),
+                ).fetchall()
+                for (payload,) in rows:
+                    existing = AlertRecord.from_dict(json.loads(payload))
+                    delta = (alert.raised_at - existing.raised_at).total_seconds()
+                    if 0.0 <= delta < window:
+                        return existing, False
+            connection.execute(
+                """
+                INSERT INTO alerts (
+                  signal, slice_name, method, raised_at, alert_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    alert.signal,
+                    alert.slice_name,
+                    alert.method,
+                    alert.raised_at.isoformat(),
+                    _dumps(alert.to_dict()),
+                ),
+            )
+            connection.commit()
+            return alert, True
+
+        return self._run("append_alert", write)
+
+    def load_alerts(
+        self,
+        *,
+        signal: str | None = None,
+    ) -> tuple[AlertRecord, ...]:
+        def read(connection: sqlite3.Connection) -> tuple[AlertRecord, ...]:
+            if signal is None:
+                rows = connection.execute(
+                    """
+                    SELECT alert_json FROM alerts
+                    ORDER BY alert_id
+                    """
+                ).fetchall()
+            else:
+                if not isinstance(signal, str) or signal == "":
+                    raise StorageError("load_alerts failed")
+                rows = connection.execute(
+                    """
+                    SELECT alert_json FROM alerts
+                    WHERE signal = ?
+                    ORDER BY alert_id
+                    """,
+                    (signal,),
+                ).fetchall()
+            return tuple(
+                AlertRecord.from_dict(json.loads(payload)) for (payload,) in rows
+            )
+
+        return self._run("load_alerts", read)
+
+    def append_deployment_decision(
+        self,
+        decision: DeploymentDecisionRecord,
+    ) -> DeploymentDecisionRecord:
+        if not isinstance(decision, DeploymentDecisionRecord):
+            raise StorageError("append_deployment_decision failed")
+
+        def write(connection: sqlite3.Connection) -> DeploymentDecisionRecord:
+            connection.execute(
+                """
+                INSERT INTO deployment_decisions (decided_at, decision_json)
+                VALUES (?, ?)
+                """,
+                (decision.decided_at.isoformat(), _dumps(decision.to_dict())),
+            )
+            connection.commit()
+            return decision
+
+        return self._run("append_deployment_decision", write)
+
+    def load_deployment_decisions(self) -> tuple[DeploymentDecisionRecord, ...]:
+        def read(
+            connection: sqlite3.Connection,
+        ) -> tuple[DeploymentDecisionRecord, ...]:
+            rows = connection.execute(
+                """
+                SELECT decision_json FROM deployment_decisions
+                ORDER BY decision_id
+                """
+            ).fetchall()
+            return tuple(
+                DeploymentDecisionRecord.from_dict(json.loads(payload))
+                for (payload,) in rows
+            )
+
+        return self._run("load_deployment_decisions", read)
+
     def close(self) -> None:
-        connection = self._connection
-        if connection is None:
-            return
-        self._connection = None
-        try:
-            connection.close()
-        except sqlite3.Error as error:
-            raise StorageError("close failed") from error
+        with self._lock:
+            connection = self._connection
+            if connection is None:
+                return
+            self._connection = None
+            try:
+                connection.close()
+            except sqlite3.Error as error:
+                raise StorageError("close failed") from error

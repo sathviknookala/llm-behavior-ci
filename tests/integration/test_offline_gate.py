@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from llm_behavior_ci.config import GateSettings, RunConfiguration
-from llm_behavior_ci.lifecycle.offline_gate import run_offline_gate
+from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs, run_offline_gate
 from llm_behavior_ci.records import TokenLogprob, assert_public_payload
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
@@ -152,6 +152,20 @@ def _settings(**overrides: object) -> GateSettings:
     return GateSettings(**values)
 
 
+def _evidence(**overrides: object) -> PlanEvidenceInputs:
+    values: dict[str, object] = {
+        "plan_format_version": "plan-v1",
+        "plan_quality_features": ("numbered_step_count", "token_count"),
+        "plan_quality_weights": (1.0, 0.1),
+        "mmd_features": ("char_count", "numbered_step_count", "model_step_count"),
+        "kl_approximation": "top_k",
+        "required_statistics": ("plan_quality", "kl", "mmd"),
+        "validation_provenance": "synthetic_fixture",
+    }
+    values.update(overrides)
+    return PlanEvidenceInputs(**values)
+
+
 class FakeSession:
     def __init__(self, task_id: str) -> None:
         self.task_id = task_id
@@ -177,9 +191,26 @@ class FakeSession:
 class PlanAgent:
     def __init__(self, clock) -> None:
         self._clock = clock
+        self._context = None
+        self.config = None
 
     def begin(self, context: TaskContext, config: RunConfiguration) -> None:
-        del context, config
+        self._context = context
+        self.config = config
+
+    def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
+        del tool_output
+        assert self._context is not None
+        return [
+            {"role": "system", "content": "Emit a plan."},
+            {
+                "role": "user",
+                "content": (
+                    f"{self._context.instruction}\n"
+                    f"{self._context.api_documentation}"
+                ),
+            },
+        ]
 
     def next_turn(self, *, tool_output: str | None) -> AgentTurn:
         del tool_output
@@ -193,6 +224,15 @@ class PlanAgent:
             app_name=None,
             api_name=None,
         )
+
+    def teacher_force_plan(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        plan_text: str,
+    ) -> tuple[tuple[TokenLogprob, ...], ...]:
+        del messages, plan_text
+        return _LOGPROBS
 
 
 def _clock():
@@ -230,13 +270,68 @@ def _task_set_dict(task_set: TaskSet) -> dict[str, object]:
     }
 
 
+def _public_document(decision) -> dict[str, object]:
+    from llm_behavior_ci.records import public_record_dict
+
+    document: dict[str, object] = {
+        "outcome": decision.outcome,
+        "reason_codes": list(decision.reason_codes),
+        "reference_configuration_hash": decision.reference_configuration_hash,
+        "candidate_configuration_hash": decision.candidate_configuration_hash,
+        "task_set_hash": decision.task_set_hash,
+        "reference_protocol_hash": decision.reference_protocol_hash,
+        "candidate_protocol_hash": decision.candidate_protocol_hash,
+        "thresholds": decision.thresholds.to_dict(),
+        "statistics": [
+            public_record_dict(item) for item in decision.statistics
+        ],
+        "public_decision": (
+            public_record_dict(decision.public_decision)
+            if decision.public_decision is not None
+            else None
+        ),
+    }
+    assert_public_payload(document)
+    return document
+
+
 class OfflineGateIntegrationTests(unittest.TestCase):
-    def test_cli_exit_codes_and_public_stdout(self) -> None:
+    def test_library_pass_and_block_public_payload(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        decision = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(),
+            plan_evidence=_evidence(),
+        )
+        self.assertEqual(decision.outcome, "PASS")
+        document = _public_document(decision)
+        self.assertEqual(document["outcome"], "PASS")
+        self.assertEqual(document["reason_codes"], [])
+        self.assertEqual(len(document["statistics"]), 3)
+        self.assertEqual(decision.validation_provenance, "synthetic_fixture")
+
+        blocked = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(score_margin=0.01),
+            runtime=_runtime(),
+            plan_evidence=_evidence(),
+        )
+        self.assertEqual(blocked.outcome, "BLOCK")
+        block_document = _public_document(blocked)
+        self.assertIn("plan_quality_margin", block_document["reason_codes"])
+
+    def test_cli_requires_plan_evidence_argument(self) -> None:
         main = _load_cli_main()
         task_set = _task_set()
         reference = _config(task_set, run_seed=7)
         candidate = _config(task_set, run_seed=8)
-        runtime = _runtime()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             reference_path = root / "reference.json"
@@ -259,42 +354,27 @@ class OfflineGateIntegrationTests(unittest.TestCase):
                 json.dumps(_settings().to_dict()),
                 encoding="utf-8",
             )
-            argv = [
-                "--reference",
-                str(reference_path),
-                "--candidate",
-                str(candidate_path),
-                "--task-set",
-                str(task_set_path),
-                "--settings",
-                str(settings_path),
-            ]
             stdout = io.StringIO()
-            with redirect_stdout(stdout):
-                code = main(argv, runtime=runtime)
-            self.assertEqual(code, 0)
-            document = json.loads(stdout.getvalue())
-            assert_public_payload(document)
-            self.assertEqual(document["outcome"], "PASS")
-            self.assertEqual(document["reason_codes"], [])
-            self.assertEqual(len(document["statistics"]), 3)
-            self.assertNotIn("task-a", stdout.getvalue())
-            self.assertNotIn(_PLAN, stdout.getvalue())
-            self.assertNotIn("scenario-1", stdout.getvalue())
-
-            blocking_settings = _settings(score_margin=0.01)
-            settings_path.write_text(
-                json.dumps(blocking_settings.to_dict()),
-                encoding="utf-8",
-            )
-            stdout = io.StringIO()
-            with redirect_stdout(stdout):
-                code = main(argv, runtime=_runtime())
-            self.assertEqual(code, 1)
-            document = json.loads(stdout.getvalue())
-            assert_public_payload(document)
-            self.assertEqual(document["outcome"], "BLOCK")
-            self.assertIn("plan_quality_margin", document["reason_codes"])
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = main(
+                    [
+                        "--reference",
+                        str(reference_path),
+                        "--candidate",
+                        str(candidate_path),
+                        "--task-set",
+                        str(task_set_path),
+                        "--settings",
+                        str(settings_path),
+                    ],
+                    runtime=_runtime(),
+                )
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertNotEqual(stderr.getvalue().strip(), "")
+            self.assertNotIn('"outcome": "PASS"', stderr.getvalue())
+            self.assertNotIn('"outcome": "BLOCK"', stderr.getvalue())
 
         code = main([])
         self.assertEqual(code, 2)
@@ -347,69 +427,35 @@ class OfflineGateIntegrationTests(unittest.TestCase):
             self.assertNotIn('"outcome": "PASS"', stderr.getvalue())
             self.assertNotIn('"outcome": "BLOCK"', stderr.getvalue())
 
-    def test_gate_and_cli_agree_on_pass(self) -> None:
-        main = _load_cli_main()
+    def test_gate_library_pass_is_stable(self) -> None:
         task_set = _task_set()
         reference = _config(task_set, run_seed=7)
         candidate = _config(task_set, run_seed=8)
-        runtime = _runtime()
         decision = run_offline_gate(
             reference,
             candidate,
             task_set,
             settings=_settings(),
-            runtime=runtime,
+            runtime=_runtime(),
+            plan_evidence=_evidence(),
         )
         self.assertEqual(decision.outcome, "PASS")
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            paths = {
-                "reference": root / "reference.json",
-                "candidate": root / "candidate.json",
-                "task_set": root / "task_set.json",
-                "settings": root / "settings.json",
-            }
-            paths["reference"].write_text(
-                json.dumps(reference.to_dict()),
-                encoding="utf-8",
-            )
-            paths["candidate"].write_text(
-                json.dumps(candidate.to_dict()),
-                encoding="utf-8",
-            )
-            paths["task_set"].write_text(
-                json.dumps(_task_set_dict(task_set)),
-                encoding="utf-8",
-            )
-            paths["settings"].write_text(
-                json.dumps(_settings().to_dict()),
-                encoding="utf-8",
-            )
-            stdout = io.StringIO()
-            with redirect_stdout(stdout):
-                code = main(
-                    [
-                        "--reference",
-                        str(paths["reference"]),
-                        "--candidate",
-                        str(paths["candidate"]),
-                        "--task-set",
-                        str(paths["task_set"]),
-                        "--settings",
-                        str(paths["settings"]),
-                    ],
-                    runtime=_runtime(),
-                )
-            self.assertEqual(code, 0)
-            document = json.loads(stdout.getvalue())
-            self.assertEqual(
-                document["reference_configuration_hash"],
-                decision.reference_configuration_hash,
-            )
-            self.assertEqual(
-                document["candidate_configuration_hash"],
-                decision.candidate_configuration_hash,
-            )
+        again = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(),
+            plan_evidence=_evidence(),
+        )
+        self.assertEqual(
+            decision.reference_configuration_hash,
+            again.reference_configuration_hash,
+        )
+        self.assertEqual(
+            decision.candidate_configuration_hash,
+            again.candidate_configuration_hash,
+        )
 
 
 if __name__ == "__main__":

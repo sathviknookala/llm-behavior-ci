@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import threading
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Literal
 
 from llm_behavior_ci.config import (
+    EpisodeIdentity,
     RunConfiguration,
     RunIdentity,
     new_episode_identity,
@@ -22,7 +23,7 @@ from llm_behavior_ci.records import (
     RecordedError,
     ToolStep,
 )
-from llm_behavior_ci.runtime.agent import AgentLoop, AgentTurn
+from llm_behavior_ci.runtime.agent import AgentLoop, AgentTurn, validate_chat_request
 from llm_behavior_ci.runtime.appworld import (
     AppWorldSession,
     EvaluationResult,
@@ -135,6 +136,7 @@ def run_episode(
     run: RunIdentity,
     runtime: RuntimeDependencies,
     pair_id: str | None = None,
+    on_start: Callable[[EpisodeIdentity, RunIdentity], None] | None = None,
     on_step: Callable[[ModelStep | ToolStep], None] | None = None,
     scenario_id: str | None = None,
 ) -> EpisodeResult:
@@ -151,6 +153,8 @@ def run_episode(
 
     _reject(task_id, config, mode, run)
     identity = new_episode_identity(run, pair_id=pair_id)
+    if on_start is not None:
+        on_start(identity, run)
     session = runtime.session_factory(task_id)
     try:
         started_at = runtime.clock()
@@ -503,6 +507,54 @@ def _open_worlds(
     return first, second, first_identity
 
 
+def build_runtime(
+    configuration: RunConfiguration,
+    endpoint_url: str,
+    *,
+    mode: Literal["plan", "execute"] = "execute",
+    clock: Callable[[], datetime] | None = None,
+) -> RuntimeDependencies:
+    """Build runtime dependencies for one configuration and HTTP endpoint.
+
+    Imports the live AppWorld session adapter and the HTTP agent only when
+    called. Does not import vLLM. Prompt versions, action interface, and
+    chat-expressible serving flags are checked before the runtime is
+    returned. Actions still execute through ``AppWorldSession.execute``.
+    """
+
+    if not isinstance(configuration, RunConfiguration):
+        raise EpisodeRejected("runtime requires a run configuration")
+    if not isinstance(endpoint_url, str) or endpoint_url.strip() == "":
+        raise EpisodeRejected("endpoint url is required")
+    if mode not in {"plan", "execute"}:
+        raise EpisodeRejected("mode must be plan or execute")
+    validate_chat_request(configuration)
+    from llm_behavior_ci.runtime.agent import VLLMAgent
+    from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
+    from llm_behavior_ci.runtime.prompts import UnknownPromptVersion, render_system_text
+
+    try:
+        render_system_text(
+            prompt_version=configuration.agent.prompt.prompt_version,
+            plan_format_version=configuration.agent.prompt.plan_format_version,
+            thinking_enabled=configuration.agent.prompt.thinking_enabled,
+            action_interface=configuration.agent.action_interface,
+            mode=mode,
+        )
+    except UnknownPromptVersion as error:
+        raise RuntimeUnavailable(str(error)) from error
+    except ValueError as error:
+        raise RuntimeUnavailable(str(error)) from error
+
+    agent = VLLMAgent(endpoint_url)
+    agent.set_mode(mode)
+    return RuntimeDependencies(
+        session_factory=LiveAppWorldSession,
+        agent=agent,
+        clock=clock or (lambda: datetime.now(timezone.utc)),
+    )
+
+
 def run_pair(
     task_id: str,
     reference_config: RunConfiguration,
@@ -513,6 +565,9 @@ def run_pair(
     runtime: RuntimeDependencies,
     mode: Literal["plan", "execute"],
     scenario_id: str | None = None,
+    candidate_runtime: RuntimeDependencies | None = None,
+    on_start: Callable[[EpisodeIdentity, RunIdentity], None] | None = None,
+    on_step: Callable[[ModelStep | ToolStep], None] | None = None,
 ) -> PairedResult:
     """Run one reference episode and one candidate episode as a pair.
 
@@ -522,6 +577,11 @@ def run_pair(
     is never passed the other's tool output. Run identities and episode
     identities stay distinct. Task-set hash, split, and sampling seed must
     already be compatible with ``PairedResult``.
+
+    When ``candidate_runtime`` is omitted, both episodes use ``runtime``.
+    When it is supplied, the reference episode uses ``runtime.agent`` and
+    the candidate episode uses ``candidate_runtime.agent``; worlds still
+    come from ``runtime.session_factory`` opened before either episode.
 
     A failed episode is kept on the pair. Missing evaluation is not rewritten
     as success. Evaluator differences are available from
@@ -551,19 +611,29 @@ def run_pair(
             raise EpisodeRejected("paired world was reused")
         return pending.pop(0)
 
-    paired_runtime = RuntimeDependencies(
+    reference_paired = RuntimeDependencies(
         session_factory=factory,
         agent=runtime.agent,
         clock=runtime.clock,
     )
+    if candidate_runtime is None:
+        candidate_paired = reference_paired
+    else:
+        candidate_paired = RuntimeDependencies(
+            session_factory=factory,
+            agent=candidate_runtime.agent,
+            clock=candidate_runtime.clock,
+        )
     try:
         reference_episode = run_episode(
             task_id,
             reference_config,
             mode,
             run=reference_run,
-            runtime=paired_runtime,
+            runtime=reference_paired,
             pair_id=pair_id,
+            on_start=on_start,
+            on_step=on_step,
             scenario_id=scenario_id,
         )
         candidate_episode = run_episode(
@@ -571,8 +641,10 @@ def run_pair(
             candidate_config,
             mode,
             run=candidate_run,
-            runtime=paired_runtime,
+            runtime=candidate_paired,
             pair_id=pair_id,
+            on_start=on_start,
+            on_step=on_step,
             scenario_id=scenario_id,
         )
     finally:

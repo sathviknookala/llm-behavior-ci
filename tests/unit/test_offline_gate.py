@@ -11,13 +11,14 @@ from unittest.mock import patch
 from llm_behavior_ci.config import GateSettings, RunConfiguration, run_configuration_hash
 from llm_behavior_ci.lifecycle.offline_gate import (
     GateExecutionError,
+    PlanEvidenceInputs,
     run_offline_gate,
 )
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
 from llm_behavior_ci.runtime.episode import RuntimeDependencies
-from llm_behavior_ci.stats.kl import truncated_next_token_kl
+from llm_behavior_ci.runtime.scoring import score_top_k
 from llm_behavior_ci.tasks.selection import (
     TaskSet,
     canonical_task_set_bytes,
@@ -26,6 +27,7 @@ from llm_behavior_ci.tasks.selection import (
 
 _START = datetime(2026, 9, 27, 15, 0, tzinfo=timezone.utc)
 _PLAN = "1. open the calendar"
+_PLAN_B = "1. open the calendar\n2. create an event"
 _MATCHING_LOGPROBS = (
     (
         TokenLogprob(token_id=7, logprob=-0.2, rank=0),
@@ -42,6 +44,18 @@ _MISALIGNED_LOGPROBS = (
     (
         TokenLogprob(token_id=11, logprob=-0.2, rank=0),
         TokenLogprob(token_id=13, logprob=-1.5, rank=1),
+    ),
+)
+_FULL_LOGPROBS = (
+    (
+        TokenLogprob(token_id=0, logprob=math.log(0.5), rank=0),
+        TokenLogprob(token_id=1, logprob=math.log(0.5), rank=1),
+    ),
+)
+_FULL_DIVERGENT = (
+    (
+        TokenLogprob(token_id=0, logprob=math.log(0.25), rank=0),
+        TokenLogprob(token_id=1, logprob=math.log(0.75), rank=1),
     ),
 )
 
@@ -164,6 +178,20 @@ def _settings(**overrides: object) -> GateSettings:
     return GateSettings(**values)
 
 
+def _evidence(**overrides: object) -> PlanEvidenceInputs:
+    values: dict[str, object] = {
+        "plan_format_version": "plan-v1",
+        "plan_quality_features": ("numbered_step_count", "token_count"),
+        "plan_quality_weights": (1.0, 0.1),
+        "mmd_features": ("char_count", "numbered_step_count", "model_step_count"),
+        "kl_approximation": "top_k",
+        "required_statistics": ("plan_quality", "kl", "mmd"),
+        "validation_provenance": "synthetic_fixture",
+    }
+    values.update(overrides)
+    return PlanEvidenceInputs(**values)
+
+
 class FakeSession:
     def __init__(self, task_id: str) -> None:
         self.task_id = task_id
@@ -195,18 +223,44 @@ class PlanAgent:
         plan_text: str = _PLAN,
         logprobs=_MATCHING_LOGPROBS,
         by_run_seed: dict[int, tuple[str, object]] | None = None,
+        teacher_force_by_seed: dict[int, object] | None = None,
+        teacher_force_logprobs=None,
         empty_plan: bool = False,
+        support_teacher_force: bool = True,
     ) -> None:
         self._clock = clock
         self._plan_text = plan_text
         self._logprobs = logprobs
         self._by_run_seed = by_run_seed or {}
+        self._teacher_force_by_seed = teacher_force_by_seed or {}
+        self._teacher_force_logprobs = (
+            teacher_force_logprobs
+            if teacher_force_logprobs is not None
+            else _MATCHING_LOGPROBS
+        )
         self._empty_plan = empty_plan
+        self._support_teacher_force = support_teacher_force
         self.config: RunConfiguration | None = None
+        self._context: TaskContext | None = None
+        self.generation_logprobs_used_for_kl = False
 
     def begin(self, context: TaskContext, config: RunConfiguration) -> None:
-        del context
+        self._context = context
         self.config = config
+
+    def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
+        del tool_output
+        assert self._context is not None
+        return [
+            {"role": "system", "content": "Emit a plan."},
+            {
+                "role": "user",
+                "content": (
+                    f"{self._context.instruction}\n"
+                    f"{self._context.api_documentation}"
+                ),
+            },
+        ]
 
     def next_turn(self, *, tool_output: str | None) -> AgentTurn:
         del tool_output
@@ -227,6 +281,30 @@ class PlanAgent:
             app_name=None,
             api_name=None,
         )
+
+    def teacher_force_plan(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        plan_text: str,
+    ) -> tuple[tuple[TokenLogprob, ...], ...]:
+        del messages, plan_text
+        if not self._support_teacher_force:
+            raise RuntimeError("unsupported teacher force")
+        assert self.config is not None
+        if self.config.run_seed in self._teacher_force_by_seed:
+            return self._teacher_force_by_seed[self.config.run_seed]
+        return self._teacher_force_logprobs
+
+
+class GenerationOnlyAgent(PlanAgent):
+    def __init__(self, clock, **kwargs) -> None:
+        super().__init__(clock, support_teacher_force=True, **kwargs)
+
+    def __getattribute__(self, name: str):
+        if name == "teacher_force_plan":
+            raise AttributeError(name)
+        return super().__getattribute__(name)
 
 
 def _clock():
@@ -262,6 +340,7 @@ class OfflineGateUnitTests(unittest.TestCase):
             task_set,
             settings=_settings(),
             runtime=_runtime(),
+            plan_evidence=_evidence(),
         )
         self.assertEqual(decision.outcome, "PASS")
         self.assertEqual(decision.reason_codes, ())
@@ -269,7 +348,7 @@ class OfflineGateUnitTests(unittest.TestCase):
         methods = tuple(item.method for item in decision.statistics)
         self.assertEqual(
             methods,
-            ("plan_quality_bootstrap", "truncated_plan_kl", "plan_mmd"),
+            ("plan_quality_bootstrap", "plan_kl_top_k", "plan_mmd"),
         )
         self.assertIsNotNone(decision.public_decision)
         self.assertEqual(decision.public_decision.decision, "allow_canary")
@@ -280,6 +359,59 @@ class OfflineGateUnitTests(unittest.TestCase):
         self.assertIsNone(decision.statistics[1].seed)
         self.assertIsNotNone(decision.statistics[0].seed)
         self.assertIsNotNone(decision.statistics[2].seed)
+        self.assertEqual(decision.validation_provenance, "synthetic_fixture")
+        self.assertNotEqual(decision.statistics[0].estimate, 1.0)
+
+    def test_plan_quality_scores_vary_with_plan_content(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        short = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(plan_text=_PLAN),
+            plan_evidence=_evidence(required_statistics=("plan_quality",)),
+        )
+        long = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(
+                by_run_seed={
+                    7: (_PLAN, _MATCHING_LOGPROBS),
+                    8: (_PLAN_B, _MATCHING_LOGPROBS),
+                }
+            ),
+            plan_evidence=_evidence(required_statistics=("plan_quality",)),
+        )
+        self.assertEqual(short.outcome, "PASS")
+        self.assertNotEqual(
+            short.statistics[0].estimate,
+            long.statistics[0].estimate,
+        )
+
+    def test_identical_plans_do_not_require_constant_one(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        decision = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(plan_text=_PLAN_B),
+            plan_evidence=_evidence(
+                plan_quality_features=("numbered_step_count",),
+                plan_quality_weights=(1.0,),
+                required_statistics=("plan_quality",),
+            ),
+        )
+        self.assertEqual(decision.outcome, "PASS")
+        self.assertEqual(decision.statistics[0].estimate, 0.0)
+        self.assertNotEqual(decision.statistics[0].estimate, 1.0)
 
     def test_plan_quality_margin_rejection(self) -> None:
         task_set = _task_set()
@@ -291,12 +423,13 @@ class OfflineGateUnitTests(unittest.TestCase):
             task_set,
             settings=_settings(score_margin=0.01),
             runtime=_runtime(),
+            plan_evidence=_evidence(),
         )
         self.assertEqual(decision.outcome, "BLOCK")
         self.assertIn("plan_quality_margin", decision.reason_codes)
         self.assertEqual(decision.public_decision.decision, "block")
 
-    def test_kl_limit_rejection(self) -> None:
+    def test_kl_limit_rejection_uses_teacher_force(self) -> None:
         task_set = _task_set()
         reference = _config(task_set, run_seed=7)
         candidate = _config(task_set, run_seed=8)
@@ -306,18 +439,100 @@ class OfflineGateUnitTests(unittest.TestCase):
             task_set,
             settings=_settings(kl_limit_nats=0.0),
             runtime=_runtime(
-                by_run_seed={
-                    7: (_PLAN, _MATCHING_LOGPROBS),
-                    8: (_PLAN, _DIVERGENT_LOGPROBS),
+                teacher_force_by_seed={
+                    7: _MATCHING_LOGPROBS,
+                    8: _DIVERGENT_LOGPROBS,
                 }
             ),
+            plan_evidence=_evidence(),
         )
         self.assertEqual(decision.outcome, "BLOCK")
         self.assertIn("kl_limit", decision.reason_codes)
         kl = next(
-            item for item in decision.statistics if item.method == "truncated_plan_kl"
+            item for item in decision.statistics if item.method == "plan_kl_top_k"
         )
         self.assertGreater(kl.estimate, 0.0)
+
+    def test_missing_teacher_force_does_not_use_generation_logprobs(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        clock = _clock()
+        agent = GenerationOnlyAgent(
+            clock,
+            by_run_seed={
+                7: (_PLAN, _MATCHING_LOGPROBS),
+                8: (_PLAN, _DIVERGENT_LOGPROBS),
+            },
+        )
+        with patch(
+            "llm_behavior_ci.lifecycle.offline_gate.score_top_k",
+            wraps=score_top_k,
+        ) as scored:
+            decision = run_offline_gate(
+                reference,
+                candidate,
+                task_set,
+                settings=_settings(),
+                runtime=_runtime(agent=agent, clock=clock),
+                plan_evidence=_evidence(),
+            )
+        scored.assert_not_called()
+        self.assertEqual(decision.outcome, "BLOCK")
+        self.assertIn("teacher_force_unavailable", decision.reason_codes)
+        methods = tuple(item.method for item in decision.statistics)
+        self.assertEqual(methods, ("plan_quality_bootstrap", "plan_mmd"))
+
+    def test_top_k_versus_full_labels(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        top_k = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(),
+            plan_evidence=_evidence(
+                kl_approximation="top_k",
+                required_statistics=("kl",),
+            ),
+        )
+        full = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(
+                teacher_force_logprobs=_FULL_LOGPROBS,
+                teacher_force_by_seed={7: _FULL_LOGPROBS, 8: _FULL_LOGPROBS},
+            ),
+            plan_evidence=_evidence(
+                kl_approximation="full",
+                required_statistics=("kl",),
+            ),
+        )
+        self.assertEqual(top_k.statistics[0].method, "plan_kl_top_k")
+        self.assertEqual(full.statistics[0].method, "plan_kl_full")
+
+    def test_mmd_receives_clusters(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        with patch(
+            "llm_behavior_ci.lifecycle.offline_gate.mmd_permutation_test",
+        ) as mmd_call:
+            mmd_call.return_value = SimpleNamespace(mmd_squared=0.0, p_value=1.0)
+            run_offline_gate(
+                reference,
+                candidate,
+                task_set,
+                settings=_settings(),
+                runtime=_runtime(),
+                plan_evidence=_evidence(required_statistics=("mmd",)),
+            )
+        kwargs = mmd_call.call_args.kwargs
+        self.assertEqual(kwargs["clusters"], ("scenario-1", "task-b"))
 
     def test_mmd_rejected(self) -> None:
         task_set = _task_set()
@@ -330,15 +545,16 @@ class OfflineGateUnitTests(unittest.TestCase):
             settings=_settings(mmd_alpha=0.99, mmd_permutations=99),
             runtime=_runtime(
                 by_run_seed={
-                    7: ("a", _MATCHING_LOGPROBS),
-                    8: ("b" * 80, _MATCHING_LOGPROBS),
+                    7: ("1. a", _MATCHING_LOGPROBS),
+                    8: ("1. " + ("b" * 80), _MATCHING_LOGPROBS),
                 }
             ),
+            plan_evidence=_evidence(),
         )
         self.assertEqual(decision.outcome, "BLOCK")
         self.assertIn("mmd_rejected", decision.reason_codes)
 
-    def test_unsupported_tokenizer_skips_truncated_kl(self) -> None:
+    def test_unsupported_tokenizer_skips_kl(self) -> None:
         task_set = _task_set()
         reference = _config(task_set, run_seed=7)
         candidate = _config(
@@ -347,8 +563,8 @@ class OfflineGateUnitTests(unittest.TestCase):
             tokenizer_revision="abcdabcdabcdabcdabcdabcdabcdabcdabcdabcd",
         )
         with patch(
-            "llm_behavior_ci.lifecycle.offline_gate.truncated_next_token_kl",
-            wraps=truncated_next_token_kl,
+            "llm_behavior_ci.lifecycle.offline_gate.score_top_k",
+            wraps=score_top_k,
         ) as kl_call:
             decision = run_offline_gate(
                 reference,
@@ -356,6 +572,7 @@ class OfflineGateUnitTests(unittest.TestCase):
                 task_set,
                 settings=_settings(),
                 runtime=_runtime(),
+                plan_evidence=_evidence(),
             )
         kl_call.assert_not_called()
         self.assertEqual(decision.outcome, "BLOCK")
@@ -368,8 +585,8 @@ class OfflineGateUnitTests(unittest.TestCase):
         reference = _config(task_set, run_seed=7)
         candidate = _config(task_set, run_seed=8)
         with patch(
-            "llm_behavior_ci.lifecycle.offline_gate.truncated_next_token_kl",
-            wraps=truncated_next_token_kl,
+            "llm_behavior_ci.lifecycle.offline_gate.score_top_k",
+            wraps=score_top_k,
         ) as kl_call:
             decision = run_offline_gate(
                 reference,
@@ -377,17 +594,36 @@ class OfflineGateUnitTests(unittest.TestCase):
                 task_set,
                 settings=_settings(),
                 runtime=_runtime(
-                    by_run_seed={
-                        7: (_PLAN, _MATCHING_LOGPROBS),
-                        8: (_PLAN, _MISALIGNED_LOGPROBS),
+                    teacher_force_by_seed={
+                        7: _MATCHING_LOGPROBS,
+                        8: _MISALIGNED_LOGPROBS,
                     }
                 ),
+                plan_evidence=_evidence(),
             )
         kl_call.assert_not_called()
         self.assertEqual(decision.outcome, "BLOCK")
         self.assertIn("kl_alignment_failed", decision.reason_codes)
         methods = tuple(item.method for item in decision.statistics)
         self.assertEqual(methods, ("plan_quality_bootstrap", "plan_mmd"))
+
+    def test_missing_required_feature_is_execution_error(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        with self.assertRaises(GateExecutionError):
+            run_offline_gate(
+                reference,
+                candidate,
+                task_set,
+                settings=_settings(),
+                runtime=_runtime(),
+                plan_evidence=_evidence(
+                    plan_quality_features=("not_a_feature",),
+                    plan_quality_weights=(1.0,),
+                    required_statistics=("plan_quality",),
+                ),
+            )
 
     def test_plan_run_failed_blocks_without_statistics(self) -> None:
         task_set = _task_set()
@@ -399,6 +635,7 @@ class OfflineGateUnitTests(unittest.TestCase):
             task_set,
             settings=_settings(),
             runtime=_runtime(empty_plan=True),
+            plan_evidence=_evidence(),
         )
         self.assertEqual(decision.outcome, "BLOCK")
         self.assertEqual(decision.reason_codes, ("plan_run_failed",))
@@ -430,6 +667,7 @@ class OfflineGateUnitTests(unittest.TestCase):
                     task_set,
                     settings=_settings(),
                     runtime=_runtime(),
+                    plan_evidence=_evidence(),
                 )
 
     def test_tool_steps_block_with_tool_execution(self) -> None:
@@ -457,6 +695,7 @@ class OfflineGateUnitTests(unittest.TestCase):
                 task_set,
                 settings=_settings(),
                 runtime=_runtime(),
+                plan_evidence=_evidence(),
             )
         self.assertEqual(decision.outcome, "BLOCK")
         self.assertEqual(decision.reason_codes, ("tool_execution",))
@@ -485,6 +724,7 @@ class OfflineGateUnitTests(unittest.TestCase):
                 task_set,
                 settings=_settings(),
                 runtime=runtime,
+                plan_evidence=_evidence(),
             )
 
     def test_split_and_format_and_hash_mismatches_are_execution_errors(self) -> None:
@@ -498,6 +738,7 @@ class OfflineGateUnitTests(unittest.TestCase):
                 replace(task_set, split="dev"),
                 settings=_settings(),
                 runtime=_runtime(),
+                plan_evidence=_evidence(),
             )
         with self.assertRaises(GateExecutionError):
             run_offline_gate(
@@ -506,6 +747,16 @@ class OfflineGateUnitTests(unittest.TestCase):
                 task_set,
                 settings=_settings(plan_format_version="plan-v2"),
                 runtime=_runtime(),
+                plan_evidence=_evidence(plan_format_version="plan-v2"),
+            )
+        with self.assertRaises(GateExecutionError):
+            run_offline_gate(
+                reference,
+                candidate,
+                task_set,
+                settings=_settings(plan_format_version="plan-v1"),
+                runtime=_runtime(),
+                plan_evidence=_evidence(plan_format_version="plan-v2"),
             )
         other = _task_set()
         mismatched = replace(
@@ -519,6 +770,7 @@ class OfflineGateUnitTests(unittest.TestCase):
                 other,
                 settings=_settings(),
                 runtime=_runtime(),
+                plan_evidence=_evidence(),
             )
 
     def test_repeated_calls_are_deterministic(self) -> None:
@@ -526,12 +778,14 @@ class OfflineGateUnitTests(unittest.TestCase):
         reference = _config(task_set, run_seed=7)
         candidate = _config(task_set, run_seed=8)
         settings = _settings()
+        evidence = _evidence()
         first = run_offline_gate(
             reference,
             candidate,
             task_set,
             settings=settings,
             runtime=_runtime(),
+            plan_evidence=evidence,
         )
         second = run_offline_gate(
             reference,
@@ -539,6 +793,7 @@ class OfflineGateUnitTests(unittest.TestCase):
             task_set,
             settings=settings,
             runtime=_runtime(),
+            plan_evidence=evidence,
         )
         self.assertEqual(first.outcome, second.outcome)
         self.assertEqual(first.reason_codes, second.reason_codes)

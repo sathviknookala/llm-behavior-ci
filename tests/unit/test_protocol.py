@@ -17,12 +17,21 @@ from llm_behavior_ci.config import (
     TaskConfiguration,
     run_configuration_hash,
 )
-from llm_behavior_ci.experiments.faults import HarmLabel
+from llm_behavior_ci.experiments.faults import (
+    FaultPatch,
+    FaultSpec,
+    HarmLabel,
+    apply_fault,
+    load_fault,
+)
 from llm_behavior_ci.experiments.protocol import (
     ProtocolError,
     ProtocolLock,
     ProtocolSettings,
+    TaskSelectionAllowance,
     admit_test_normal,
+    authorize_faulted_candidate,
+    authorize_gated_candidate,
     bind_protocol,
     lock_protocol,
     require_protocol_lock,
@@ -31,17 +40,63 @@ from llm_behavior_ci.experiments.validation import (
     AADependenceReport,
     ValidationReport,
 )
+from llm_behavior_ci.tasks.selection import (
+    TaskSet,
+    canonical_task_set_bytes,
+    task_set_hash_from_bytes,
+)
 
 _REVISION = "0123456789abcdef0123456789abcdef01234567"
 _TOKENIZER_REVISION = "fedcba9876543210fedcba9876543210fedcba98"
 _GIT_COMMIT = "a" * 40
-_DEV_TASK_SET_HASH = "c" * 64
-_TEST_TASK_SET_HASH = "d" * 64
 _HASH_A = "1" * 64
 _HASH_B = "2" * 64
+_REPO = Path(__file__).resolve().parents[2]
+_CATALOG = _REPO / "configs" / "faults"
 
 
-def _payload(*, split: str, task_set_hash: str) -> dict[str, object]:
+def _make_task_set(*, split: str, task_count: int = 2) -> TaskSet:
+    tasks = tuple(
+        (f"task-{index}", f"scenario-{(index % 2) + 1}")
+        for index in range(task_count)
+    )
+    payload = canonical_task_set_bytes(
+        appworld_version="0.1.3.post1",
+        split=split,
+        selection_rule="fixed-v1",
+        selection_seed=20260926,
+        tasks=tasks,
+    )
+    digest = task_set_hash_from_bytes(payload)
+    return TaskSet(
+        appworld_version="0.1.3.post1",
+        split=split,
+        selection_rule="fixed-v1",
+        selection_seed=20260926,
+        task_count=task_count,
+        scenario_count=len({scenario for _, scenario in tasks}),
+        task_ids=tuple(task_id for task_id, _ in tasks),
+        scenario_ids=tuple(scenario for _, scenario in tasks),
+        task_set_hash=digest,
+    )
+
+
+_TRAIN_TASKS = _make_task_set(split="train")
+_DEV_TASKS = _make_task_set(split="dev")
+_TEST_TASKS = _make_task_set(split="test_normal")
+_TRAIN_TASK_SET_HASH = _TRAIN_TASKS.task_set_hash
+_DEV_TASK_SET_HASH = _DEV_TASKS.task_set_hash
+_TEST_TASK_SET_HASH = _TEST_TASKS.task_set_hash
+
+
+def _payload(
+    *,
+    split: str,
+    task_set_hash: str,
+    selection_rule: str = "fixed-v1",
+    selection_seed: int = 20260926,
+    task_count: int = 2,
+) -> dict[str, object]:
     return {
         "model": {
             "model": {
@@ -90,9 +145,9 @@ def _payload(*, split: str, task_set_hash: str) -> dict[str, object]:
         "task": {
             "appworld_version": "0.1.3.post1",
             "split": split,
-            "selection_rule": "fixed-v1",
-            "selection_seed": 20260926,
-            "task_count": 50,
+            "selection_rule": selection_rule,
+            "selection_seed": selection_seed,
+            "task_count": task_count,
             "task_set_hash": task_set_hash,
         },
         "run_seed": 7,
@@ -110,6 +165,12 @@ def _dev_config() -> RunConfiguration:
 def _test_normal_config() -> RunConfiguration:
     return RunConfiguration.from_dict(
         _payload(split="test_normal", task_set_hash=_TEST_TASK_SET_HASH)
+    )
+
+
+def _train_config() -> RunConfiguration:
+    return RunConfiguration.from_dict(
+        _payload(split="train", task_set_hash=_TRAIN_TASK_SET_HASH)
     )
 
 
@@ -252,13 +313,18 @@ def _settings(
     harm_labels: tuple[HarmLabel, ...] | None = None,
     validation_reports: tuple[ValidationReport, ...] | None = None,
 ) -> ProtocolSettings:
+    train = _train_config()
     dev = _dev_config()
     test_normal = _test_normal_config()
-    chosen = configurations if configurations is not None else (dev, test_normal)
+    chosen = (
+        configurations
+        if configurations is not None
+        else (train, dev, test_normal)
+    )
     selections = (
         task_selections
         if task_selections is not None
-        else (dev.task, test_normal.task)
+        else (train.task, dev.task, test_normal.task)
     )
     labels = harm_labels if harm_labels is not None else (_harm_label(),)
     reports = (
@@ -305,7 +371,11 @@ class ProtocolLockTests(unittest.TestCase):
             self.assertEqual(first.validated_flags, (True,))
             self.assertEqual(
                 set(first.task_set_hashes),
-                {_DEV_TASK_SET_HASH, _TEST_TASK_SET_HASH},
+                {
+                    _TRAIN_TASK_SET_HASH,
+                    _DEV_TASK_SET_HASH,
+                    _TEST_TASK_SET_HASH,
+                },
             )
 
     def test_mutation_detection(self) -> None:
@@ -522,6 +592,300 @@ class ProtocolLockTests(unittest.TestCase):
                     task_set_hash=_TEST_TASK_SET_HASH,
                 )
             )
+
+
+class _GateView:
+    def __init__(
+        self,
+        *,
+        outcome: str,
+        reason_codes: tuple[str, ...],
+        reference_configuration_hash: str,
+        candidate_configuration_hash: str,
+        task_set_hash: str,
+        reference_protocol_hash: str | None,
+        candidate_protocol_hash: str | None,
+    ) -> None:
+        self.outcome = outcome
+        self.reason_codes = reason_codes
+        self.reference_configuration_hash = reference_configuration_hash
+        self.candidate_configuration_hash = candidate_configuration_hash
+        self.task_set_hash = task_set_hash
+        self.reference_protocol_hash = reference_protocol_hash
+        self.candidate_protocol_hash = candidate_protocol_hash
+
+
+def _task_selection_allowance() -> TaskSelectionAllowance:
+    return TaskSelectionAllowance(
+        allowed_leaves=frozenset(
+            {
+                "task.split",
+                "task.selection_rule",
+                "task.selection_seed",
+                "task.task_count",
+                "task.task_set_hash",
+            }
+        ),
+        train_task_set_hash=_TRAIN_TASK_SET_HASH,
+        train_values={
+            "task.split": "train",
+            "task.selection_rule": "fixed-v1",
+            "task.selection_seed": 20260926,
+            "task.task_count": 2,
+            "task.task_set_hash": _TRAIN_TASK_SET_HASH,
+        },
+    )
+
+
+class AuthorizeGatedCandidateTests(unittest.TestCase):
+    def test_legal_task_selection_difference_accepted(self) -> None:
+        train_reference = _train_config()
+        train_candidate = RunConfiguration.from_dict(
+            {
+                **_payload(split="train", task_set_hash=_TRAIN_TASK_SET_HASH),
+                "agent": {
+                    **_payload(split="train", task_set_hash=_TRAIN_TASK_SET_HASH)[
+                        "agent"
+                    ],
+                    "step_limit": 4,
+                },
+            }
+        )
+        gate = _GateView(
+            outcome="PASS",
+            reason_codes=(),
+            reference_configuration_hash=run_configuration_hash(train_reference),
+            candidate_configuration_hash=run_configuration_hash(train_candidate),
+            task_set_hash=_TRAIN_TASK_SET_HASH,
+            reference_protocol_hash=None,
+            candidate_protocol_hash=None,
+        )
+        served_reference = _test_normal_config()
+        served_candidate = RunConfiguration.from_dict(
+            {
+                **_payload(
+                    split="test_normal",
+                    task_set_hash=_TEST_TASK_SET_HASH,
+                ),
+                "agent": {
+                    **_payload(
+                        split="test_normal",
+                        task_set_hash=_TEST_TASK_SET_HASH,
+                    )["agent"],
+                    "step_limit": 4,
+                },
+            }
+        )
+        admission = authorize_gated_candidate(
+            gate,
+            served_reference,
+            served_candidate,
+            allowance=_task_selection_allowance(),
+        )
+        self.assertEqual(admission.outcome, "PASS")
+        self.assertEqual(
+            admission.reference_configuration_hash,
+            run_configuration_hash(train_reference),
+        )
+        self.assertEqual(
+            admission.candidate_configuration_hash,
+            run_configuration_hash(train_candidate),
+        )
+        self.assertEqual(admission.train_task_set_hash, _TRAIN_TASK_SET_HASH)
+        self.assertEqual(
+            admission.served_candidate_configuration_hash,
+            run_configuration_hash(served_candidate),
+        )
+        self.assertNotEqual(
+            admission.served_candidate_configuration_hash,
+            admission.candidate_configuration_hash,
+        )
+
+    def test_sampling_change_rejected_with_legal_task_diff(self) -> None:
+        train_reference = _train_config()
+        train_candidate = train_reference
+        gate = _GateView(
+            outcome="PASS",
+            reason_codes=(),
+            reference_configuration_hash=run_configuration_hash(train_reference),
+            candidate_configuration_hash=run_configuration_hash(train_candidate),
+            task_set_hash=_TRAIN_TASK_SET_HASH,
+            reference_protocol_hash=None,
+            candidate_protocol_hash=None,
+        )
+        served_reference = _test_normal_config()
+        changed = _test_normal_config().to_dict()
+        changed["agent"]["sampling"]["temperature"] = 1.0
+        served_candidate = RunConfiguration.from_dict(changed)
+        with self.assertRaises(ProtocolError) as ctx:
+            authorize_gated_candidate(
+                gate,
+                served_reference,
+                served_candidate,
+                allowance=_task_selection_allowance(),
+            )
+        self.assertIn("does not match the gate", str(ctx.exception))
+
+    def test_prompt_change_rejected_with_legal_task_diff(self) -> None:
+        train_reference = _train_config()
+        gate = _GateView(
+            outcome="PASS",
+            reason_codes=(),
+            reference_configuration_hash=run_configuration_hash(train_reference),
+            candidate_configuration_hash=run_configuration_hash(train_reference),
+            task_set_hash=_TRAIN_TASK_SET_HASH,
+            reference_protocol_hash=None,
+            candidate_protocol_hash=None,
+        )
+        served_reference = _test_normal_config()
+        changed = _test_normal_config().to_dict()
+        changed["agent"]["prompt"]["prompt_version"] = "prompt-no-api-guidance"
+        served_candidate = RunConfiguration.from_dict(changed)
+        with self.assertRaises(ProtocolError):
+            authorize_gated_candidate(
+                gate,
+                served_reference,
+                served_candidate,
+                allowance=_task_selection_allowance(),
+            )
+
+    def test_manufactured_pass_with_swapped_hashes_rejected(self) -> None:
+        train_reference = _train_config()
+        train_candidate = RunConfiguration.from_dict(
+            {
+                **_payload(split="train", task_set_hash=_TRAIN_TASK_SET_HASH),
+                "agent": {
+                    **_payload(split="train", task_set_hash=_TRAIN_TASK_SET_HASH)[
+                        "agent"
+                    ],
+                    "step_limit": 4,
+                },
+            }
+        )
+        gate = _GateView(
+            outcome="PASS",
+            reason_codes=(),
+            reference_configuration_hash=run_configuration_hash(train_candidate),
+            candidate_configuration_hash=run_configuration_hash(train_reference),
+            task_set_hash=_TRAIN_TASK_SET_HASH,
+            reference_protocol_hash=None,
+            candidate_protocol_hash=None,
+        )
+        with self.assertRaises(ProtocolError):
+            authorize_gated_candidate(
+                gate,
+                train_reference,
+                train_candidate,
+            )
+
+
+class AuthorizeFaultedCandidateTests(unittest.TestCase):
+    def test_declared_fault_admitted(self) -> None:
+        settings = _settings()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            lock = lock_protocol(settings, path)
+            reference = bind_protocol(_test_normal_config(), lock)
+            fault = load_fault(_CATALOG / "sampling_temperature_one.v1.json")
+            candidate = apply_fault(reference, fault)
+            admission = authorize_faulted_candidate(
+                lock,
+                reference,
+                candidate,
+                fault,
+                _TEST_TASKS,
+            )
+            self.assertEqual(admission.fault_version, fault.fault_version)
+            self.assertEqual(
+                admission.candidate_configuration_hash,
+                run_configuration_hash(candidate),
+            )
+            self.assertEqual(admission.task_set_hash, _TEST_TASK_SET_HASH)
+
+    def test_undeclared_patch_candidate_rejected(self) -> None:
+        settings = _settings()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            lock = lock_protocol(settings, path)
+            reference = bind_protocol(_test_normal_config(), lock)
+            fault = load_fault(_CATALOG / "sampling_temperature_one.v1.json")
+            other = apply_fault(
+                reference,
+                load_fault(_CATALOG / "step_limit_reduced.v1.json"),
+            )
+            with self.assertRaises(ProtocolError) as ctx:
+                authorize_faulted_candidate(
+                    lock,
+                    reference,
+                    other,
+                    fault,
+                    _TEST_TASKS,
+                )
+            self.assertIn("declared fault", str(ctx.exception))
+
+    def test_unnamed_fault_rejected(self) -> None:
+        settings = _settings()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            lock = lock_protocol(settings, path)
+            reference = bind_protocol(_test_normal_config(), lock)
+            fault = load_fault(_CATALOG / "step_limit_reduced.v1.json")
+            candidate = apply_fault(reference, fault)
+            with self.assertRaises(ProtocolError) as ctx:
+                authorize_faulted_candidate(
+                    lock,
+                    reference,
+                    candidate,
+                    fault,
+                    _TEST_TASKS,
+                )
+            self.assertIn("not named", str(ctx.exception))
+
+    def test_locked_fault_list_rejects_kind_mismatch(self) -> None:
+        settings = _settings()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "lock.json"
+            lock = lock_protocol(settings, path)
+            payload = copy.deepcopy(dict(lock.payload))
+            payload["faults"] = [
+                {
+                    "fault_id": "sampling_temperature_one",
+                    "version": "1",
+                    "kind": "sampling",
+                    "patches": [
+                        {
+                            "path": "agent.sampling.temperature",
+                            "value": 1.0,
+                        }
+                    ],
+                }
+            ]
+            digest = hashlib.sha256(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            listed = ProtocolLock(digest=digest, payload=payload)
+            reference = bind_protocol(_test_normal_config(), listed)
+            fault = FaultSpec(
+                fault_id="sampling_temperature_one",
+                version="1",
+                kind="token_limit",
+                patches=(FaultPatch("agent.sampling.max_tokens", 16),),
+            )
+            with self.assertRaises(ProtocolError) as ctx:
+                authorize_faulted_candidate(
+                    listed,
+                    reference,
+                    apply_fault(reference, fault),
+                    fault,
+                    _TEST_TASKS,
+                )
+            self.assertIn("kind", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,11 @@ from llm_behavior_ci.config import (
     new_run_identity,
     run_configuration_hash,
 )
-from llm_behavior_ci.lifecycle.canary import CanaryController, CanaryRejected
+from llm_behavior_ci.lifecycle.canary import (
+    CanaryController,
+    CanaryRejected,
+    assign_canary,
+)
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import (
     EvaluationResult,
@@ -367,6 +371,171 @@ class CanaryControllerIntegrationTests(unittest.TestCase):
             decision.snapshot.serving_configuration_hash,
             run_configuration_hash(reference),
         )
+
+    def test_assign_canary_and_post_rollback_outstanding_path(self) -> None:
+        reference, candidate = _configs()
+        clock = Clock()
+        production_hash = run_configuration_hash(reference)
+        self.assertEqual(
+            assign_canary("arrival-0", fraction=0.35, seed=3),
+            assign_canary("arrival-0", fraction=0.35, seed=3),
+        )
+        assigned = [
+            assign_canary(f"arrival-{index}", fraction=0.5, seed=11)
+            for index in range(300)
+        ]
+        self.assertNotEqual(set(assigned), {True})
+        self.assertNotEqual(set(assigned), {False})
+
+        controller = CanaryController(
+            reference,
+            candidate,
+            settings=CanarySettings(
+                fraction=0.5,
+                outcome_delay_seconds=0.0,
+                harm_margin=0.1,
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=5,
+                ),
+            ),
+            clock=clock,
+        )
+        controller.start(
+            FakeGate(
+                outcome="PASS",
+                reason_codes=(),
+                reference_configuration_hash=production_hash,
+                candidate_configuration_hash=run_configuration_hash(candidate),
+                task_set_hash=reference.task.task_set_hash,
+                reference_protocol_hash=reference.protocol_hash,
+                candidate_protocol_hash=candidate.protocol_hash,
+            )
+        )
+        controller.begin_candidate_episode()
+        controller.begin_candidate_episode()
+        controller.begin_candidate_episode()
+        first = run_pair(
+            "task-1",
+            reference,
+            candidate,
+            reference_run=new_run_identity(reference),
+            candidate_run=new_run_identity(candidate),
+            runtime=_runtime(clock, candidate_success=False),
+            mode="execute",
+        )
+        pair_execution(first)
+        observed = controller.observe(first)
+        self.assertEqual(observed.action, "continue")
+        self.assertEqual(
+            observed.snapshot.candidate_episodes_evaluator_unsuccessful, 1
+        )
+        self.assertEqual(observed.snapshot.candidate_episodes_failed, 0)
+
+        rolled = controller.rollback("operator_request", manual=True)
+        self.assertEqual(rolled.action, "rollback")
+        self.assertEqual(rolled.snapshot.outstanding, 2)
+        self.assertEqual(rolled.snapshot.serving_configuration_hash, production_hash)
+        with self.assertRaises(CanaryRejected):
+            controller.begin_candidate_episode()
+
+        second = run_pair(
+            "task-2",
+            reference,
+            candidate,
+            reference_run=new_run_identity(reference),
+            candidate_run=new_run_identity(candidate),
+            runtime=_runtime(clock, candidate_success=True),
+            mode="execute",
+        )
+        pair_execution(second)
+        after_second = controller.complete_outstanding(second)
+        self.assertEqual(after_second.outstanding, 1)
+        self.assertEqual(after_second.candidate_episodes_served, 2)
+        self.assertEqual(after_second.state, "ROLLED_BACK")
+
+        aborted = controller.abort_outstanding()
+        self.assertEqual(aborted.outstanding, 0)
+        self.assertEqual(aborted.candidate_episodes_served, 2)
+        self.assertEqual(aborted.candidate_episodes_evaluator_unsuccessful, 1)
+        self.assertEqual(aborted.serving_configuration_hash, production_hash)
+
+    def test_automatic_rollback_then_complete_outstanding(self) -> None:
+        reference, candidate = _configs()
+        clock = Clock()
+        production_hash = run_configuration_hash(reference)
+        controller = CanaryController(
+            reference,
+            candidate,
+            settings=CanarySettings(
+                fraction=1.0,
+                outcome_delay_seconds=0.0,
+                harm_margin=0.1,
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=1,
+                ),
+            ),
+            clock=clock,
+        )
+        controller.start(
+            FakeGate(
+                outcome="PASS",
+                reason_codes=(),
+                reference_configuration_hash=production_hash,
+                candidate_configuration_hash=run_configuration_hash(candidate),
+                task_set_hash=reference.task.task_set_hash,
+                reference_protocol_hash=reference.protocol_hash,
+                candidate_protocol_hash=candidate.protocol_hash,
+            )
+        )
+        controller.begin_candidate_episode()
+        controller.begin_candidate_episode()
+        harm = run_pair(
+            "task-1",
+            reference,
+            candidate,
+            reference_run=new_run_identity(reference),
+            candidate_run=new_run_identity(candidate),
+            runtime=_runtime(clock, candidate_success=False),
+            mode="execute",
+        )
+        pair_execution(harm)
+        decision = controller.observe(harm)
+        self.assertEqual(decision.action, "rollback")
+        self.assertFalse(decision.snapshot.rollback_manual)
+        self.assertEqual(decision.snapshot.rollback_reason, "stopping_rule_alarm")
+        self.assertEqual(decision.snapshot.outstanding, 1)
+        self.assertEqual(decision.snapshot.serving_configuration_hash, production_hash)
+
+        trailing = run_pair(
+            "task-2",
+            reference,
+            candidate,
+            reference_run=new_run_identity(reference),
+            candidate_run=new_run_identity(candidate),
+            runtime=_runtime(clock, candidate_success=True),
+            mode="execute",
+        )
+        pair_execution(trailing)
+        finished = controller.complete_outstanding(trailing)
+        self.assertEqual(finished.outstanding, 0)
+        self.assertEqual(finished.candidate_episodes_served, 2)
+        self.assertEqual(finished.state, "ROLLED_BACK")
+        with self.assertRaises(CanaryRejected):
+            controller.observe(
+                run_pair(
+                    "task-3",
+                    reference,
+                    candidate,
+                    reference_run=new_run_identity(reference),
+                    candidate_run=new_run_identity(candidate),
+                    runtime=_runtime(clock, candidate_success=True),
+                    mode="execute",
+                )
+            )
 
 
 if __name__ == "__main__":

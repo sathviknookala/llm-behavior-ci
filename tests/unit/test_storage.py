@@ -257,3 +257,73 @@ class EpisodeStoreTests(unittest.TestCase):
             path = Path(directory) / "missing" / "episodes.sqlite"
             with self.assertRaises(StorageError):
                 EpisodeStore(path)
+
+    def test_finish_failure_keeps_two_appended_steps(self) -> None:
+        run = _run()
+        identity = _identity(run)
+        first = _model_step(0, _START)
+        second = _tool_step(1, _MID)
+        mismatched = _episode(
+            run,
+            identity,
+            model_steps=(first,),
+            tool_steps=(),
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "episodes.sqlite"
+            store = EpisodeStore(path)
+            store.start_episode(identity, run, "task-a")
+            store.append_step(identity.episode_id, first)
+            store.append_step(identity.episode_id, second)
+            with self.assertRaises(StorageError):
+                store.finish_episode(mismatched)
+            opened = store.load_open_episode(identity.episode_id)
+            self.assertEqual(opened.steps, (first, second))
+            store.close()
+            reopened = EpisodeStore(path)
+            recovered = reopened.load_open_episode(identity.episode_id)
+            self.assertEqual(recovered.steps, (first, second))
+            reopened.close()
+
+    def test_alert_dedup_returns_original_row(self) -> None:
+        from llm_behavior_ci.storage import AlertRecord
+
+        first = AlertRecord(
+            configuration_hash=_HASH_A,
+            reference_configuration_hash=_HASH_B,
+            signal="task_success",
+            slice_name="task_success",
+            method="cusum",
+            estimate=1.0,
+            boundary=0.5,
+            sample_size=2,
+            raised_at=_START,
+        )
+        second = AlertRecord(
+            configuration_hash=_HASH_A,
+            reference_configuration_hash=_HASH_B,
+            signal="task_success",
+            slice_name="task_success",
+            method="cusum",
+            estimate=2.0,
+            boundary=0.5,
+            sample_size=3,
+            raised_at=_MID,
+        )
+        with TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite")
+            stored, inserted = store.append_alert_with_status(
+                first,
+                dedup_seconds=3600.0,
+            )
+            self.assertTrue(inserted)
+            self.assertEqual(stored, first)
+            deduped, again = store.append_alert_with_status(
+                second,
+                dedup_seconds=3600.0,
+            )
+            self.assertFalse(again)
+            self.assertEqual(deduped, first)
+            loaded = store.load_alerts(signal="task_success")
+            self.assertEqual(loaded, (first,))
+            store.close()

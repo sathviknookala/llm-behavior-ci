@@ -8,8 +8,10 @@ from tempfile import TemporaryDirectory
 
 try:
     from fastapi.testclient import TestClient
-except ImportError:
-    TestClient = None
+except ImportError as error:
+    raise ImportError(
+        "fastapi is required for tests.integration.test_service_episode"
+    ) from error
 
 from llm_behavior_ci.config import (
     CanarySettings,
@@ -63,9 +65,32 @@ class LazyStore(EpisodeStore):
         self._ensure()
         return super().load_episode(episode_id)
 
+    def load_open_episode(self, episode_id: str):
+        self._ensure()
+        return super().load_open_episode(episode_id)
+
     def append_pair(self, pair) -> None:
         self._ensure()
         return super().append_pair(pair)
+
+    def append_alert_with_status(self, alert, *, dedup_seconds: float = 0.0):
+        self._ensure()
+        return super().append_alert_with_status(
+            alert,
+            dedup_seconds=dedup_seconds,
+        )
+
+    def append_deployment_decision(self, decision):
+        self._ensure()
+        return super().append_deployment_decision(decision)
+
+    def load_alerts(self, *, signal=None):
+        self._ensure()
+        return super().load_alerts(signal=signal)
+
+    def load_deployment_decisions(self):
+        self._ensure()
+        return super().load_deployment_decisions()
 
     def close(self) -> None:
         if self._opened:
@@ -254,12 +279,11 @@ class SpyMonitor(ProductionMonitor):
         super().__init__(*args, **kwargs)
         self.updates: list[object] = []
 
-    def update(self, observation):
+    def update(self, observation, **kwargs):
         self.updates.append(observation)
-        return super().update(observation)
+        return super().update(observation, **kwargs)
 
 
-@unittest.skipUnless(TestClient is not None, "fastapi is not installed")
 class ServiceEpisodeIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         from llm_behavior_ci.service import (
@@ -345,6 +369,7 @@ class ServiceEpisodeIntegrationTests(unittest.TestCase):
                     horizon_episodes=10,
                 ),
             ),
+            canary_assignment_seed=0,
         )
         app = self.create_app(dependencies)
         client = TestClient(app)

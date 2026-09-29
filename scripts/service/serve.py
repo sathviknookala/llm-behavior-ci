@@ -21,7 +21,11 @@ from llm_behavior_ci.lifecycle.monitoring import (
     TaskMetadata,
 )
 from llm_behavior_ci.records import EpisodeResult
-from llm_behavior_ci.runtime.episode import RuntimeDependencies, RuntimeUnavailable
+from llm_behavior_ci.runtime.episode import (
+    RuntimeDependencies,
+    RuntimeUnavailable,
+    build_runtime,
+)
 from llm_behavior_ci.service import (
     ConfigurationRegistry,
     ServiceDependencies,
@@ -72,24 +76,27 @@ def _frozen_reference(payload: object) -> FrozenReference:
 def _runtime_factory_for(
     registry: ConfigurationRegistry,
     *,
-    production_base_url: str | None,
-    candidate_base_url: str | None,
+    production_base_url: str,
+    candidate_base_url: str,
 ) -> Callable[[RunConfiguration], RuntimeDependencies]:
-    production = registry.production
-    candidate = registry.candidate
+    production_hash = run_configuration_hash(registry.production)
+    candidate_hash = (
+        None
+        if registry.candidate is None
+        else run_configuration_hash(registry.candidate)
+    )
 
     def runtime_factory(config: RunConfiguration) -> RuntimeDependencies:
-        if config is production:
+        digest = run_configuration_hash(config)
+        if digest == production_hash:
             url = production_base_url
-        elif candidate is not None and config is candidate:
+        elif candidate_hash is not None and digest == candidate_hash:
             url = candidate_base_url
         else:
             raise RuntimeUnavailable("configuration is not in the registry")
-        if url is None or url == "":
+        if url == "":
             raise RuntimeUnavailable("base url is not configured for this role")
-        from llm_behavior_ci.runtime.aa_capture import live_runtime_factory
-
-        return live_runtime_factory(url)("execute")
+        return build_runtime(config, url, mode="execute")
 
     return runtime_factory
 
@@ -107,7 +114,15 @@ def _metadata_for_factory() -> Callable[[EpisodeResult], TaskMetadata]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Serve the llm-behavior-ci gateway.")
+    if argv is None and len(sys.argv) <= 1:
+        return 2
+    parser = argparse.ArgumentParser(
+        description=(
+            "Serve the llm-behavior-ci gateway. Requires configuration files, "
+            "canary assignment seed, and distinct production and candidate base URLs. "
+            "Does not import vLLM."
+        )
+    )
     parser.add_argument("--production-config", required=True)
     parser.add_argument("--candidate-config", default=None)
     parser.add_argument("--store", required=True)
@@ -117,8 +132,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--monitor-settings", required=True)
     parser.add_argument("--frozen-reference", required=True)
     parser.add_argument("--dedup-seconds", required=True, type=float)
-    parser.add_argument("--production-base-url", default=None)
-    parser.add_argument("--candidate-base-url", default=None)
+    parser.add_argument("--canary-assignment-seed", required=True, type=int)
+    parser.add_argument("--production-base-url", required=True)
+    parser.add_argument("--candidate-base-url", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
     try:
@@ -128,6 +144,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if code is None:
             return 2
         return int(code)
+
+    if args.production_base_url.strip() == "" or args.candidate_base_url.strip() == "":
+        print("production and candidate base URLs are required", file=sys.stderr)
+        return 2
+    if args.production_base_url == args.candidate_base_url:
+        print(
+            "production and candidate base URLs must be distinct",
+            file=sys.stderr,
+        )
+        return 2
 
     production_path = Path(args.production_config)
     store_path = Path(args.store)
@@ -194,6 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             shutdown_timeout_seconds=float(args.shutdown_timeout_seconds),
             metadata_for=_metadata_for_factory(),
             canary_settings=canary_settings,
+            canary_assignment_seed=int(args.canary_assignment_seed),
         )
         app = create_app(dependencies)
     except (ConfigError, StorageError, SystemExit) as error:

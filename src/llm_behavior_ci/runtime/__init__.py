@@ -1,4 +1,13 @@
-from llm_behavior_ci.runtime.agent import VLLMAgent
+from llm_behavior_ci.runtime.agent import (
+    AppWorldActionExecutor,
+    VLLMAgent,
+    action_execution_backend,
+    bind_appworld_action_executor,
+    check_model_identity,
+    reject_local_python_executor,
+    resolve_action_interface,
+    validate_chat_request,
+)
 from llm_behavior_ci.runtime.appworld import (
     EvaluationResult,
     LiveAppWorldSession,
@@ -10,11 +19,20 @@ from llm_behavior_ci.runtime.episode import (
     EvaluatorDifference,
     PairExecution,
     RuntimeDependencies,
+    build_runtime,
     evaluator_difference,
     pair_execution,
     restore_pair_execution,
     run_episode,
     run_pair,
+)
+from llm_behavior_ci.runtime.prompts import (
+    UnknownPromptVersion,
+    registered_plan_format_versions,
+    registered_prompt_versions,
+    render_system_text,
+    resolve_plan_format_template,
+    resolve_prompt_template,
 )
 from llm_behavior_ci.runtime.scoring import (
     DistributionScore,
@@ -23,6 +41,7 @@ from llm_behavior_ci.runtime.scoring import (
 )
 
 __all__ = [
+    "AppWorldActionExecutor",
     "DistributionScore",
     "EpisodeRejected",
     "EvaluationResult",
@@ -32,12 +51,25 @@ __all__ = [
     "RuntimeDependencies",
     "TaskContext",
     "ToolResult",
+    "UnknownPromptVersion",
     "VLLMAgent",
+    "action_execution_backend",
+    "bind_appworld_action_executor",
+    "build_runtime",
+    "check_model_identity",
     "evaluator_difference",
     "pair_execution",
+    "registered_plan_format_versions",
+    "registered_prompt_versions",
+    "reject_local_python_executor",
+    "render_system_text",
+    "resolve_action_interface",
+    "resolve_plan_format_template",
+    "resolve_prompt_template",
     "restore_pair_execution",
     "run_episode",
     "run_pair",
     "score_full",
     "score_top_k",
+    "validate_chat_request",
 ]

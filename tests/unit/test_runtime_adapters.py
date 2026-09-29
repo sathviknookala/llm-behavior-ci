@@ -1,17 +1,36 @@
 import builtins
+import json
 import math
+import threading
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import URLError
 
 from llm_behavior_ci.config import RunConfiguration
-from llm_behavior_ci.runtime.agent import VLLMAgent, parse_model_output
+from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.runtime.agent import (
+    VLLMAgent,
+    action_execution_backend,
+    bind_appworld_action_executor,
+    check_model_identity,
+    parse_model_output,
+    reject_local_python_executor,
+    resolve_action_interface,
+    validate_chat_request,
+)
 from llm_behavior_ci.runtime.appworld import (
     LiveAppWorldSession,
     TaskContext,
     _open_appworld,
 )
 from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+from llm_behavior_ci.runtime.prompts import (
+    UnknownPromptVersion,
+    render_system_text,
+    resolve_prompt_template,
+)
 from llm_behavior_ci.runtime.scoring import score_full, score_top_k
 
 
@@ -79,6 +98,33 @@ def _config() -> RunConfiguration:
     return RunConfiguration.from_dict(_payload())
 
 
+def _context() -> TaskContext:
+    return TaskContext(
+        task_id="task-1",
+        instruction="solve the task",
+        api_documentation="docs",
+    )
+
+
+def _completion_body(text: str = "STOP") -> dict[str, object]:
+    return {
+        "choices": [
+            {
+                "message": {"content": text},
+                "logprobs": {
+                    "content": [
+                        {
+                            "token_id": 7,
+                            "logprob": -0.5,
+                            "top_logprobs": [],
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+
+
 class FakeWorld:
     def __init__(self) -> None:
         self.task = SimpleNamespace(
@@ -97,6 +143,20 @@ class FakeWorld:
 
     def close(self) -> None:
         self.closed += 1
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode("utf-8")
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        del exc_type, exc, tb
 
 
 class RuntimeAdapterTests(unittest.TestCase):
@@ -140,12 +200,7 @@ class RuntimeAdapterTests(unittest.TestCase):
 
     def test_completion_payload_contains_sampling_prompt_and_thinking(self) -> None:
         agent = VLLMAgent("http://127.0.0.1:9")
-        context = TaskContext(
-            task_id="task-1",
-            instruction="solve the task",
-            api_documentation="docs",
-        )
-        agent.begin(context, _config())
+        agent.begin(_context(), _config())
         payload = agent.completion_payload(agent.messages())
         self.assertEqual(payload["temperature"], 0.0)
         self.assertEqual(payload["seed"], 17)
@@ -154,7 +209,204 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(extra["min_p"], 0.0)
         self.assertFalse(extra["chat_template_kwargs"]["enable_thinking"])
         system = payload["messages"][0]["content"]
-        self.assertIn("prompt_version=prompt-v1", system)
+        self.assertIn("You are an AppWorld tool-using agent.", system)
+        self.assertIn("Prompt registry id: prompt-v1", system)
+
+    def test_unknown_prompt_version_is_rejected(self) -> None:
+        with self.assertRaises(UnknownPromptVersion):
+            resolve_prompt_template("prompt-missing")
+        with self.assertRaises(UnknownPromptVersion):
+            render_system_text(
+                prompt_version="prompt-missing",
+                plan_format_version="plan-v1",
+                thinking_enabled=False,
+                action_interface="code",
+                mode="execute",
+            )
+        agent = VLLMAgent("http://127.0.0.1:9")
+        config = replace(
+            _config(),
+            agent=replace(
+                _config().agent,
+                prompt=replace(
+                    _config().agent.prompt,
+                    prompt_version="prompt-missing",
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeUnavailable, "unknown prompt_version"):
+            agent.begin(_context(), config)
+
+    def test_known_prompt_version_is_more_than_an_interpolated_id(self) -> None:
+        text = render_system_text(
+            prompt_version="prompt-v1",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="plan",
+        )
+        self.assertIn("You are an AppWorld tool-using agent.", text)
+        self.assertIn("Emit a numbered plan before acting.", text)
+        self.assertNotEqual(text, "prompt-v1")
+        self.assertNotEqual(
+            text,
+            "prompt_version=prompt-v1\nplan_format_version=plan-v1\n",
+        )
+        agent = VLLMAgent("http://127.0.0.1:9")
+        agent.set_mode("plan")
+        agent.begin(_context(), _config())
+        system = agent.messages()[0]["content"]
+        self.assertIn("Do not execute tools while planning.", system)
+        self.assertIn("Prompt registry id: prompt-v1", system)
+
+    def test_local_python_executor_is_not_on_the_action_path(self) -> None:
+        self.assertEqual(action_execution_backend(), "appworld_session.execute")
+        with self.assertRaisesRegex(RuntimeUnavailable, "LocalPythonExecutor"):
+            reject_local_python_executor()
+        actions: list[str] = []
+
+        def execute(action: str) -> str:
+            actions.append(action)
+            return f"ok:{action}"
+
+        executor = bind_appworld_action_executor(execute)
+        self.assertEqual(executor("calendar.lookup()"), "ok:calendar.lookup()")
+        self.assertEqual(actions, ["calendar.lookup()"])
+        self.assertFalse(hasattr(executor, "authorized_imports"))
+
+    def test_unsupported_action_interface_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeUnavailable, "unsupported action_interface"):
+            resolve_action_interface("local_python")
+        with self.assertRaisesRegex(RuntimeUnavailable, "unsupported action_interface"):
+            resolve_action_interface("shell")
+
+    def test_unsupported_serving_flags_are_rejected(self) -> None:
+        config = replace(
+            _config(),
+            model=replace(
+                _config().model,
+                serving=replace(_config().model.serving, batch_invariant=True),
+            ),
+        )
+        with self.assertRaisesRegex(
+            RuntimeUnavailable,
+            "serving.batch_invariant cannot be applied via chat completions",
+        ):
+            validate_chat_request(config)
+        agent = VLLMAgent("http://127.0.0.1:9")
+        with self.assertRaisesRegex(RuntimeUnavailable, "batch_invariant"):
+            agent.begin(_context(), config)
+        eager = replace(
+            _config(),
+            model=replace(
+                _config().model,
+                serving=replace(_config().model.serving, enforce_eager=True),
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeUnavailable, "enforce_eager"):
+            validate_chat_request(eager)
+
+    def test_model_identity_check_reports_unchecked_fields(self) -> None:
+        config = _config()
+        unchecked = check_model_identity(
+            config,
+            {
+                "id": "Qwen/Qwen3-4B",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
+            },
+        )
+        self.assertIn("weights_digest", unchecked)
+        self.assertIn("model.serving.batch_invariant", unchecked)
+        self.assertIn("model.serving.dtype", unchecked)
+        self.assertNotIn("model.model.repository", unchecked)
+        self.assertNotIn("model.model.revision", unchecked)
+        with self.assertRaisesRegex(RuntimeUnavailable, "served model id"):
+            check_model_identity(config, {"id": "other/model", "root": "other/model"})
+
+    def test_teacher_force_plan_posts_frozen_plan_not_max_tokens_generation(
+        self,
+    ) -> None:
+        agent = VLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), _config())
+        posted: list[dict[str, object]] = []
+
+        def fake_urlopen(request, timeout=None):
+            del timeout
+            payload = json.loads(request.data.decode("utf-8"))
+            posted.append(payload)
+            return _FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": ""},
+                            "logprobs": {
+                                "content": [
+                                    {
+                                        "token_id": 3,
+                                        "logprob": -0.25,
+                                        "top_logprobs": [],
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            )
+
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "plan please"},
+        ]
+        plan_text = "1. open the calendar\n2. book the slot"
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            logprobs = agent.teacher_force_plan(
+                messages=messages,
+                plan_text=plan_text,
+            )
+        self.assertEqual(len(posted), 1)
+        body = posted[0]
+        self.assertEqual(body["max_tokens"], 0)
+        self.assertEqual(body["messages"][-1]["role"], "assistant")
+        self.assertEqual(body["messages"][-1]["content"], plan_text)
+        self.assertNotEqual(body["max_tokens"], _config().agent.sampling.max_tokens)
+        self.assertEqual(
+            logprobs,
+            ((TokenLogprob(token_id=3, logprob=-0.25, rank=0),),),
+        )
+
+    def test_concurrent_begins_isolate_history(self) -> None:
+        agent = VLLMAgent("http://127.0.0.1:9")
+        barrier = threading.Barrier(2)
+        seen: dict[str, list[str]] = {"a": [], "b": []}
+        errors: list[BaseException] = []
+
+        def worker(name: str, marker: str) -> None:
+            try:
+                agent.begin(_context(), _config())
+                barrier.wait()
+                with patch(
+                    "urllib.request.urlopen",
+                    side_effect=lambda request, timeout=None: _FakeResponse(
+                        _completion_body(f"CALL calendar lookup\n{marker}")
+                    ),
+                ):
+                    turn = agent.next_turn(tool_output=None)
+                barrier.wait()
+                messages = agent.messages()
+                seen[name] = [item["content"] for item in messages if item["role"] == "assistant"]
+                self.assertEqual(turn.action, marker)
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=worker, args=("a", "action-a()"))
+        second = threading.Thread(target=worker, args=("b", "action-b()"))
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(seen["a"], ["CALL calendar lookup\naction-a()"])
+        self.assertEqual(seen["b"], ["CALL calendar lookup\naction-b()"])
 
     def test_parse_model_output_stop_and_call(self) -> None:
         self.assertEqual(parse_model_output("STOP"), (None, None, None))
@@ -189,3 +441,13 @@ class RuntimeAdapterTests(unittest.TestCase):
             score = score_top_k(((0.0,),), ((0.0,),))
         self.assertEqual(score.kind, "top_k")
         self.assertEqual(score.mean_kl_nats, 0.25)
+
+    def test_http_failure_is_runtime_unavailable(self) -> None:
+        agent = VLLMAgent("http://127.0.0.1:9")
+        agent.begin(_context(), _config())
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=URLError("down"),
+        ):
+            with self.assertRaises(RuntimeUnavailable):
+                agent.next_turn(tool_output=None)

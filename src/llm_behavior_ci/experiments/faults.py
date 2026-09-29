@@ -53,6 +53,23 @@ _KINDS = frozenset(
     }
 )
 _SCHEMA_KINDS = frozenset({"api_documentation", "lora"})
+_LIVE_UNAVAILABLE_KINDS = frozenset(
+    {
+        "quantization",
+        "lora",
+        "api_documentation",
+    }
+)
+_LIVE_UNAVAILABLE_CONTROLS = frozenset({"batch_invariant"})
+_LIVE_UNAVAILABLE_REASONS: Mapping[str, str] = {
+    "quantization": "quantization weights are unavailable for live execution",
+    "lora": "LoRA weights are unavailable for live execution",
+    "api_documentation": (
+        "optional hashed leaves agent.api_docs_version and agent.api_docs_app "
+        "are unavailable for live execution"
+    ),
+    "batch_invariant": "GPU serving flag is unavailable for live execution",
+}
 _BENIGN_CONTROLS = frozenset(
     {
         "identical",
@@ -90,6 +107,20 @@ _KIND_PATHS: Mapping[str, frozenset[str]] = {
     "step_limit": frozenset({"agent.step_limit"}),
     "api_documentation": frozenset(),
     "lora": frozenset(),
+}
+_SCHEMA_KIND_PATHS: Mapping[str, frozenset[str]] = {
+    "api_documentation": frozenset(
+        {
+            "agent.api_docs_version",
+            "agent.api_docs_app",
+        }
+    ),
+    "lora": frozenset(
+        {
+            "model.lora.repository",
+            "model.lora.revision",
+        }
+    ),
 }
 _BENIGN_PATHS: Mapping[str, frozenset[str]] = {
     "identical": frozenset(),
@@ -184,6 +215,49 @@ class FaultSpec:
     @property
     def representable(self) -> bool:
         return self.schema_request is None
+
+    @property
+    def schema_supported(self) -> bool:
+        if self.kind not in _KINDS:
+            return False
+        if self.kind in _SCHEMA_KINDS:
+            return (
+                self.schema_request is not None
+                and self.kind in _SCHEMA_KIND_PATHS
+                and len(self.patches) == 0
+            )
+        return True
+
+
+@dataclass(frozen=True)
+class LiveFaultAvailability:
+    available: bool
+    reason: str | None = None
+
+
+def live_fault_available(fault: FaultSpec) -> LiveFaultAvailability:
+    """Report whether a catalog fault can be executed live.
+
+    Schema-gap and GPU-backed faults stay in coverage reports as unavailable
+    rather than absent. ``apply_fault`` still rejects schema-gap faults and
+    does not apply an empty patch for them.
+    """
+
+    if not isinstance(fault, FaultSpec):
+        raise FaultError("live_fault_available requires a fault spec")
+    if fault.schema_request is not None:
+        return LiveFaultAvailability(available=False, reason=str(fault.schema_request))
+    if fault.kind in _LIVE_UNAVAILABLE_KINDS:
+        return LiveFaultAvailability(
+            available=False,
+            reason=_LIVE_UNAVAILABLE_REASONS[fault.kind],
+        )
+    if fault.kind == "benign_control" and fault.control in _LIVE_UNAVAILABLE_CONTROLS:
+        return LiveFaultAvailability(
+            available=False,
+            reason=_LIVE_UNAVAILABLE_REASONS[fault.control],
+        )
+    return LiveFaultAvailability(available=True, reason=None)
 
 
 @dataclass(frozen=True)
@@ -419,8 +493,10 @@ def apply_fault(base: RunConfiguration, fault: FaultSpec) -> RunConfiguration:
     """Return a new configuration with only the fault's declared hashed leaves changed.
 
     Does not mutate ``base``. Schema-gap faults raise and do not return a
-    configuration. After reconstruction, the set of changed ``HASHED_FIELDS``
-    must equal the declared patch paths.
+    configuration. Live-unavailable representable faults may still patch
+    hashed leaves; ``live_fault_available`` reports execution status. After
+    reconstruction, the set of changed ``HASHED_FIELDS`` must equal the
+    declared patch paths.
     """
 
     if not isinstance(base, RunConfiguration):
@@ -633,7 +709,7 @@ def freeze_harm_label(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Print catalog fault versions and whether each is representable."""
+    """Print catalog fault versions and schema or live-execution status."""
 
     parser = argparse.ArgumentParser(
         description="List fault catalog entries without measuring harm."
@@ -642,6 +718,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     catalog = load_fault_catalog(Path(args.catalog))
     for fault in catalog:
-        status = "representable" if fault.representable else "schema_gap"
+        availability = live_fault_available(fault)
+        if not fault.representable:
+            status = "schema_gap"
+        elif availability.available:
+            status = "live"
+        else:
+            status = "live_unavailable"
         print(f"{fault.fault_version}\t{fault.kind}\t{status}")
     return 0

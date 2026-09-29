@@ -24,12 +24,13 @@ from llm_behavior_ci.runtime.aa_capture import (
     repeated_schedule,
     write_local_capture,
 )
-from llm_behavior_ci.runtime.agent import AgentTurn
+from llm_behavior_ci.runtime.agent import AgentTurn, VLLMAgent
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
     RuntimeDependencies,
     RuntimeUnavailable,
+    build_runtime,
     evaluator_difference,
     pair_execution,
     run_pair,
@@ -245,22 +246,37 @@ class PlainWorld:
 
 
 class PairAgent:
-    def __init__(self, clock: Clock, *, mode: str, diverge: bool) -> None:
+    def __init__(
+        self,
+        clock: Clock,
+        *,
+        mode: str,
+        diverge: bool,
+        endpoint: str | None = None,
+        force_candidate: bool | None = None,
+    ) -> None:
         self._clock = clock
         self._mode = mode
         self._diverge = diverge
+        self.endpoint = endpoint
+        self._force_candidate = force_candidate
         self._begins = 0
         self._step = 0
         self._reference = True
         self.begins = 0
+        self.began_endpoints: list[str | None] = []
         self.tool_outputs: list[list[str | None]] = []
 
     def begin(self, context: TaskContext, config: RunConfiguration) -> None:
         del context, config
         self.begins += 1
         self._begins += 1
-        self._reference = self._begins % 2 == 1
+        if self._force_candidate is None:
+            self._reference = self._begins % 2 == 1
+        else:
+            self._reference = not self._force_candidate
         self._step = 0
+        self.began_endpoints.append(self.endpoint)
         self.tool_outputs.append([])
 
     def next_turn(self, *, tool_output: str | None) -> AgentTurn:
@@ -676,6 +692,60 @@ class PairedExecutionTests(unittest.TestCase):
         self.assertEqual(pair_execution(pair).initial_state_identity, expected)
         self.assertEqual(len(worlds), 2)
         self.assertEqual([world.close_count for world in worlds], [1, 1])
+
+    def test_distinct_runtimes_keep_reference_off_candidate_endpoint(self) -> None:
+        config = _config()
+        clock = Clock()
+        worlds: list[World] = []
+        reference_agent = PairAgent(
+            clock,
+            mode="execute",
+            diverge=False,
+            endpoint="http://127.0.0.1:8000",
+            force_candidate=False,
+        )
+        candidate_agent = PairAgent(
+            clock,
+            mode="execute",
+            diverge=True,
+            endpoint="http://127.0.0.1:8001",
+            force_candidate=True,
+        )
+
+        def factory(task_id: str) -> World:
+            world = World(task_id, "same-state")
+            worlds.append(world)
+            return world
+
+        pair = run_pair(
+            "task-1",
+            config,
+            config,
+            reference_run=new_run_identity(config),
+            candidate_run=new_run_identity(config),
+            runtime=RuntimeDependencies(
+                session_factory=factory,
+                agent=reference_agent,
+                clock=clock,
+            ),
+            candidate_runtime=RuntimeDependencies(
+                session_factory=factory,
+                agent=candidate_agent,
+                clock=clock,
+            ),
+            mode="execute",
+        )
+        self.assertEqual(reference_agent.began_endpoints, ["http://127.0.0.1:8000"])
+        self.assertEqual(candidate_agent.began_endpoints, ["http://127.0.0.1:8001"])
+        self.assertEqual(reference_agent.begins, 1)
+        self.assertEqual(candidate_agent.begins, 1)
+        self.assertEqual(worlds[0].seen, ["reference.lookup()"])
+        self.assertEqual(worlds[1].seen, ["candidate.lookup()"])
+        self.assertEqual(pair.reference.role, "reference")
+        self.assertEqual(pair.candidate.role, "candidate")
+        built = build_runtime(config, "http://127.0.0.1:8000")
+        self.assertIsInstance(built.agent, VLLMAgent)
+        self.assertEqual(built.agent.base_url, "http://127.0.0.1:8000")
 
 
 class AACaptureTests(unittest.TestCase):
