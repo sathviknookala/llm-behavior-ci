@@ -130,6 +130,7 @@ class DeploymentDecisionRecord:
     sample_size: int
     decided_at: datetime
     evidence_artifact_id: str | None = None
+    evidence_source: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -144,6 +145,7 @@ class DeploymentDecisionRecord:
             "sample_size": self.sample_size,
             "decided_at": self.decided_at.isoformat(),
             "evidence_artifact_id": self.evidence_artifact_id,
+            "evidence_source": self.evidence_source,
         }
 
     @classmethod
@@ -184,6 +186,11 @@ class DeploymentDecisionRecord:
             not isinstance(evidence_artifact_id, str) or evidence_artifact_id == ""
         ):
             raise StorageError("deployment decision evidence_artifact_id is invalid")
+        evidence_source = payload.get("evidence_source")
+        if evidence_source is not None and (
+            not isinstance(evidence_source, str) or evidence_source == ""
+        ):
+            raise StorageError("deployment decision evidence_source is invalid")
         return cls(
             configuration_hash=str(payload["configuration_hash"]),
             reference_configuration_hash=str(
@@ -198,6 +205,7 @@ class DeploymentDecisionRecord:
             sample_size=sample_size,
             decided_at=parsed,
             evidence_artifact_id=evidence_artifact_id,
+            evidence_source=evidence_source,
         )
 
 

@@ -152,7 +152,11 @@ def _gate_artifact(
         task_set_hash=task_set_hash or reference.task.task_set_hash,
         task_split=reference.task.split,
         statistics=statistics,
-        validation_provenance=validation_provenance,
+        evidence_source=(
+            "synthetic_fixture"
+            if validation_provenance == "synthetic_fixture"
+            else "gate_run"
+        ),
         created_at=datetime.now(timezone.utc),
     )
 
@@ -398,6 +402,37 @@ def _metadata_for(episode) -> TaskMetadata:
     return TaskMetadata(signal="task_success", completion_index=0)
 
 
+def _monitor_with_plan_signals(production: RunConfiguration, clock) -> SpyMonitor:
+    digest = run_configuration_hash(production)
+    settings = MonitorSettings(
+        reference_configuration_hash=digest,
+        outcome_delay_seconds=0.0,
+        signals=("task_success", "plan_quality_score", "plan_kl_mean_nats"),
+        stopping_rules=(
+            StoppingRule(
+                name="cusum",
+                alpha=0.1,
+                horizon_episodes=20,
+                threshold=5.0,
+            ),
+        ),
+    )
+    reference = FrozenReference(
+        configuration_hash=digest,
+        baselines=(
+            ("task_success", 0.9),
+            ("plan_quality_score", 0.8),
+            ("plan_kl_mean_nats", 0.1),
+        ),
+    )
+    return SpyMonitor(
+        settings,
+        reference,
+        clock=clock,
+        dedup_seconds=0.0,
+    )
+
+
 class ServiceUnitTests(unittest.TestCase):
     def setUp(self) -> None:
         from llm_behavior_ci.service import (
@@ -452,6 +487,7 @@ class ServiceUnitTests(unittest.TestCase):
         max_in_flight: int = 4,
         candidate: RunConfiguration | None = None,
         shutdown_timeout_seconds: float = 1.0,
+        admission_mode: str = "release",
     ):
         registry = self.ConfigurationRegistry(
             production=self.production,
@@ -474,6 +510,7 @@ class ServiceUnitTests(unittest.TestCase):
             metadata_for=_metadata_for,
             canary_settings=_canary_settings(),
             canary_assignment_seed=0,
+            admission_mode=admission_mode,
         )
 
     def _client(self, dependencies=None):
@@ -496,6 +533,67 @@ class ServiceUnitTests(unittest.TestCase):
             return reader.load_deployment_decisions()
         finally:
             reader.close()
+
+    def _dependencies_with_monitor(self, monitor, **overrides):
+        registry = self.ConfigurationRegistry(
+            production=self.production,
+            candidate=self.candidate,
+        )
+        base = dict(
+            registry=registry,
+            runtime_factory=lambda config: self._runtime(),
+            store=self.store,
+            monitor=monitor,
+            clock=self.clock,
+            max_in_flight=4,
+            shutdown_timeout_seconds=1.0,
+            metadata_for=_metadata_for,
+            canary_settings=_canary_settings(),
+            canary_assignment_seed=0,
+        )
+        base.update(overrides)
+        return self.ServiceDependencies(**base)
+
+    def test_plan_signals_reach_detector_when_supplied(self) -> None:
+        monitor = _monitor_with_plan_signals(self.production, self.clock)
+
+        def plan_quality_features_for(episode):
+            del episode
+            return {"requirement_coverage_fraction": 0.75}
+
+        def plan_kl_mean_nats_for(episode):
+            del episode
+            return 0.2
+
+        dependencies = self._dependencies_with_monitor(
+            monitor,
+            plan_quality_features_for=plan_quality_features_for,
+            plan_kl_mean_nats_for=plan_kl_mean_nats_for,
+        )
+        with TestClient(self.create_app(dependencies)) as client:
+            response = client.post(
+                "/episodes",
+                json={"task_id": "task-1", "mode": "execute", "role": "production"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["monitoring_status"], "updated")
+        by_signal = {observation.signal: observation.value for observation in monitor.updates}
+        self.assertEqual(by_signal.get("plan_quality_score"), 0.75)
+        self.assertEqual(by_signal.get("plan_kl_mean_nats"), 0.2)
+
+    def test_plan_signals_skip_without_crashing_when_not_supplied(self) -> None:
+        monitor = _monitor_with_plan_signals(self.production, self.clock)
+        dependencies = self._dependencies_with_monitor(monitor)
+        with TestClient(self.create_app(dependencies)) as client:
+            response = client.post(
+                "/episodes",
+                json={"task_id": "task-1", "mode": "execute", "role": "production"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["monitoring_status"], "updated")
+        signals_seen = {observation.signal for observation in monitor.updates}
+        self.assertNotIn("plan_quality_score", signals_seen)
+        self.assertNotIn("plan_kl_mean_nats", signals_seen)
 
     def test_rejects_extra_model_fields_and_keeps_registry_hash(self) -> None:
         before = run_configuration_hash(self.production)
@@ -609,6 +707,7 @@ class ServiceUnitTests(unittest.TestCase):
         decisions = self._read_decisions()
         self.assertEqual(decisions[-1].decision, "admit")
         self.assertEqual(decisions[-1].evidence_artifact_id, artifact.artifact_id)
+        self.assertEqual(decisions[-1].evidence_source, "gate_run")
 
     def test_candidate_admission_rejects_synthetic_fixture_evidence(self) -> None:
         client = self._client()
@@ -623,6 +722,23 @@ class ServiceUnitTests(unittest.TestCase):
             json={"artifact_id": artifact.artifact_id},
         )
         self.assertEqual(response.status_code, 409)
+
+    def test_test_mode_admission_accepts_synthetic_fixture_evidence(self) -> None:
+        client = self._client(self._dependencies(admission_mode="test"))
+        artifact = _gate_artifact(
+            self.production,
+            self.candidate,
+            validation_provenance="synthetic_fixture",
+        )
+        self._persist_artifact(artifact)
+        response = client.post(
+            "/candidates",
+            json={"artifact_id": artifact.artifact_id},
+        )
+        self.assertEqual(response.status_code, 200)
+        decisions = self._read_decisions()
+        self.assertEqual(decisions[-1].decision, "admit")
+        self.assertEqual(decisions[-1].evidence_source, "synthetic_fixture")
 
     def test_runtime_unavailable_returns_503(self) -> None:
         def factory(config: RunConfiguration) -> RuntimeDependencies:

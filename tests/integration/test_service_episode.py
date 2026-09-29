@@ -549,5 +549,171 @@ class MultiSignalServiceMonitoringTests(unittest.TestCase):
         )
 
 
+def _load_serve_module():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "service"
+        / "serve.py"
+    )
+    spec = importlib.util.spec_from_file_location("serve_cli", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ServeBuiltDependenciesFeedToolSelectionTests(unittest.TestCase):
+    """A service built the way ``scripts/service/serve.py`` builds it.
+
+    Exercises ``serve._build_dependencies`` end to end, including the
+    distributional-monitor factory wiring, rather than constructing a
+    ``DistributionalMonitor`` by hand the way other tests in this module
+    do. Only ``runtime_factory`` is swapped afterward for a fake, since a
+    real one would dial a live vLLM base URL this suite never starts.
+    """
+
+    def setUp(self) -> None:
+        self.serve = _load_serve_module()
+        self._tmpdir = TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.clock = _clock()
+        self.production = _config()
+        self.digest = run_configuration_hash(self.production)
+
+    def _write(self, name: str, document: object) -> Path:
+        import json
+
+        path = self.root / name
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def _args(self):
+        import argparse
+
+        production_path = self._write("production.json", _payload())
+        canary_path = self._write(
+            "canary.json",
+            CanarySettings(
+                fraction=1.0,
+                outcome_delay_seconds=0.0,
+                harm_margin=0.1,
+                stopping_rule=StoppingRule(
+                    name="fixed_window",
+                    alpha=0.05,
+                    horizon_episodes=10,
+                ),
+                metric_orientation="higher_is_better",
+                promotion_policy="horizon_reached_without_harm",
+            ).to_dict(),
+        )
+        monitor_path = self._write(
+            "monitor.json",
+            MonitorSettings(
+                reference_configuration_hash=self.digest,
+                outcome_delay_seconds=0.0,
+                signals=("task_success",),
+                stopping_rules=(
+                    StoppingRule(
+                        name="cusum",
+                        alpha=0.1,
+                        horizon_episodes=20,
+                        threshold=5.0,
+                    ),
+                ),
+            ).to_dict(),
+        )
+        frozen_path = self._write(
+            "frozen_reference.json",
+            {
+                "configuration_hash": self.digest,
+                "baselines": [["task_success", 0.9]],
+            },
+        )
+        distributional_path = self._write(
+            "distributional_monitors.json",
+            [
+                DistributionalMonitorSettings(
+                    signal="tool_selection",
+                    reference_counts=(("lookup", 1),),
+                    window_episodes=10,
+                    alpha=0.01,
+                    correction="none",
+                ).to_dict()
+            ],
+        )
+        store_path = self.root / "episodes.sqlite"
+        return argparse.Namespace(
+            production_config=str(production_path),
+            candidate_config=None,
+            store=str(store_path),
+            max_in_flight=4,
+            shutdown_timeout_seconds=1.0,
+            canary_settings=str(canary_path),
+            monitor_settings=str(monitor_path),
+            frozen_reference=str(frozen_path),
+            dedup_seconds=0.0,
+            canary_assignment_seed=0,
+            production_base_url="http://production.invalid",
+            candidate_base_url="http://candidate.invalid",
+            distributional_monitors=str(distributional_path),
+            slice_attribution=False,
+        ), store_path
+
+    def test_serve_built_service_feeds_tool_selection_observation(self) -> None:
+        from dataclasses import replace as dc_replace
+
+        args, store_path = self._args()
+        dependencies = self.serve._build_dependencies(args)
+        self.assertIsNotNone(dependencies.tool_selection_monitor)
+        dependencies.store.close()
+
+        def fake_runtime_factory(config: RunConfiguration) -> RuntimeDependencies:
+            del config
+            return RuntimeDependencies(
+                session_factory=lambda task_id: FakeSession(task_id),
+                agent=FakeAgent(
+                    [
+                        _turn(_ACTION, action=_ACTION, api_name="lookup"),
+                        _turn("STOP", action=None),
+                    ],
+                    clock=self.clock,
+                ),
+                clock=self.clock,
+            )
+
+        dependencies = dc_replace(
+            dependencies,
+            runtime_factory=fake_runtime_factory,
+            store=LazyStore(store_path),
+            clock=self.clock,
+            metadata_for=lambda episode: TaskMetadata(
+                signal="task_success", completion_index=0
+            ),
+        )
+        app = self.serve.create_app(dependencies)
+        with TestClient(app) as client:
+            response = client.post(
+                "/episodes",
+                json={
+                    "task_id": "task-1",
+                    "mode": "execute",
+                    "role": "production",
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["monitoring_status"], "updated")
+
+        reader = EpisodeStore(store_path)
+        self.addCleanup(reader.close)
+        persisted = reader.load_monitor_metadata_for_episode(body["episode_id"])
+        persisted_signals = {record.signal for record in persisted}
+        self.assertIn("tool_selection", persisted_signals)
+
+
 if __name__ == "__main__":
     unittest.main()

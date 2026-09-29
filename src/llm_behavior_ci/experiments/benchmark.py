@@ -12,10 +12,11 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from llm_behavior_ci.config import (
     CanarySettings,
+    DistributionalMonitorSettings,
     GateSettings,
     MonitorSettings,
     RunConfiguration,
@@ -35,21 +36,27 @@ from llm_behavior_ci.experiments.protocol import (
     ProtocolLock,
     TaskSelectionAllowance,
     authorize_faulted_candidate,
+    authorize_gated_candidate,
     authorize_test_gated_candidate,
     bind_protocol,
 )
 from llm_behavior_ci.export import AggregateResults, ExportError, export_public_results
 from llm_behavior_ci.lifecycle.canary import CanaryController, CanaryDecision, CanaryRejected
 from llm_behavior_ci.lifecycle.monitoring import (
+    PLAN_KL_SIGNAL,
+    PLAN_QUALITY_SIGNAL,
     FrozenReference,
     ProductionMonitor,
     TaskMetadata,
+    build_distributional_monitors,
     observation_from_episode,
+    tool_selection_observation_from_episode,
 )
 from llm_behavior_ci.lifecycle.offline_gate import (
     GateDecision,
     GateExecutionError,
     PlanEvidenceInputs,
+    plan_evidence_from_dict as _canonical_plan_evidence_from_dict,
     plan_evidence_to_dict,
     run_offline_gate,
 )
@@ -60,6 +67,7 @@ from llm_behavior_ci.records import (
     MonitorObservation,
     PairedResult,
     StatisticalEvidence,
+    ToolSelectionObservation,
 )
 from llm_behavior_ci.runtime.episode import (
     PairExecution,
@@ -117,6 +125,7 @@ class GateTierOutcome:
     public_decision: LifecycleDecision | None
     statistics: tuple[StatisticalEvidence, ...]
     validation_provenance: str | None
+    evidence_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +185,7 @@ class BenchmarkResult:
     wall_seconds: float
     gpu_memory_mib: float | None
     gpu_hours: float | None
+    admission_mode: str
 
 
 def _under_results(path: Path) -> bool:
@@ -210,15 +220,26 @@ def _seeds_from_lock(protocol: ProtocolLock) -> tuple[int, ...]:
 
 def _settings_from_lock(
     protocol: ProtocolLock,
-) -> tuple[GateSettings, CanarySettings, MonitorSettings, StreamSettings]:
+) -> tuple[
+    GateSettings,
+    CanarySettings,
+    MonitorSettings,
+    StreamSettings,
+    tuple[DistributionalMonitorSettings, ...],
+]:
     try:
         gate = GateSettings.from_dict(protocol.payload["gate"])
         canary = CanarySettings.from_dict(protocol.payload["canary"])
         monitor = MonitorSettings.from_dict(protocol.payload["monitor"])
         stream = StreamSettings.from_dict(protocol.payload["stream"])
+        distributional_raw = protocol.payload.get("distributional_monitors", [])
+        distributional = tuple(
+            DistributionalMonitorSettings.from_dict(item)
+            for item in distributional_raw
+        )
     except Exception as error:
         raise BenchmarkError("protocol lock settings are invalid") from error
-    return gate, canary, monitor, stream
+    return gate, canary, monitor, stream, distributional
 
 
 def _templates_by_split(
@@ -442,25 +463,9 @@ def _reference_baselines_to_dict(reference: FrozenReference) -> dict[str, object
 
 
 def _plan_evidence_from_dict(payload: Mapping[str, object]) -> PlanEvidenceInputs:
-    features = payload.get("plan_quality_features")
-    weights = payload.get("plan_quality_weights")
-    mmd_features = payload.get("mmd_features")
-    required = payload.get("required_statistics")
-    if not isinstance(features, list) or not isinstance(weights, list):
-        raise BenchmarkError("plan evidence features are invalid")
-    if not isinstance(mmd_features, list) or not isinstance(required, list):
-        raise BenchmarkError("plan evidence feature lists are invalid")
     try:
-        return PlanEvidenceInputs(
-            plan_format_version=str(payload["plan_format_version"]),
-            plan_quality_features=tuple(str(item) for item in features),
-            plan_quality_weights=tuple(float(item) for item in weights),
-            mmd_features=tuple(str(item) for item in mmd_features),
-            kl_approximation=str(payload["kl_approximation"]),  # type: ignore[arg-type]
-            required_statistics=tuple(str(item) for item in required),
-            validation_provenance=str(payload["validation_provenance"]),
-        )
-    except (GateExecutionError, KeyError, TypeError, ValueError) as error:
+        return _canonical_plan_evidence_from_dict(payload)
+    except GateExecutionError as error:
         raise BenchmarkError("plan evidence is invalid") from error
 
 
@@ -651,6 +656,7 @@ def _gate_outcome_from_decision(
         public_decision=decision.public_decision,
         statistics=decision.statistics,
         validation_provenance=decision.validation_provenance,
+        evidence_source=decision.artifact.evidence_source,
     )
 
 
@@ -740,6 +746,7 @@ def _serialize_replicate(outcome: ReplicateOutcome) -> dict[str, object]:
             ),
             "statistics": [item.to_dict() for item in outcome.gate.statistics],
             "validation_provenance": outcome.gate.validation_provenance,
+            "evidence_source": outcome.gate.evidence_source,
         },
         "canary": _serialize_canary_outcome(outcome.canary),
         "monitor": _serialize_monitor_outcome(outcome.monitor),
@@ -781,6 +788,11 @@ def _deserialize_replicate(payload: Mapping[str, object]) -> ReplicateOutcome:
                 None
                 if gate.get("validation_provenance") is None
                 else str(gate["validation_provenance"])
+            ),
+            evidence_source=(
+                None
+                if gate.get("evidence_source") is None
+                else str(gate["evidence_source"])
             ),
         ),
         canary=CanaryTierOutcome(
@@ -844,6 +856,7 @@ def _aggregate(
     wall_seconds: float,
     gpu_memory_mib: float | None,
     gpu_hours: float | None,
+    admission_mode: str,
 ) -> BenchmarkResult:
     scored = [item for item in replicates if _is_complete_replicate(item)]
     gate_catch = 0
@@ -917,6 +930,7 @@ def _aggregate(
         wall_seconds=wall_seconds,
         gpu_memory_mib=gpu_memory_mib,
         gpu_hours=gpu_hours,
+        admission_mode=admission_mode,
     )
 
 
@@ -1197,24 +1211,28 @@ def _start_canary_controller(
     reference: RunConfiguration,
     candidate: RunConfiguration,
     allowance: TaskSelectionAllowance,
+    admission_mode: Literal["release", "test"],
 ) -> None:
     """Start the canary from this run's own, just-computed gate decision.
 
-    Calls ``authorize_test_gated_candidate`` rather than
-    ``authorize_gated_candidate``: ``gate_decision.artifact`` was produced
-    a few calls up this same stack, by this same process, either from a
-    real ``run_offline_gate`` call or (for the CPU synthetic path) from
-    one that used a ``synthetic_fixture``-provenance ``PlanEvidenceInputs``.
-    Either way it is trusted in-process evidence, not an externally
-    supplied claim, so the permissive test entry point is the correct one
-    here; the strict ``authorize_gated_candidate`` is reserved for
-    ``service.py``'s HTTP ``/candidates`` route, which admits a candidate
-    on an untrusted caller's say-so and must never accept synthetic
-    evidence.
+    ``admission_mode="test"`` calls ``authorize_test_gated_candidate``,
+    which also accepts ``synthetic_fixture``-sourced evidence; that is
+    correct for the CPU synthetic path, where ``gate_decision.artifact``
+    was produced a few calls up this same stack from a
+    ``synthetic_fixture``-provenance ``PlanEvidenceInputs``.
+    ``admission_mode="release"`` calls the strict
+    ``authorize_gated_candidate``, which refuses synthetic evidence, and is
+    the mode a caller running this benchmark against a real, live-runtime
+    gate decision must choose.
     """
 
+    authorize = (
+        authorize_test_gated_candidate
+        if admission_mode == "test"
+        else authorize_gated_candidate
+    )
     try:
-        admission = authorize_test_gated_candidate(
+        admission = authorize(
             gate_decision.artifact,
             reference,
             candidate,
@@ -1256,6 +1274,7 @@ def run_lifecycle_benchmark(
     reference_baselines: FrozenReference,
     checkpoint_path: Path,
     plan_evidence: PlanEvidenceInputs,
+    admission_mode: Literal["release", "test"],
     export_path: Path | None = None,
     should_interrupt: Callable[[BenchmarkProgress], bool] | None = None,
     candidate_runtime: RuntimeDependencies | None = None,
@@ -1274,6 +1293,8 @@ def run_lifecycle_benchmark(
         raise BenchmarkError("candidate_runtime must be RuntimeDependencies when set")
     if not isinstance(plan_evidence, PlanEvidenceInputs):
         raise BenchmarkError("run_lifecycle_benchmark requires plan evidence inputs")
+    if admission_mode not in {"release", "test"}:
+        raise BenchmarkError("admission_mode must be release or test")
     if not isinstance(train_tasks, TaskSet) or not isinstance(
         test_normal_tasks, TaskSet
     ):
@@ -1285,9 +1306,13 @@ def run_lifecycle_benchmark(
     if export_path is not None:
         _refuse_results_path(Path(export_path), "export_path")
 
-    gate_settings, canary_settings, monitor_settings, stream_settings = (
-        _settings_from_lock(protocol)
-    )
+    (
+        gate_settings,
+        canary_settings,
+        monitor_settings,
+        stream_settings,
+        distributional_monitor_settings,
+    ) = _settings_from_lock(protocol)
     if (
         reference_baselines.configuration_hash
         != monitor_settings.reference_configuration_hash
@@ -1453,6 +1478,7 @@ def run_lifecycle_benchmark(
                 document=document,
                 should_interrupt=should_interrupt,
                 fault_version=fault.fault_version,
+                admission_mode=admission_mode,
             )
             if canary_result["interrupted"]:
                 interrupted = True
@@ -1528,6 +1554,7 @@ def run_lifecycle_benchmark(
                 test_normal_template=test_normal_template,
                 test_normal_tasks=test_normal_tasks,
                 monitor_settings=monitor_settings,
+                distributional_monitor_settings=distributional_monitor_settings,
                 stream_settings=stream_settings,
                 reference_baselines=reference_baselines,
                 runtime=runtime,
@@ -1574,6 +1601,7 @@ def run_lifecycle_benchmark(
         wall_seconds=wall_seconds,
         gpu_memory_mib=gpu_memory_mib,
         gpu_hours=gpu_hours,
+        admission_mode=admission_mode,
     )
     if status == "completed" and export_path is not None:
         try:
@@ -1690,6 +1718,7 @@ def _run_or_resume_canary(
     document: dict[str, Any],
     should_interrupt: Callable[[BenchmarkProgress], bool] | None,
     fault_version: str,
+    admission_mode: Literal["release", "test"],
 ) -> dict[str, Any]:
     reference, candidate = _authorize_faulted_test_normal(
         protocol, test_normal_template, test_normal_tasks, fault
@@ -1738,6 +1767,7 @@ def _run_or_resume_canary(
         reference=reference,
         candidate=candidate,
         allowance=allowance,
+        admission_mode=admission_mode,
     )
 
     started = time.perf_counter()
@@ -1882,6 +1912,7 @@ def _run_or_resume_monitor(
     test_normal_template: RunConfiguration,
     test_normal_tasks: TaskSet,
     monitor_settings: MonitorSettings,
+    distributional_monitor_settings: tuple[DistributionalMonitorSettings, ...] = (),
     stream_settings: StreamSettings,
     reference_baselines: FrozenReference,
     runtime: RuntimeDependencies,
@@ -1933,6 +1964,13 @@ def _run_or_resume_monitor(
         clock=runtime.clock,
         dedup_seconds=0.0,
     )
+    distributional_monitors = build_distributional_monitors(
+        distributional_monitor_settings,
+        reference_configuration_hash=reference_baselines.configuration_hash,
+        clock=runtime.clock,
+        dedup_seconds=0.0,
+    )
+    tool_monitor = distributional_monitors.get("tool_selection")
     started = time.perf_counter()
     compute_base = float(monitor_blob.get("compute_seconds", 0.0))
     agent_base = float(monitor_blob.get("agent_execution_seconds", 0.0))
@@ -1959,6 +1997,15 @@ def _run_or_resume_monitor(
             observation = MonitorObservation.from_dict(observation_payload)
             detector_started = time.perf_counter()
             alerts = monitor.update(observation)
+            detector_delta += time.perf_counter() - detector_started
+            if alerts and first_alert_index is None:
+                first_alert_index = int(item["stream_index"])
+                alerted = True
+        tool_selection_payload = item.get("tool_selection")
+        if tool_monitor is not None and tool_selection_payload is not None:
+            selection = ToolSelectionObservation.from_dict(tool_selection_payload)
+            detector_started = time.perf_counter()
+            alerts = tool_monitor.update(selection)
             detector_delta += time.perf_counter() - detector_started
             if alerts and first_alert_index is None:
                 first_alert_index = int(item["stream_index"])
@@ -2026,6 +2073,8 @@ def _run_or_resume_monitor(
         observation_payloads: list[dict[str, object]] = []
         new_alerts = False
         for signal in monitor_settings.signals:
+            if signal in (PLAN_QUALITY_SIGNAL, PLAN_KL_SIGNAL):
+                continue
             observation = observation_from_episode(
                 episode,
                 task_metadata=TaskMetadata(
@@ -2039,6 +2088,21 @@ def _run_or_resume_monitor(
             observation_payloads.append(observation.to_dict())
             if alerts:
                 new_alerts = True
+        tool_selection_payload: dict[str, object] | None = None
+        if tool_monitor is not None:
+            selection = tool_selection_observation_from_episode(
+                episode,
+                task_metadata=TaskMetadata(
+                    signal="tool_selection",
+                    completion_index=arrival.index,
+                ),
+            )
+            detector_started = time.perf_counter()
+            alerts = tool_monitor.update(selection)
+            detector_delta += time.perf_counter() - detector_started
+            tool_selection_payload = selection.to_dict()
+            if alerts:
+                new_alerts = True
         if new_alerts and first_alert_index is None:
             first_alert_index = arrival.index
             alerted = True
@@ -2046,6 +2110,7 @@ def _run_or_resume_monitor(
             {
                 "stream_index": arrival.index,
                 "observations": observation_payloads,
+                "tool_selection": tool_selection_payload,
             }
         )
         if first_alert_index is not None:

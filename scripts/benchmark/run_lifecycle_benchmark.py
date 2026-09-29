@@ -17,7 +17,11 @@ from llm_behavior_ci.experiments.benchmark import (
 from llm_behavior_ci.experiments.faults import FaultError, load_fault
 from llm_behavior_ci.experiments.protocol import ProtocolError, require_protocol_lock
 from llm_behavior_ci.lifecycle.monitoring import FrozenReference
-from llm_behavior_ci.lifecycle.offline_gate import GateExecutionError, PlanEvidenceInputs
+from llm_behavior_ci.lifecycle.offline_gate import (
+    GateExecutionError,
+    PlanEvidenceInputs,
+    plan_evidence_from_dict,
+)
 from llm_behavior_ci.runtime.episode import RuntimeDependencies
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
@@ -82,23 +86,8 @@ def _load_plan_evidence(payload: object) -> PlanEvidenceInputs:
     if not isinstance(payload, dict):
         raise BenchmarkError("plan evidence must be an object")
     try:
-        features = tuple(str(item) for item in payload["plan_quality_features"])
-        weights = tuple(float(item) for item in payload["plan_quality_weights"])
-        mmd_features = tuple(str(item) for item in payload["mmd_features"])
-        required = tuple(str(item) for item in payload["required_statistics"])
-        approximation = str(payload["kl_approximation"])
-        if approximation not in {"full", "top_k"}:
-            raise BenchmarkError("kl_approximation must be full or top_k")
-        return PlanEvidenceInputs(
-            plan_format_version=str(payload["plan_format_version"]),
-            plan_quality_features=features,
-            plan_quality_weights=weights,
-            mmd_features=mmd_features,
-            kl_approximation=approximation,  # type: ignore[arg-type]
-            required_statistics=required,
-            validation_provenance=str(payload["validation_provenance"]),
-        )
-    except (GateExecutionError, KeyError, TypeError, ValueError) as error:
+        return plan_evidence_from_dict(payload)
+    except GateExecutionError as error:
         raise BenchmarkError("plan evidence is incomplete") from error
 
 
@@ -202,11 +191,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         test_normal_tasks = _load_task_set(_load_json(Path(args.test_normal_tasks)))
         baselines = _frozen_reference(_load_json(Path(args.baselines)))
         plan_evidence = _load_plan_evidence(_load_json(Path(args.plan_evidence)))
-        if plan_evidence.validation_provenance != "synthetic_fixture":
-            if plan_evidence.validation_provenance != "validated":
-                raise BenchmarkError(
-                    "plan evidence validation_provenance must be synthetic_fixture or validated"
-                )
+        if plan_evidence.validation_provenance == "synthetic_fixture":
+            admission_mode = "test"
+        elif plan_evidence.validation_provenance == "validated":
+            admission_mode = "release"
+        else:
+            raise BenchmarkError(
+                "plan evidence validation_provenance must be synthetic_fixture or validated"
+            )
         runtime = _load_runtime(runtime_spec)
         result = run_lifecycle_benchmark(
             protocol,
@@ -217,6 +209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             reference_baselines=baselines,
             checkpoint_path=checkpoint,
             plan_evidence=plan_evidence,
+            admission_mode=admission_mode,
             export_path=export_path,
         )
     except SystemExit as error:

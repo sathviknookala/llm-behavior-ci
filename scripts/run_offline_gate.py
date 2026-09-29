@@ -11,12 +11,12 @@ from llm_behavior_ci.lifecycle.offline_gate import (
     GateDecision,
     GateExecutionError,
     PlanEvidenceInputs,
+    plan_evidence_from_dict,
     run_offline_gate,
 )
 from llm_behavior_ci.records import assert_public_payload, public_record_dict
 from llm_behavior_ci.runtime.episode import RuntimeDependencies, build_runtime
 from llm_behavior_ci.storage import EpisodeStore, StorageError
-from llm_behavior_ci.tasks.plan_specs import PlanSpecError, task_plan_specs_from_mapping
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
     TaskSet,
@@ -72,29 +72,7 @@ def _load_task_set(payload: object) -> TaskSet:
 def _load_plan_evidence(payload: object) -> PlanEvidenceInputs:
     if not isinstance(payload, dict):
         raise GateExecutionError("plan evidence must be an object")
-    try:
-        features = tuple(str(item) for item in payload["plan_quality_features"])
-        weights = tuple(float(item) for item in payload["plan_quality_weights"])
-        mmd_features = tuple(str(item) for item in payload["mmd_features"])
-        required = tuple(str(item) for item in payload["required_statistics"])
-        approximation = str(payload["kl_approximation"])
-        if approximation not in {"full", "top_k"}:
-            raise GateExecutionError("kl_approximation must be full or top_k")
-        task_plan_specs = task_plan_specs_from_mapping(
-            payload.get("task_plan_specs", [])
-        )
-        return PlanEvidenceInputs(
-            plan_format_version=str(payload["plan_format_version"]),
-            plan_quality_features=features,
-            plan_quality_weights=weights,
-            mmd_features=mmd_features,
-            kl_approximation=approximation,  # type: ignore[arg-type]
-            required_statistics=required,
-            validation_provenance=str(payload["validation_provenance"]),
-            task_plan_specs=task_plan_specs,
-        )
-    except (GateExecutionError, PlanSpecError, KeyError, TypeError, ValueError) as error:
-        raise GateExecutionError("plan evidence is incomplete") from error
+    return plan_evidence_from_dict(payload)
 
 
 class _SwitchingAgent:
@@ -141,6 +119,9 @@ class _SwitchingAgent:
             setter = getattr(agent, "set_mode", None)
             if callable(setter):
                 setter(mode)
+
+    def underlying_agents(self) -> tuple[object, ...]:
+        return (self._reference_agent, self._candidate_agent)
 
 
 def _live_runtime(

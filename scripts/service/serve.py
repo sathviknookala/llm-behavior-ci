@@ -11,6 +11,7 @@ from typing import Callable
 from llm_behavior_ci.config import (
     CanarySettings,
     ConfigError,
+    DistributionalMonitorSettings,
     MonitorSettings,
     RunConfiguration,
     run_configuration_hash,
@@ -19,6 +20,7 @@ from llm_behavior_ci.lifecycle.monitoring import (
     FrozenReference,
     ProductionMonitor,
     TaskMetadata,
+    build_distributional_monitors,
 )
 from llm_behavior_ci.records import EpisodeResult
 from llm_behavior_ci.runtime.episode import (
@@ -113,6 +115,85 @@ def _metadata_for_factory() -> Callable[[EpisodeResult], TaskMetadata]:
     return metadata_for
 
 
+def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
+    """Build the exact ``ServiceDependencies`` a live ``serve.py`` process runs.
+
+    Pure with respect to the network: it reads the caller's config files
+    and builds the monitor, distributional monitors, and runtime factory,
+    but never starts ``uvicorn``. ``main`` calls this before creating the
+    app so a caller (a test, or another entry point) can build the same
+    dependencies and wrap them in ``create_app``/``TestClient`` directly.
+    """
+
+    production = RunConfiguration.from_dict(
+        _load_json(Path(args.production_config))
+    )
+    candidate = None
+    if args.candidate_config is not None:
+        candidate = RunConfiguration.from_dict(
+            _load_json(Path(args.candidate_config))
+        )
+    canary_settings = CanarySettings.from_dict(_load_json(Path(args.canary_settings)))
+    monitor_settings = MonitorSettings.from_dict(
+        _load_json(Path(args.monitor_settings))
+    )
+    frozen = _frozen_reference(_load_json(Path(args.frozen_reference)))
+    if frozen.configuration_hash != run_configuration_hash(production):
+        raise ConfigError(
+            "frozen reference hash must match production configuration"
+        )
+    if monitor_settings.reference_configuration_hash != frozen.configuration_hash:
+        raise ConfigError(
+            "monitor settings reference hash must match frozen reference"
+        )
+    store = EpisodeStore(Path(args.store))
+    clock = lambda: datetime.now(timezone.utc)
+    monitor = ProductionMonitor(
+        monitor_settings,
+        frozen,
+        clock=clock,
+        dedup_seconds=float(args.dedup_seconds),
+        use_slice_attribution=bool(args.slice_attribution),
+    )
+    distributional_settings: tuple[DistributionalMonitorSettings, ...] = ()
+    if args.distributional_monitors is not None:
+        raw_distributional = _load_json(Path(args.distributional_monitors))
+        if not isinstance(raw_distributional, list):
+            raise ConfigError("distributional monitors document must be a list")
+        distributional_settings = tuple(
+            DistributionalMonitorSettings.from_dict(item)
+            for item in raw_distributional
+        )
+    distributional_monitors = build_distributional_monitors(
+        distributional_settings,
+        reference_configuration_hash=frozen.configuration_hash,
+        clock=clock,
+        dedup_seconds=float(args.dedup_seconds),
+    )
+    registry = ConfigurationRegistry(
+        production=production,
+        candidate=candidate,
+    )
+    return ServiceDependencies(
+        registry=registry,
+        runtime_factory=_runtime_factory_for(
+            registry,
+            production_base_url=args.production_base_url,
+            candidate_base_url=args.candidate_base_url,
+        ),
+        store=store,
+        monitor=monitor,
+        clock=clock,
+        max_in_flight=int(args.max_in_flight),
+        shutdown_timeout_seconds=float(args.shutdown_timeout_seconds),
+        metadata_for=_metadata_for_factory(),
+        canary_settings=canary_settings,
+        canary_assignment_seed=int(args.canary_assignment_seed),
+        tool_selection_monitor=distributional_monitors.get("tool_selection"),
+        task_mix_monitor=distributional_monitors.get("task_mix"),
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     if argv is None and len(sys.argv) <= 1:
         return 2
@@ -135,6 +216,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--canary-assignment-seed", required=True, type=int)
     parser.add_argument("--production-base-url", required=True)
     parser.add_argument("--candidate-base-url", required=True)
+    parser.add_argument("--distributional-monitors", default=None)
+    parser.add_argument("--slice-attribution", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
     try:
@@ -163,6 +246,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     required_paths = [production_path, canary_path, monitor_path, frozen_path]
     if args.candidate_config is not None:
         required_paths.append(Path(args.candidate_config))
+    if args.distributional_monitors is not None:
+        required_paths.append(Path(args.distributional_monitors))
     for path in required_paths:
         if not path.is_file():
             print(f"missing file: {path}", file=sys.stderr)
@@ -170,58 +255,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _refuse_results_store(store_path)
 
     try:
-        production = RunConfiguration.from_dict(_load_json(production_path))
-        candidate = None
-        if args.candidate_config is not None:
-            candidate = RunConfiguration.from_dict(
-                _load_json(Path(args.candidate_config))
-            )
-        canary_settings = CanarySettings.from_dict(_load_json(canary_path))
-        monitor_settings = MonitorSettings.from_dict(_load_json(monitor_path))
-        frozen = _frozen_reference(_load_json(frozen_path))
-        if frozen.configuration_hash != run_configuration_hash(production):
-            print(
-                "frozen reference hash must match production configuration",
-                file=sys.stderr,
-            )
-            return 2
-        if (
-            monitor_settings.reference_configuration_hash
-            != frozen.configuration_hash
-        ):
-            print(
-                "monitor settings reference hash must match frozen reference",
-                file=sys.stderr,
-            )
-            return 2
-        store = EpisodeStore(store_path)
-        clock = lambda: datetime.now(timezone.utc)
-        monitor = ProductionMonitor(
-            monitor_settings,
-            frozen,
-            clock=clock,
-            dedup_seconds=float(args.dedup_seconds),
-        )
-        registry = ConfigurationRegistry(
-            production=production,
-            candidate=candidate,
-        )
-        dependencies = ServiceDependencies(
-            registry=registry,
-            runtime_factory=_runtime_factory_for(
-                registry,
-                production_base_url=args.production_base_url,
-                candidate_base_url=args.candidate_base_url,
-            ),
-            store=store,
-            monitor=monitor,
-            clock=clock,
-            max_in_flight=int(args.max_in_flight),
-            shutdown_timeout_seconds=float(args.shutdown_timeout_seconds),
-            metadata_for=_metadata_for_factory(),
-            canary_settings=canary_settings,
-            canary_assignment_seed=int(args.canary_assignment_seed),
-        )
+        dependencies = _build_dependencies(args)
         app = create_app(dependencies)
     except (ConfigError, StorageError, SystemExit) as error:
         if isinstance(error, SystemExit):

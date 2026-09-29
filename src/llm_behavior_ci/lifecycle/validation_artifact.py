@@ -9,11 +9,10 @@ computed, the plan-feature schema version, the run identities of the two
 paired executions, and a creation timestamp.
 
 ``evidence_source`` is not read back from the caller at admission time.
-The gate itself sets it, once, from ``PlanEvidenceInputs.
-validation_provenance``: the reserved token ``synthetic_fixture`` produces
-``evidence_source="synthetic_fixture"``; every other provenance string
-produces ``evidence_source="gate_run"``. Admission never sees the raw
-provenance string again, only this closed, gate-assigned field, and
+``run_offline_gate`` sets it, once, from whether the runtime that actually
+produced the episodes was live (``runtime.episode.is_live_runtime``), not
+from any caller-supplied provenance string. Admission never sees a raw
+provenance string, only this closed, gate-assigned field, and
 ``experiments.protocol.authorize_gated_candidate`` refuses
 ``synthetic_fixture`` outright. ``authorize_test_gated_candidate`` is the
 explicit, separately named entry point that accepts either, so CPU tests
@@ -111,6 +110,7 @@ class ValidationArtifact(Record):
     candidate_git_commit: str
     plan_feature_schema_version: str
     statistics: tuple[StatisticalEvidence, ...]
+    scoring_contract_hashes: tuple[str, ...]
     created_at: datetime
 
     def __post_init__(self) -> None:
@@ -146,6 +146,12 @@ class ValidationArtifact(Record):
         _git_revision(self.reference_git_commit, "reference_git_commit")
         _git_revision(self.candidate_git_commit, "candidate_git_commit")
         _line(self.plan_feature_schema_version, "plan_feature_schema_version")
+        if not isinstance(self.scoring_contract_hashes, tuple):
+            raise RecordError("scoring_contract_hashes must be a tuple")
+        for item in self.scoring_contract_hashes:
+            _sha256(item, "scoring_contract_hashes item")
+        if list(self.scoring_contract_hashes) != sorted(self.scoring_contract_hashes):
+            raise RecordError("scoring_contract_hashes must be sorted")
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise RecordError("created_at must be a timezone-aware timestamp")
 
@@ -174,20 +180,21 @@ def build_validation_artifact(
     task_set_hash: str,
     task_split: str,
     statistics: Sequence[StatisticalEvidence],
-    validation_provenance: str,
+    evidence_source: str,
     created_at: datetime,
+    scoring_contract_hashes: Sequence[str] = (),
 ) -> ValidationArtifact:
     """Build the artifact a real gate execution emits.
 
-    ``evidence_source`` is derived here, once, from ``validation_provenance``
-    rather than accepted as a caller-chosen field on the artifact itself:
-    the only way to obtain a ``gate_run`` artifact is to call this from
-    ``run_offline_gate`` with a provenance string other than the reserved
-    ``synthetic_fixture`` token.
+    ``evidence_source`` is not derived here: the caller (``run_offline_gate``)
+    determines it from whether the runtime that actually produced the
+    episodes was live (``runtime.episode.is_live_runtime``), not from any
+    caller-supplied provenance label. That keeps a fake runtime from ever
+    producing a ``gate_run`` artifact by choosing a favorable string.
     """
 
-    if not isinstance(validation_provenance, str) or not validation_provenance:
-        raise RecordError("validation_provenance must be a non-empty string")
+    if evidence_source not in EVIDENCE_SOURCES:
+        raise RecordError("evidence_source must be gate_run or synthetic_fixture")
     if not isinstance(reference, RunConfiguration) or not isinstance(
         candidate, RunConfiguration
     ):
@@ -196,11 +203,6 @@ def build_validation_artifact(
         candidate_run, RunIdentity
     ):
         raise RecordError("build_validation_artifact requires run identities")
-    evidence_source = (
-        "synthetic_fixture"
-        if validation_provenance == SYNTHETIC_FIXTURE_PROVENANCE
-        else "gate_run"
-    )
     return ValidationArtifact(
         schema_version=GATE_VALIDATION_ARTIFACT_SCHEMA_VERSION,
         evidence_source=evidence_source,
@@ -218,5 +220,6 @@ def build_validation_artifact(
         candidate_git_commit=candidate.git_commit,
         plan_feature_schema_version=PLAN_FEATURE_SCHEMA_VERSION,
         statistics=tuple(statistics),
+        scoring_contract_hashes=tuple(sorted(scoring_contract_hashes)),
         created_at=created_at,
     )

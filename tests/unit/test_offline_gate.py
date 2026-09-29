@@ -12,6 +12,8 @@ from llm_behavior_ci.config import GateSettings, RunConfiguration, run_configura
 from llm_behavior_ci.lifecycle.offline_gate import (
     GateExecutionError,
     PlanEvidenceInputs,
+    plan_evidence_from_dict,
+    plan_evidence_to_dict,
     run_offline_gate,
 )
 from llm_behavior_ci.records import TokenLogprob
@@ -386,6 +388,14 @@ class OfflineGateUnitTests(unittest.TestCase):
         self.assertIsNotNone(decision.statistics[2].seed)
         self.assertEqual(decision.validation_provenance, "synthetic_fixture")
         self.assertNotEqual(decision.statistics[0].estimate, 1.0)
+        self.assertEqual(len(decision.artifact.scoring_contract_hashes), 4)
+        self.assertEqual(
+            decision.artifact.scoring_contract_hashes,
+            tuple(sorted(decision.artifact.scoring_contract_hashes)),
+        )
+        for digest in decision.artifact.scoring_contract_hashes:
+            self.assertEqual(len(digest), 64)
+            int(digest, 16)
 
     def test_plan_quality_scores_vary_with_plan_content(self) -> None:
         task_set = _task_set()
@@ -417,6 +427,7 @@ class OfflineGateUnitTests(unittest.TestCase):
             short.statistics[0].estimate,
             long.statistics[0].estimate,
         )
+        self.assertEqual(short.artifact.scoring_contract_hashes, ())
 
     def test_identical_plans_do_not_require_constant_one(self) -> None:
         task_set = _task_set()
@@ -920,6 +931,51 @@ class OfflineGateUnitTests(unittest.TestCase):
                 runtime=_runtime(),
                 plan_evidence=_evidence(),
             )
+
+    def test_plan_evidence_round_trip_preserves_vocabulary_size_and_specs(
+        self,
+    ) -> None:
+        evidence = _evidence(
+            kl_approximation="full",
+            kl_vocabulary_size=32000,
+            task_plan_specs=_task_plan_specs(),
+        )
+        payload = plan_evidence_to_dict(evidence)
+        restored = plan_evidence_from_dict(payload)
+        self.assertEqual(restored.kl_vocabulary_size, 32000)
+        self.assertEqual(restored.task_plan_specs, _task_plan_specs())
+
+    def test_unknown_validation_provenance_is_rejected(self) -> None:
+        with self.assertRaises(GateExecutionError):
+            _evidence(validation_provenance="not-a-real-provenance")
+
+    def test_validated_provenance_with_fake_runtime_is_execution_error(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        with self.assertRaises(GateExecutionError):
+            run_offline_gate(
+                reference,
+                candidate,
+                task_set,
+                settings=_settings(),
+                runtime=_runtime(),
+                plan_evidence=_evidence(validation_provenance="validated"),
+            )
+
+    def test_fake_runtime_never_yields_gate_run_evidence(self) -> None:
+        task_set = _task_set()
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        decision = run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=_settings(),
+            runtime=_runtime(),
+            plan_evidence=_evidence(),
+        )
+        self.assertEqual(decision.artifact.evidence_source, "synthetic_fixture")
 
     def test_repeated_calls_are_deterministic(self) -> None:
         task_set = _task_set()

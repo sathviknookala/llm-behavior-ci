@@ -417,7 +417,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             task_set_hash=reference.task.task_set_hash,
             task_split=reference.task.split,
             statistics=statistics,
-            validation_provenance="validated",
+            evidence_source="gate_run",
             created_at=datetime.now(timezone.utc),
         )
         writer = EpisodeStore(self.store_path)

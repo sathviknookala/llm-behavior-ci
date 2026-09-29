@@ -24,6 +24,7 @@ from llm_behavior_ci.lifecycle.plan_features import (
     structural_plan_features,
 )
 from llm_behavior_ci.lifecycle.validation_artifact import (
+    SYNTHETIC_FIXTURE_PROVENANCE,
     ValidationArtifact,
     build_validation_artifact,
 )
@@ -37,6 +38,7 @@ from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
     RuntimeDependencies,
     RuntimeUnavailable,
+    is_live_runtime,
     run_pair,
 )
 from llm_behavior_ci.runtime.scoring import (
@@ -59,6 +61,10 @@ from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task
 _STATISTIC_NAMES = frozenset({"plan_quality", "kl", "mmd"})
 _MODEL_STEP_FEATURE = "model_step_count"
 _KL_APPROXIMATIONS = KL_FIDELITY_MODES
+VALIDATED_PROVENANCE = "validated"
+_VALIDATION_PROVENANCE_VALUES = frozenset(
+    {SYNTHETIC_FIXTURE_PROVENANCE, VALIDATED_PROVENANCE}
+)
 
 
 class GateExecutionError(ValueError):
@@ -100,8 +106,10 @@ class PlanEvidenceInputs:
     def __post_init__(self) -> None:
         if not isinstance(self.plan_format_version, str) or not self.plan_format_version:
             raise GateExecutionError("plan_format_version must be a non-empty string")
-        if not isinstance(self.validation_provenance, str) or not self.validation_provenance:
-            raise GateExecutionError("validation_provenance must be a non-empty string")
+        if self.validation_provenance not in _VALIDATION_PROVENANCE_VALUES:
+            raise GateExecutionError(
+                "validation_provenance must be synthetic_fixture or validated"
+            )
         if self.kl_approximation not in _KL_APPROXIMATIONS:
             raise GateExecutionError("kl_approximation must be full or top_k")
         if self.kl_vocabulary_size is not None and (
@@ -540,6 +548,15 @@ def run_offline_gate(
     if not isinstance(runtime, RuntimeDependencies):
         raise GateExecutionError("run_offline_gate requires runtime dependencies")
 
+    if plan_evidence.validation_provenance == VALIDATED_PROVENANCE:
+        if not is_live_runtime(runtime):
+            raise GateExecutionError(
+                "validated provenance requires a live AppWorld/vLLM runtime"
+            )
+        evidence_source = "gate_run"
+    else:
+        evidence_source = "synthetic_fixture"
+
     reference_hash = run_configuration_hash(reference)
     candidate_hash = run_configuration_hash(candidate)
     seed = _decision_seed(
@@ -583,6 +600,7 @@ def run_offline_gate(
                     settings=settings,
                     reason_codes=("tool_execution",),
                     validation_provenance=plan_evidence.validation_provenance,
+                    evidence_source=evidence_source,
                     created_at=runtime.clock(),
                 )
             if not _plan_succeeded(pair.reference) or not _plan_succeeded(
@@ -599,6 +617,7 @@ def run_offline_gate(
                     settings=settings,
                     reason_codes=("plan_run_failed",),
                     validation_provenance=plan_evidence.validation_provenance,
+                    evidence_source=evidence_source,
                     created_at=runtime.clock(),
                 )
             pairs.append(
@@ -620,6 +639,7 @@ def run_offline_gate(
     clusters = tuple(label for _reference, _candidate, label, _task_id in pairs)
     statistics: list[StatisticalEvidence] = []
     reason_codes: list[str] = []
+    scoring_contract_hashes: list[str] = []
 
     if "plan_quality" in required:
         reference_scores = tuple(
@@ -668,6 +688,7 @@ def run_offline_gate(
         else:
             production_positions: list[tuple[float, ...]] = []
             candidate_positions: list[tuple[float, ...]] = []
+            contract_hashes: list[str] = []
             kl_reason: str | None = None
             for reference_episode, _candidate_episode, _label, task_id in pairs:
                 if reference_episode.plan_text is None:
@@ -710,6 +731,8 @@ def run_offline_gate(
                         declared_vocabulary_size=plan_evidence.kl_vocabulary_size,
                     )
                     verify_scoring_contracts(reference_contract, candidate_contract)
+                    contract_hashes.append(reference_contract.content_hash())
+                    contract_hashes.append(candidate_contract.content_hash())
                 except (PositionAlignmentError, SupportAlignmentError):
                     kl_reason = "kl_alignment_failed"
                     break
@@ -727,6 +750,7 @@ def run_offline_gate(
             if kl_reason is not None:
                 reason_codes.append(kl_reason)
             else:
+                scoring_contract_hashes.extend(contract_hashes)
                 try:
                     if plan_evidence.kl_approximation == "full":
                         scored = score_full(production_positions, candidate_positions)
@@ -813,7 +837,8 @@ def run_offline_gate(
         task_set_hash=task_set.task_set_hash,
         task_split=task_set.split,
         statistics=statistics,
-        validation_provenance=plan_evidence.validation_provenance,
+        evidence_source=evidence_source,
+        scoring_contract_hashes=scoring_contract_hashes,
         created_at=decided_at,
     )
     return GateDecision(
@@ -844,6 +869,7 @@ def _blocked_without_statistics(
     settings: GateSettings,
     reason_codes: Sequence[str],
     validation_provenance: str,
+    evidence_source: str,
     created_at: datetime,
 ) -> GateDecision:
     artifact = build_validation_artifact(
@@ -856,7 +882,7 @@ def _blocked_without_statistics(
         task_set_hash=task_set.task_set_hash,
         task_split=task_set.split,
         statistics=(),
-        validation_provenance=validation_provenance,
+        evidence_source=evidence_source,
         created_at=created_at,
     )
     return GateDecision(

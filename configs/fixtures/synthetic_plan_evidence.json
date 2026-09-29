@@ -1,11 +1,13 @@
 {
   "plan_format_version": "plan-v1",
   "plan_quality_features": [
-    "numbered_step_count",
-    "token_count"
+    "requirement_coverage_fraction",
+    "invalid_tool_reference_fraction",
+    "numbered_step_count"
   ],
   "plan_quality_weights": [
     1.0,
+    -1.0,
     0.1
   ],
   "mmd_features": [

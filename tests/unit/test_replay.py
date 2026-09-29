@@ -522,6 +522,82 @@ class DistributionalReplayTests(unittest.TestCase):
                 schedule=schedule,
             )
 
+    def test_cli_replays_a_distributional_counts_stream(self) -> None:
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            counts_path = directory / "counts.json"
+            settings_path = directory / "settings.json"
+            schedule_path = directory / "schedule.json"
+            output_path = directory / "output.json"
+            counts_path.write_text(
+                json.dumps(
+                    [
+                        {"calendar.lookup": 4, "mail.send": 1},
+                        {"calendar.lookup": 4, "mail.send": 1},
+                        {"mail.send": 10},
+                        {"mail.send": 10},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            settings_path.write_text(
+                json.dumps(
+                    DistributionalMonitorSettings(
+                        signal="tool_selection",
+                        reference_counts=(("calendar.lookup", 80), ("mail.send", 20)),
+                        window_episodes=2,
+                        alpha=0.01,
+                        correction="none",
+                    ).to_dict()
+                ),
+                encoding="utf-8",
+            )
+            schedule_path.write_text(
+                json.dumps(
+                    {
+                        "outcome_delay_seconds": 0.0,
+                        "horizon_episodes": 2,
+                        "onset_index": 2,
+                        "scenario_keys": [f"scenario-{index}" for index in range(4)],
+                        "arrival_times": [
+                            (_START + timedelta(seconds=index)).isoformat()
+                            for index in range(4)
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = "src"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(_CLI),
+                    "--distributional-counts",
+                    str(counts_path),
+                    "--distributional-settings",
+                    str(settings_path),
+                    "--schedule",
+                    str(schedule_path),
+                    "--output",
+                    str(output_path),
+                ],
+                cwd=_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            document = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(document["visibility"], "public")
+            result = document["methods"]["chi_square_hourly"]
+            self.assertFalse(result["missed_horizon"])
+            self.assertEqual(result["detection_delay_episodes"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

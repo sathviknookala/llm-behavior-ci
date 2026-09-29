@@ -52,6 +52,29 @@ class RuntimeDependencies:
     clock: Callable[[], datetime]
 
 
+def is_live_runtime(runtime: RuntimeDependencies) -> bool:
+    """True only when both the session and every underlying agent are live.
+
+    Imports the live adapters lazily, as ``build_runtime`` does, so this
+    stays CPU-testable without AppWorld or smolagents installed. A wrapper
+    around several agents (a switching agent used to run reference and
+    candidate through one gate call) exposes them through
+    ``underlying_agents()``; every one of them must be a real
+    ``SmolagentsVLLMAgent`` for the runtime to count as live.
+    """
+
+    from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
+    from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
+
+    if runtime.session_factory is not LiveAppWorldSession:
+        return False
+    underlying = getattr(runtime.agent, "underlying_agents", None)
+    agents = underlying() if callable(underlying) else (runtime.agent,)
+    return len(agents) > 0 and all(
+        isinstance(agent, SmolagentsVLLMAgent) for agent in agents
+    )
+
+
 def _reject(
     task_id: str,
     config: RunConfiguration,

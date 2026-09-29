@@ -29,6 +29,7 @@ from llm_behavior_ci.experiments.protocol import (
     ProtocolError,
     TaskSelectionAllowance,
     authorize_gated_candidate,
+    authorize_test_gated_candidate,
 )
 from llm_behavior_ci.lifecycle.canary import (
     CanaryController,
@@ -44,9 +45,13 @@ from llm_behavior_ci.lifecycle.monitoring import (
     LocalAlertSink,
     MissingEvaluatorOutcome,
     MonitorRejected,
+    PLAN_KL_SIGNAL,
+    PLAN_QUALITY_SIGNAL,
     ProductionMonitor,
     TaskMetadata,
     UndefinedRequirementFraction,
+    plan_kl_observation,
+    plan_quality_observation_from_features,
     resolved_slice_name,
     task_mix_observation_from_episode,
     tool_selection_observation_from_episode,
@@ -112,6 +117,11 @@ class ServiceDependencies:
     task_selection_allowance: TaskSelectionAllowance | None = None
     tool_selection_monitor: DistributionalMonitor | None = None
     task_mix_monitor: DistributionalMonitor | None = None
+    plan_quality_features_for: (
+        Callable[[EpisodeResult], dict[str, float] | None] | None
+    ) = None
+    plan_kl_mean_nats_for: Callable[[EpisodeResult], float | None] | None = None
+    admission_mode: Literal["release", "test"] = "release"
 
     def __post_init__(self) -> None:
         try:
@@ -176,6 +186,18 @@ class ServiceDependencies:
                 raise ValueError(
                     "task_mix_monitor must be DistributionalMonitor or None"
                 )
+            if self.plan_quality_features_for is not None and not callable(
+                self.plan_quality_features_for
+            ):
+                raise ValueError(
+                    "plan_quality_features_for must be callable or None"
+                )
+            if self.plan_kl_mean_nats_for is not None and not callable(
+                self.plan_kl_mean_nats_for
+            ):
+                raise ValueError("plan_kl_mean_nats_for must be callable or None")
+            if self.admission_mode not in {"release", "test"}:
+                raise ValueError("admission_mode must be release or test")
         except ValueError as error:
             raise ServiceError(error) from error
 
@@ -375,6 +397,12 @@ def _feed_monitor(
     Scalar values themselves come only from ``episode.evaluator_outcome``
     and ``episode.tool_steps``/``model_steps`` (``normalize_episode``),
     real execution and evaluation, never a launcher-supplied override.
+    ``plan_quality_score`` and ``plan_kl_mean_nats`` are never derivable
+    from the episode alone, so each is only observed when the deployment
+    wires ``plan_quality_features_for``/``plan_kl_mean_nats_for`` and that
+    callable returns a value for this episode; otherwise the signal is
+    explicitly skipped (withheld), never forced through the scalar
+    episode-normalization path that would reject it.
     """
 
     base_metadata = state.dependencies.metadata_for(episode)
@@ -390,15 +418,52 @@ def _feed_monitor(
     for signal in monitor.signals:
         metadata = replace(base_metadata, signal=signal)
         store.append_monitor_metadata(metadata.to_record(episode_id))
-        try:
-            alerts = monitor.update_from_episode(
-                episode,
-                task_metadata=metadata,
-                period_id=period_id,
+        if signal == PLAN_QUALITY_SIGNAL:
+            features = (
+                None
+                if state.dependencies.plan_quality_features_for is None
+                else state.dependencies.plan_quality_features_for(episode)
             )
-        except (MissingEvaluatorOutcome, UndefinedRequirementFraction):
-            withheld = True
+            if features is None:
+                withheld = True
+                continue
+            observation = plan_quality_observation_from_features(
+                episode, features=features
+            )
+        elif signal == PLAN_KL_SIGNAL:
+            mean_kl_nats = (
+                None
+                if state.dependencies.plan_kl_mean_nats_for is None
+                else state.dependencies.plan_kl_mean_nats_for(episode)
+            )
+            if mean_kl_nats is None:
+                withheld = True
+                continue
+            observation = plan_kl_observation(episode, mean_kl_nats=mean_kl_nats)
+        else:
+            try:
+                alerts = monitor.update_from_episode(
+                    episode,
+                    task_metadata=metadata,
+                    period_id=period_id,
+                )
+            except (MissingEvaluatorOutcome, UndefinedRequirementFraction):
+                withheld = True
+                continue
+            updated = True
+            all_alerts.extend(alerts)
             continue
+        slice_name = resolved_slice_name(
+            episode,
+            metadata,
+            use_slice_attribution=monitor.use_slice_attribution,
+        )
+        alerts = monitor.update(
+            observation,
+            completion_index=metadata.completion_index,
+            period_id=period_id,
+            slice_name=slice_name,
+        )
         updated = True
         all_alerts.extend(alerts)
 
@@ -524,6 +589,7 @@ def _persist_lifecycle_decision(
     decided_at: datetime,
     method: str,
     evidence_artifact_id: str | None = None,
+    evidence_source: str | None = None,
 ) -> None:
     state.dependencies.store.append_deployment_decision(
         DeploymentDecisionRecord(
@@ -540,6 +606,7 @@ def _persist_lifecycle_decision(
             sample_size=snapshot.candidate_episodes_served,
             decided_at=decided_at,
             evidence_artifact_id=evidence_artifact_id,
+            evidence_source=evidence_source,
         )
     )
 
@@ -764,8 +831,13 @@ def _admit_candidate(state: _ServiceState, artifact_id: str) -> dict[str, object
     artifact = state.dependencies.store.load_validation_artifact(artifact_id)
     if artifact is None:
         raise _Conflict("validation artifact is not recorded")
+    authorize = (
+        authorize_test_gated_candidate
+        if state.dependencies.admission_mode == "test"
+        else authorize_gated_candidate
+    )
     try:
-        admission = authorize_gated_candidate(
+        admission = authorize(
             artifact,
             registry.production,
             registry.candidate,
@@ -796,6 +868,7 @@ def _admit_candidate(state: _ServiceState, artifact_id: str) -> dict[str, object
             decided_at=state.dependencies.clock(),
             method="validation_artifact",
             evidence_artifact_id=admission.evidence_artifact_id,
+            evidence_source=artifact.evidence_source,
         )
         return _deployment_document(state)
 

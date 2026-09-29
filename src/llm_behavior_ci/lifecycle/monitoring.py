@@ -966,6 +966,45 @@ class DistributionalMonitor:
         self._last_alert_at.clear()
 
 
+def build_distributional_monitors(
+    settings: tuple[DistributionalMonitorSettings, ...],
+    *,
+    reference_configuration_hash: str,
+    clock: Callable[[], datetime],
+    dedup_seconds: float,
+) -> dict[str, DistributionalMonitor]:
+    """Build one ``DistributionalMonitor`` per configured distributional signal.
+
+    Keyed by ``signal`` (``tool_selection`` or ``task_mix``) so a caller
+    wires ``monitors.get("tool_selection")``/``monitors.get("task_mix")``
+    straight into ``ServiceDependencies.tool_selection_monitor``/
+    ``task_mix_monitor`` or an equivalent benchmark or replay binding,
+    the same shared construction every ``DistributionalMonitor`` uses.
+    """
+
+    if not isinstance(settings, tuple):
+        raise MonitorRejected(
+            "settings must be a tuple of DistributionalMonitorSettings"
+        )
+    monitors: dict[str, DistributionalMonitor] = {}
+    for entry in settings:
+        if not isinstance(entry, DistributionalMonitorSettings):
+            raise MonitorRejected(
+                "settings must contain DistributionalMonitorSettings"
+            )
+        if entry.signal in monitors:
+            raise MonitorRejected(
+                "settings contains a duplicate distributional signal"
+            )
+        monitors[entry.signal] = DistributionalMonitor(
+            entry,
+            reference_configuration_hash=reference_configuration_hash,
+            clock=clock,
+            dedup_seconds=dedup_seconds,
+        )
+    return monitors
+
+
 def _baselines_for_signals(
     baselines: tuple[tuple[str, float], ...],
     signals: tuple[str, ...],

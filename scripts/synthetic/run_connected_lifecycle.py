@@ -8,11 +8,13 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Literal
 
 from fastapi.testclient import TestClient
 
 from llm_behavior_ci.config import (
     CanarySettings,
+    DistributionalMonitorSettings,
     GateSettings,
     MonitorSettings,
     RunConfiguration,
@@ -20,11 +22,17 @@ from llm_behavior_ci.config import (
     run_configuration_hash,
 )
 from llm_behavior_ci.export import AggregateResults, export_public_results
-from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs, run_offline_gate
+from llm_behavior_ci.lifecycle.offline_gate import (
+    GateExecutionError,
+    PlanEvidenceInputs,
+    run_offline_gate,
+)
 from llm_behavior_ci.lifecycle.monitoring import (
+    DistributionalMonitor,
     FrozenReference,
     ProductionMonitor,
     TaskMetadata,
+    build_distributional_monitors,
 )
 from llm_behavior_ci.records import (
     AggregateRecord,
@@ -468,6 +476,8 @@ def _dependencies(
     fraction: float = 1.0,
     horizon_episodes: int = 10,
     harm_margin: float = 0.1,
+    tool_selection_monitor: DistributionalMonitor | None = None,
+    admission_mode: Literal["release", "test"] = "release",
 ) -> ServiceDependencies:
     settings = CanarySettings(
         fraction=fraction,
@@ -503,7 +513,38 @@ def _dependencies(
         metadata_for=metadata_for,
         canary_settings=settings,
         canary_assignment_seed=canary_assignment_seed,
+        tool_selection_monitor=tool_selection_monitor,
+        admission_mode=admission_mode,
     )
+
+
+def _tool_selection_monitor(
+    production: RunConfiguration,
+    clock,
+) -> DistributionalMonitor:
+    """One live ``tool_selection`` distributional monitor for the synthetic run.
+
+    Exercises ``build_distributional_monitors`` the way ``serve.py`` and
+    the benchmark monitor tier do, on a reference distribution that
+    matches the fixed ``calendar.lookup`` tool call every synthetic
+    episode makes, so a real production episode is fed through without
+    a manufactured alert.
+    """
+
+    settings = DistributionalMonitorSettings(
+        signal="tool_selection",
+        reference_counts=(("lookup", 9), ("unparsed", 1)),
+        window_episodes=1,
+        alpha=0.05,
+        correction="none",
+    )
+    monitors = build_distributional_monitors(
+        (settings,),
+        reference_configuration_hash=run_configuration_hash(production),
+        clock=clock,
+        dedup_seconds=0.0,
+    )
+    return monitors["tool_selection"]
 
 
 def _monitor(
@@ -594,29 +635,31 @@ def main() -> int:
         print("expected synthetic_fixture evidence_source", file=sys.stderr)
         return 1
 
-    real_evidence = replace(evidence, validation_provenance="connected_lifecycle_demo")
-    real_passed = run_offline_gate(
-        production,
-        candidate,
-        task_set,
-        settings=GateSettings(
-            confidence_level=0.9,
-            bootstrap_resamples=40,
-            score_margin=-0.02,
-            kl_limit_nats=0.05,
-            mmd_bandwidth=1.0,
-            mmd_permutations=19,
-            mmd_alpha=0.05,
-            plan_format_version="plan-v1",
-        ),
-        runtime=_plan_runtime(_clock()),
-        plan_evidence=real_evidence,
-    )
-    if real_passed.outcome != "PASS":
-        print("expected non-synthetic train gate PASS shape", file=sys.stderr)
-        return 1
-    if real_passed.artifact.evidence_source != "gate_run":
-        print("expected gate_run evidence_source", file=sys.stderr)
+    try:
+        run_offline_gate(
+            production,
+            candidate,
+            task_set,
+            settings=GateSettings(
+                confidence_level=0.9,
+                bootstrap_resamples=40,
+                score_margin=-0.02,
+                kl_limit_nats=0.05,
+                mmd_bandwidth=1.0,
+                mmd_permutations=19,
+                mmd_alpha=0.05,
+                plan_format_version="plan-v1",
+            ),
+            runtime=_plan_runtime(_clock()),
+            plan_evidence=replace(evidence, validation_provenance="validated"),
+        )
+    except GateExecutionError:
+        pass
+    else:
+        print(
+            "validated provenance must require a live AppWorld/vLLM runtime",
+            file=sys.stderr,
+        )
         return 1
 
     summary: dict[str, object] = {
@@ -696,13 +739,14 @@ def main() -> int:
                         clock=clock,
                         runtime_factory=factory,
                         monitor=_monitor(production, clock),
+                        admission_mode="test",
                     )
                 )
             )
             with changed_client:
                 reject_changed = changed_client.post(
                     "/candidates",
-                    json=_persist_artifact(changed_store_path, real_passed.artifact),
+                    json=_persist_artifact(changed_store_path, passed.artifact),
                 )
             if reject_changed.status_code != 409:
                 print("PASS gate must not admit a changed candidate", file=sys.stderr)
@@ -764,13 +808,14 @@ def main() -> int:
                         monitor=_monitor(production, clock),
                         horizon_episodes=1,
                         harm_margin=0.1,
+                        admission_mode="test",
                     )
                 )
             )
             with rollback_client:
                 admit = rollback_client.post(
                     "/candidates",
-                    json=_persist_artifact(rollback_store_path, real_passed.artifact),
+                    json=_persist_artifact(rollback_store_path, passed.artifact),
                 )
                 if admit.status_code != 200:
                     print("PASS gate must admit matching candidate", file=sys.stderr)
@@ -805,13 +850,14 @@ def main() -> int:
                         monitor=_monitor(production, clock),
                         horizon_episodes=1,
                         harm_margin=0.1,
+                        admission_mode="test",
                     )
                 )
             )
             with promote_client:
                 admit = promote_client.post(
                     "/candidates",
-                    json=_persist_artifact(promote_store_path, real_passed.artifact),
+                    json=_persist_artifact(promote_store_path, passed.artifact),
                 )
                 if admit.status_code != 200:
                     print("promotion admit failed", file=sys.stderr)
@@ -856,6 +902,9 @@ def main() -> int:
                         ),
                         fraction=0.01,
                         canary_assignment_seed=0,
+                        tool_selection_monitor=_tool_selection_monitor(
+                            production, clock
+                        ),
                     )
                 )
             )
@@ -872,6 +921,15 @@ def main() -> int:
                     if response.status_code != 200:
                         print("monitor episode failed", file=sys.stderr)
                         return 1
+                    if response.json().get("monitoring_status") != "updated":
+                        print(
+                            "expected tool_selection monitor to be fed",
+                            file=sys.stderr,
+                        )
+                        return 1
+            summary["tool_selection_monitor_status"] = response.json()[
+                "monitoring_status"
+            ]
             reader = EpisodeStore(alert_store_path)
             try:
                 alerts = reader.load_alerts()

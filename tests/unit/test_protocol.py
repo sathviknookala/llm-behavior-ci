@@ -274,7 +274,7 @@ def _plan_evidence() -> PlanEvidenceInputs:
         mmd_features=(),
         kl_approximation="top_k",
         required_statistics=("plan_quality",),
-        validation_provenance="protocol-test",
+        validation_provenance="synthetic_fixture",
     )
 
 
@@ -675,7 +675,11 @@ def _artifact(
         statistics=(
             _gate_statistics(reference, candidate) if outcome == "PASS" else ()
         ),
-        validation_provenance=validation_provenance,
+        evidence_source=(
+            "synthetic_fixture"
+            if validation_provenance == "synthetic_fixture"
+            else "gate_run"
+        ),
         created_at=datetime.now(timezone.utc),
     )
 

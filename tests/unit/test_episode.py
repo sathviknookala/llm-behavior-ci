@@ -20,6 +20,7 @@ from llm_behavior_ci.runtime.episode import (
     RuntimeDependencies,
     RuntimeUnavailable,
     build_runtime,
+    is_live_runtime,
     run_episode,
 )
 
@@ -517,3 +518,18 @@ class EpisodeRunnerTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeUnavailable, "unknown prompt_version"):
             build_runtime(bad, "http://127.0.0.1:9")
+
+    def test_is_live_runtime_distinguishes_real_agents_from_fakes(self) -> None:
+        config = _config()
+        live = build_runtime(config, "http://127.0.0.1:9", mode="plan")
+        self.assertTrue(is_live_runtime(live))
+        session = FakeSession()
+        agent = FakeAgent([], clock=lambda: _START)
+        fake = _runtime(session, agent, lambda: _START)
+        self.assertFalse(is_live_runtime(fake))
+        real_agent_fake_session = RuntimeDependencies(
+            session_factory=lambda task_id: session,
+            agent=SmolagentsVLLMAgent("http://127.0.0.1:9"),
+            clock=lambda: _START,
+        )
+        self.assertFalse(is_live_runtime(real_agent_fake_session))

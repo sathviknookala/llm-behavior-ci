@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -15,7 +16,9 @@ from llm_behavior_ci.config import (
     StreamSettings,
     run_configuration_hash,
 )
+from llm_behavior_ci.experiments import benchmark as benchmark_module
 from llm_behavior_ci.experiments.benchmark import (
+    BenchmarkError,
     BenchmarkProgress,
     run_lifecycle_benchmark,
 )
@@ -23,7 +26,7 @@ from llm_behavior_ci.experiments.faults import FaultPatch, FaultSpec, HarmLabel,
 from llm_behavior_ci.experiments.protocol import ProtocolSettings, lock_protocol
 from llm_behavior_ci.experiments.validation import AADependenceReport, ValidationReport
 from llm_behavior_ci.lifecycle.monitoring import FrozenReference
-from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs
+from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs, plan_evidence_to_dict
 from llm_behavior_ci.records import TokenLogprob, assert_public_payload
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
@@ -467,6 +470,50 @@ _GATE_WORLDS = 6
 
 
 class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
+    def test_benchmark_plan_evidence_loader_round_trips_vocabulary_size(self) -> None:
+        evidence = PlanEvidenceInputs(
+            plan_format_version="plan-v1",
+            plan_quality_features=("numbered_step_count",),
+            plan_quality_weights=(1.0,),
+            mmd_features=(),
+            kl_approximation="full",
+            required_statistics=("plan_quality",),
+            validation_provenance="synthetic_fixture",
+            kl_vocabulary_size=32000,
+        )
+        payload = plan_evidence_to_dict(evidence)
+        restored = benchmark_module._plan_evidence_from_dict(payload)
+        self.assertEqual(restored.kl_vocabulary_size, 32000)
+
+    def test_lifecycle_benchmark_cli_plan_evidence_loader_round_trips_vocabulary_size(
+        self,
+    ) -> None:
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "benchmark"
+            / "run_lifecycle_benchmark.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "run_lifecycle_benchmark_cli", path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        evidence = PlanEvidenceInputs(
+            plan_format_version="plan-v1",
+            plan_quality_features=("numbered_step_count",),
+            plan_quality_weights=(1.0,),
+            mmd_features=(),
+            kl_approximation="full",
+            required_statistics=("plan_quality",),
+            validation_provenance="synthetic_fixture",
+            kl_vocabulary_size=32000,
+        )
+        payload = plan_evidence_to_dict(evidence)
+        restored = module._load_plan_evidence(payload)
+        self.assertEqual(restored.kl_vocabulary_size, 32000)
+
     def test_gate_block_catch_not_reached_later_tiers(self) -> None:
         train_tasks, dev_tasks, test_tasks = _sets()
         with tempfile.TemporaryDirectory() as temporary:
@@ -496,6 +543,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=root / "checkpoint.json",
                 export_path=root / "export.json",
             )
@@ -544,6 +592,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=root / "checkpoint.json",
             )
         replicate = result.replicates[0]
@@ -588,6 +637,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=root / "checkpoint.json",
             )
         replicate = result.replicates[0]
@@ -599,6 +649,45 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
         self.assertEqual(replicate.monitor.status, "not_reached")
         self.assertEqual(replicate.monitor.reason, "canary_rollback")
         self.assertEqual(result.candidate_episodes_served, 4)
+
+    def test_release_admission_mode_rejects_synthetic_gate_evidence(self) -> None:
+        train_tasks, dev_tasks, test_tasks = _sets()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lock, baselines = _build_lock(
+                root,
+                train_tasks=train_tasks,
+                dev_tasks=dev_tasks,
+                test_normal_tasks=test_tasks,
+                harmful=True,
+                canary_horizon=4,
+                canary_alpha=0.5,
+                monitor_horizon=2,
+                with_replacement=True,
+            )
+            clock = Clock()
+            factory = CountingFactory(
+                candidate_success=False,
+                monitor_success=True,
+                pair_world_cutoff=_GATE_WORLDS + 8,
+            )
+            runtime = RuntimeDependencies(
+                session_factory=factory,
+                agent=BenchmarkAgent(clock, block_on_temperature=False),
+                clock=clock,
+            )
+            with self.assertRaises(BenchmarkError):
+                run_lifecycle_benchmark(
+                    lock,
+                    (_temperature_fault(),),
+                    runtime=runtime,
+                    train_tasks=train_tasks,
+                    test_normal_tasks=test_tasks,
+                    reference_baselines=baselines,
+                    plan_evidence=_plan_evidence(),
+                    admission_mode="release",
+                    checkpoint_path=root / "checkpoint.json",
+                )
 
     def test_promote_then_monitor_alert(self) -> None:
         train_tasks, dev_tasks, test_tasks = _sets()
@@ -634,6 +723,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=root / "checkpoint.json",
             )
         replicate = result.replicates[0]
@@ -682,6 +772,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=checkpoint,
                 should_interrupt=lambda progress: progress.tier == "canary"
                 and progress.stream_index >= 1,
@@ -702,6 +793,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=checkpoint,
                 should_interrupt=None,
                 export_path=root / "export.json",
@@ -749,6 +841,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=root / "checkpoint.json",
                 export_path=export_path,
             )
@@ -797,6 +890,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines2,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=root / "checkpoint2.json",
                 export_path=interrupt_export,
                 should_interrupt=lambda progress: progress.tier == "canary"
@@ -909,6 +1003,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 test_normal_tasks=test_tasks,
                 reference_baselines=baselines,
                 plan_evidence=_plan_evidence(),
+                admission_mode="test",
                 checkpoint_path=root / "checkpoint.json",
             )
         self.assertEqual(result.status, "completed")

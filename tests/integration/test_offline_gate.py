@@ -11,7 +11,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from llm_behavior_ci.config import GateSettings, RunConfiguration
-from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs, run_offline_gate
+from llm_behavior_ci.lifecycle.offline_gate import (
+    PlanEvidenceInputs,
+    plan_evidence_to_dict,
+    run_offline_gate,
+)
 from llm_behavior_ci.records import TokenLogprob, assert_public_payload
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
@@ -23,13 +27,17 @@ from llm_behavior_ci.tasks.selection import (
 )
 
 
-def _load_cli_main():
+def _load_cli_module():
     path = Path(__file__).resolve().parents[2] / "scripts" / "run_offline_gate.py"
     spec = importlib.util.spec_from_file_location("run_offline_gate_cli", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.main
+    return module
+
+
+def _load_cli_main():
+    return _load_cli_module().main
 
 _START = datetime(2026, 9, 27, 15, 0, tzinfo=timezone.utc)
 _PLAN = "1. open the calendar"
@@ -296,6 +304,13 @@ def _public_document(decision) -> dict[str, object]:
 
 
 class OfflineGateIntegrationTests(unittest.TestCase):
+    def test_cli_plan_evidence_loader_round_trips_vocabulary_size(self) -> None:
+        module = _load_cli_module()
+        evidence = _evidence(kl_approximation="full", kl_vocabulary_size=32000)
+        payload = plan_evidence_to_dict(evidence)
+        restored = module._load_plan_evidence(payload)
+        self.assertEqual(restored.kl_vocabulary_size, 32000)
+
     def test_library_pass_and_block_public_payload(self) -> None:
         task_set = _task_set()
         reference = _config(task_set, run_seed=7)
