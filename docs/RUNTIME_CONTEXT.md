@@ -114,7 +114,7 @@ Measured again on 2026-09-29 through `POST /tokenize` with the messages shape (`
 | Headroom after 8 turns of 1024 generated tokens | 11095 |
 | Headroom after 16 turns of 1024 generated tokens | 2903 |
 
-Eight full turns fit, and sixteen still fit before observation text. `step_limit` remains 40; a turn that actually emits 1024 tokens plus a long observation can still fill the window late in an episode. That is history growth, not a reason to cut the catalog down to the solution's APIs.
+Eight full turns fit, and sixteen still fit before observation text. `step_limit` remains 40; a turn that actually emits 1024 tokens plus a long observation can still fill the window late in an episode. That is history growth, not a reason to cut the catalog down to the solution's APIs. The 122 system-prompt tokens were measured before `prompt-v2` gained its credential sentences. That count was not remeasured.
 
 `AppWorld` has no `initial_state_identity` method. `execute` returns `Execution failed.` text instead of raising. `evaluate` returns a `TestTracker` with `pass_count`, `fail_count`, `num_tests`, `passes`, and `failures`. The adapter follows that shape.
 
@@ -158,3 +158,27 @@ Indices 1 and 2, before that wrap, and all three indices after it, still stopped
 | 2 | yes | `step_limit` | 40 | 40 | 0 | 40 | no | no | 110.855 | 111.825 |
 
 None of these episodes called `apis.supervisor.complete_task` or `evaluate()`. The index-0 failures are credential and mailbox state, not missing parameter names or a parser mismatch. Indices 1 and 2 are login credential rejections and unauthorized calls, with no successful tool output for the print wrap to change. Compact API lines already include the supervisor password API. Restoring parameter descriptions was not required for these failures.
+
+## Live runtime integration closed
+
+On 2026-09-29 one further `train_smoke` index-0 execute episode was run with `scripts/evaluation/smoke_live_episode.py` against the already-running Qwen3-4B server at `127.0.0.1:8000`. The SQLite log is `data/processed/smoke_block1_task0.sqlite`. It is not a `results/` artifact. No task text, action, observation, or credential is copied here.
+
+Execute mode now calls `session.evaluate()` when `agent.step_limit` is reached and stores the outcome with `status="failed"` and `termination_reason="step_limit"`. Evaluator success does not complete the episode. `prompt-v2` tells the agent to obtain credentials through documented AppWorld and supervisor APIs, not to guess them, and to reuse values returned by earlier calls.
+
+This episode terminated through `apis.supervisor.complete_task` before the step limit. The run used working-tree code on top of `9ce4e46`. The script's configuration hash was `2971c38a4c770b88eb96fc45dd3cdb865c9ee0ad0a27b4f7b0f3749df3bbc80c`, which embeds that git revision. Prompt-body edits are not hashed fields. Committing this work changes the hash.
+
+| Field | Value |
+| --- | --- |
+| `termination_reason` | `appworld_completed` |
+| `status` | `completed` |
+| `model_step_count` | 3 |
+| `tool_step_count` | 3 |
+| `successful_tool_call_count` | 1 |
+| `error_tool_call_count` | 2 |
+| `model_latency_seconds` | 6.932 |
+| `wall_seconds` | 7.341 |
+| `evaluator_success` | false |
+| `passed_requirements` | 1 |
+| `total_requirements` | 8 |
+
+The stored episode is `finished` and its `evaluator_outcome` is non-null. That closes the live runtime integration: a real vLLM call, real AppWorld actions and observations, termination, `evaluate()`, and a persisted `EpisodeResult`. Model task success is not part of the close. One of eight requirements passed. Baseline AppWorld capability is stage 1. A later failure to solve a task is an experimental outcome unless it exposes a runtime defect.

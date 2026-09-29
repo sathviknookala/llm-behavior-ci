@@ -160,6 +160,12 @@ def _public_summary(
     model_latency_seconds = sum(
         step.latency_seconds for step in episode.model_steps
     )
+    successful_tool_calls = sum(
+        1 for step in episode.tool_steps if step.error is None
+    )
+    error_tool_calls = sum(
+        1 for step in episode.tool_steps if step.error is not None
+    )
     return {
         "configuration_hash": run_configuration_hash(configuration),
         "task_set_hash": configuration.task.task_set_hash,
@@ -168,6 +174,8 @@ def _public_summary(
         "status": episode.status,
         "model_step_count": len(episode.model_steps),
         "tool_step_count": len(episode.tool_steps),
+        "successful_tool_call_count": successful_tool_calls,
+        "error_tool_call_count": error_tool_calls,
         "model_latency_seconds": model_latency_seconds,
         "wall_seconds": wall_seconds,
         "evaluator_success": None if outcome is None else outcome.success,
