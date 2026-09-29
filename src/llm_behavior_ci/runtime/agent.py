@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import threading
 import time
 import urllib.error
@@ -12,6 +11,7 @@ from typing import Callable, Mapping, Protocol
 
 from llm_behavior_ci.config import ACTION_INTERFACES, RunConfiguration
 from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.runtime.actions import parse_model_output
 from llm_behavior_ci.runtime.api_docs import (
     ApiDocsCorruptionError,
     resolve_api_documentation,
@@ -38,8 +38,6 @@ try:
     from smolagents.local_python_executor import PythonExecutor as _SmolPythonExecutor
 except ImportError:
     _SmolPythonExecutor = object
-
-_CALL = re.compile(r"^CALL ([^ \n]+) ([^ \n]+)\n([\s\S]+)$")
 
 _TOKEN_ID_PREFIX = "token_id:"
 
@@ -94,15 +92,6 @@ class _EpisodeState:
     context: TaskContext
     config: RunConfiguration
     history: list[dict[str, str]] = field(default_factory=list)
-
-
-def parse_model_output(text: str) -> tuple[str | None, str | None, str | None]:
-    if text == "STOP" or text.startswith("STOP\n"):
-        return None, None, None
-    matched = _CALL.match(text)
-    if matched is not None:
-        return matched.group(3), matched.group(1), matched.group(2)
-    return text, None, None
 
 
 def _logprob_token_id(entry: object) -> int:
@@ -619,7 +608,10 @@ class SmolagentsVLLMAgent(_SmolModel):
         raw = chat_message.raw
         choice = raw["choices"][0]
         logprobs = parse_logprobs(choice)
-        action, app_name, api_name = parse_model_output(output_text)
+        if self._mode == "plan":
+            action, app_name, api_name = None, None, None
+        else:
+            action, app_name, api_name = parse_model_output(output_text)
         state.history.append({"role": "assistant", "content": output_text})
         return AgentTurn(
             prompt_text=messages[-1]["content"],

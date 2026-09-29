@@ -41,7 +41,9 @@ PUBLIC = "public"
 MODES = frozenset({"plan", "execute"})
 EPISODE_STATUSES = frozenset({"completed", "failed"})
 PAIR_ROLES = frozenset({"reference", "candidate"})
-COMPLETED_TERMINATIONS = frozenset({"plan_emitted", "agent_stopped"})
+COMPLETED_TERMINATIONS = frozenset(
+    {"plan_emitted", "agent_stopped", "appworld_completed"}
+)
 FAILED_TERMINATIONS = frozenset(
     {
         "step_limit",
@@ -49,6 +51,7 @@ FAILED_TERMINATIONS = frozenset(
         "runtime_error",
         "timeout",
         "cancelled",
+        "invalid_action",
     }
 )
 TERMINATION_REASONS = COMPLETED_TERMINATIONS | FAILED_TERMINATIONS
@@ -64,11 +67,13 @@ PLAN_TERMINATIONS = frozenset(
 EXECUTE_TERMINATIONS = frozenset(
     {
         "agent_stopped",
+        "appworld_completed",
         "step_limit",
         "unrecoverable_tool_error",
         "runtime_error",
         "timeout",
         "cancelled",
+        "invalid_action",
     }
 )
 ERROR_SOURCES = frozenset(
@@ -108,6 +113,7 @@ _TERMINATING_ERROR = {
     "timeout": "timeout",
     "cancelled": "cancelled",
     "step_limit": "step_limit",
+    "invalid_action": "runtime",
 }
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")

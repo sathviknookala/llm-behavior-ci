@@ -10,6 +10,7 @@ from urllib.error import URLError
 
 from llm_behavior_ci.config import LoRASettings, RunConfiguration
 from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.runtime.actions import ActionRejected
 from llm_behavior_ci.runtime.agent import (
     AppWorldActionExecutor,
     AppWorldExecuteTool,
@@ -573,7 +574,8 @@ class RuntimeAdapterTests(unittest.TestCase):
             parse_model_output("CALL calendar lookup\napp.lookup()"),
             ("app.lookup()", "calendar", "lookup"),
         )
-        self.assertEqual(parse_model_output("plain action"), ("plain action", None, None))
+        with self.assertRaises(ActionRejected):
+            parse_model_output("plain action")
         self.assertEqual(
             SmolagentsVLLMAgent("http://127.0.0.1:9").parse_model_output("STOP"),
             (None, None, None),

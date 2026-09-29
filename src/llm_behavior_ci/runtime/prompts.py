@@ -33,6 +33,15 @@ _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
             "Mutate state only through AppWorld-executed actions.\n"
         ),
     ),
+    "prompt-v2": PromptTemplate(
+        version="prompt-v2",
+        system_body=(
+            "You are an AppWorld tool-using agent.\n"
+            "Follow the task instruction and the API documentation.\n"
+            "Mutate state only through AppWorld-executed actions.\n"
+            "Do not invent APIs that are absent from the documentation.\n"
+        ),
+    ),
 }
 
 _PLAN_FORMAT_REGISTRY: dict[str, PlanFormatTemplate] = {
@@ -45,6 +54,29 @@ _PLAN_FORMAT_REGISTRY: dict[str, PlanFormatTemplate] = {
         ),
     ),
 }
+
+_LEGACY_CODE_EXECUTE = (
+    "Emit the next Python action for AppWorld execution, "
+    "or STOP when the task is done.\n"
+    "Format a tool call as:\n"
+    "CALL <app> <api>\n"
+    "<python action>\n"
+)
+
+_LEGACY_TOOL_CALLING_EXECUTE = (
+    "Emit the next tool call for AppWorld execution, "
+    "or STOP when the task is done.\n"
+    "Format a tool call as:\n"
+    "CALL <app> <api>\n"
+    "<arguments>\n"
+)
+
+_NATIVE_CODE_EXECUTE = (
+    "Emit exactly one AppWorld-native Python API call per turn, "
+    "of the form apis.<app>.<api>(...).\n"
+    "Do not emit prose, Markdown fences, or any wrapper syntax "
+    "around the call.\n"
+)
 
 
 class UnknownPromptVersion(ValueError):
@@ -93,24 +125,10 @@ def render_system_text(
             "Respond with the plan text only.\n"
         )
     elif mode == "execute":
-        if action_interface == "code":
-            mode_instruction = (
-                "Emit the next Python action for AppWorld execution, "
-                "or STOP when the task is done.\n"
-                "Format a tool call as:\n"
-                "CALL <app> <api>\n"
-                "<python action>\n"
-            )
-        elif action_interface == "tool_calling":
-            mode_instruction = (
-                "Emit the next tool call for AppWorld execution, "
-                "or STOP when the task is done.\n"
-                "Format a tool call as:\n"
-                "CALL <app> <api>\n"
-                "<arguments>\n"
-            )
-        else:
-            raise ValueError(f"unsupported action_interface: {action_interface}")
+        mode_instruction = _execute_instruction(
+            prompt_version=prompt_version,
+            action_interface=action_interface,
+        )
     else:
         raise ValueError(f"unsupported agent mode: {mode}")
     thinking = "enabled" if thinking_enabled else "disabled"
@@ -122,3 +140,17 @@ def render_system_text(
         f"Action interface: {action_interface}\n"
         f"{mode_instruction}"
     )
+
+
+def _execute_instruction(*, prompt_version: str, action_interface: str) -> str:
+    if action_interface == "code":
+        if prompt_version == "prompt-v2":
+            return _NATIVE_CODE_EXECUTE
+        return _LEGACY_CODE_EXECUTE
+    if action_interface == "tool_calling":
+        if prompt_version == "prompt-v2":
+            raise ValueError(
+                "prompt-v2 does not support tool_calling action interface"
+            )
+        return _LEGACY_TOOL_CALLING_EXECUTE
+    raise ValueError(f"unsupported action_interface: {action_interface}")

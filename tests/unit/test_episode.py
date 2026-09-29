@@ -1,13 +1,16 @@
 import copy
+import json
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from llm_behavior_ci.config import (
     RunConfiguration,
     new_run_identity,
 )
 from llm_behavior_ci.records import ModelStep, TokenLogprob, ToolStep
+from llm_behavior_ci.runtime.actions import ActionRejected
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import (
     EvaluationResult,
@@ -534,3 +537,139 @@ class EpisodeRunnerTests(unittest.TestCase):
             clock=lambda: _START,
         )
         self.assertFalse(is_live_runtime(real_agent_fake_session))
+
+    def test_plan_mode_keeps_embedded_api_call_unparsed(self) -> None:
+        plan_with_call = (
+            "1. inspect the calendar\n"
+            'apis.calendar.show_calendar(date="2026-01-01")\n'
+            "2. finish"
+        )
+        agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
+        agent.set_mode("plan")
+        agent.begin(
+            TaskContext(
+                task_id="task-1",
+                instruction="solve the task",
+                api_documentation="calendar docs",
+            ),
+            _config(),
+        )
+        body = {
+            "choices": [
+                {
+                    "message": {"content": plan_with_call},
+                    "logprobs": {
+                        "content": [
+                            {
+                                "token": "token_id:7",
+                                "bytes": [55],
+                                "logprob": -0.5,
+                                "top_logprobs": [],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+
+        class _FakeResponse:
+            def read(self) -> bytes:
+                return json.dumps(body).encode("utf-8")
+
+            def __enter__(self) -> "_FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=lambda request, timeout=None: _FakeResponse(),
+        ):
+            turn = agent.next_turn(tool_output=None)
+        self.assertIsNone(turn.action)
+        self.assertIsNone(turn.app_name)
+        self.assertIsNone(turn.api_name)
+        self.assertEqual(turn.output_text, plan_with_call)
+
+        clock = _clock()
+        session = FakeSession()
+        fake_agent = FakeAgent(
+            [_turn(plan_with_call, action=None)],
+            clock=clock,
+        )
+        result = run_episode(
+            "task-1",
+            _config(),
+            "plan",
+            run=new_run_identity(_config()),
+            runtime=_runtime(session, fake_agent, clock),
+        )
+        self.assertEqual(session.execute_count, 0)
+        self.assertEqual(session.evaluate_count, 0)
+        self.assertEqual(result.termination_reason, "plan_emitted")
+        self.assertEqual(result.plan_text, plan_with_call)
+
+    def test_complete_task_executes_then_evaluates(self) -> None:
+        complete = "apis.supervisor.complete_task()"
+        config = _config()
+        clock = _clock()
+        session = FakeSession()
+        agent = FakeAgent(
+            [
+                _turn(
+                    complete,
+                    action=complete,
+                    app_name="supervisor",
+                    api_name="complete_task",
+                )
+            ],
+            clock=clock,
+        )
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(session.execute_count, 1)
+        self.assertEqual(session.actions, [complete])
+        self.assertEqual(session.evaluate_count, 1)
+        self.assertEqual(result.termination_reason, "appworld_completed")
+        self.assertEqual(result.status, "completed")
+        self.assertIsNotNone(result.evaluator_outcome)
+        self.assertEqual(len(result.tool_steps), 1)
+
+    def test_invalid_action_fails_without_evaluate(self) -> None:
+        class RejectingAgent:
+            def __init__(self, clock) -> None:
+                self._clock = clock
+
+            def begin(self, context: TaskContext, config: RunConfiguration) -> None:
+                del context, config
+
+            def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+                del tool_output
+                raise ActionRejected("action is not valid Python")
+
+        config = _config()
+        clock = _clock()
+        session = FakeSession()
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, RejectingAgent(clock), clock),
+        )
+        self.assertEqual(result.termination_reason, "invalid_action")
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(session.execute_count, 0)
+        self.assertEqual(session.evaluate_count, 0)
+        self.assertEqual(result.episode_errors[0].source, "runtime")
+        self.assertIsNone(result.evaluator_outcome)
+
+
+if __name__ == "__main__":
+    unittest.main()

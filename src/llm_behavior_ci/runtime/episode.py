@@ -23,6 +23,7 @@ from llm_behavior_ci.records import (
     RecordedError,
     ToolStep,
 )
+from llm_behavior_ci.runtime.actions import ActionRejected
 from llm_behavior_ci.runtime.agent import (
     AgentLoop,
     AgentTurn,
@@ -34,7 +35,7 @@ from llm_behavior_ci.runtime.appworld import (
     EvaluationResult,
 )
 
-_COMPLETED = frozenset({"plan_emitted", "agent_stopped"})
+_COMPLETED = frozenset({"plan_emitted", "agent_stopped", "appworld_completed"})
 
 
 class EpisodeRejected(ValueError):
@@ -266,7 +267,32 @@ def run_episode(
                         ),
                     ),
                 )
-            turn = runtime.agent.next_turn(tool_output=tool_output)
+            try:
+                turn = runtime.agent.next_turn(tool_output=tool_output)
+            except ActionRejected as error:
+                return _finish(
+                    identity=identity,
+                    run=run,
+                    task_id=task_id,
+                    config=config,
+                    scenario_id=scenario_id,
+                    mode=mode,
+                    started_at=started_at,
+                    clock=runtime.clock,
+                    model_steps=model_steps,
+                    tool_steps=tool_steps,
+                    plan_text=None,
+                    evaluator_outcome=None,
+                    termination_reason="invalid_action",
+                    episode_errors=(
+                        RecordedError(
+                            source="runtime",
+                            recoverable=False,
+                            message=str(error),
+                            step_index=None,
+                        ),
+                    ),
+                )
             step = _model_step(next_index, turn)
             model_steps.append(step)
             next_index += 1
@@ -355,6 +381,28 @@ def run_episode(
                     plan_text=None,
                     evaluator_outcome=None,
                     termination_reason="unrecoverable_tool_error",
+                    episode_errors=(),
+                )
+            if (
+                result.error_message is None
+                and turn.app_name == "supervisor"
+                and turn.api_name == "complete_task"
+            ):
+                evaluation = session.evaluate()
+                return _finish(
+                    identity=identity,
+                    run=run,
+                    task_id=task_id,
+                    config=config,
+                    scenario_id=scenario_id,
+                    mode=mode,
+                    started_at=started_at,
+                    clock=runtime.clock,
+                    model_steps=model_steps,
+                    tool_steps=tool_steps,
+                    plan_text=None,
+                    evaluator_outcome=_outcome(evaluation),
+                    termination_reason="appworld_completed",
                     episode_errors=(),
                 )
             if result.error_message is not None:
