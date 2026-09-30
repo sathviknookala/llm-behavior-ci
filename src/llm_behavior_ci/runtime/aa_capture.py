@@ -28,11 +28,12 @@ import json
 import subprocess
 import sys
 import time
+from statistics import fmean
 from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -59,6 +60,20 @@ from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task
 from llm_behavior_ci.tasks.streams import StreamError, TaskArrival, generate_stream
 
 ModeName = Literal["plan", "execute"]
+TEACHER_FORCED_KL_STATUSES = (
+    "scored",
+    "support_mismatch",
+    "teacher_force_unavailable",
+    "empty_positions",
+    "scoring_error",
+)
+_TEACHER_FORCED_COUNT_KEYS = {
+    "scored": "teacher_forced_scored",
+    "support_mismatch": "teacher_forced_support_mismatch",
+    "teacher_force_unavailable": "teacher_forced_unavailable",
+    "empty_positions": "teacher_forced_empty",
+    "scoring_error": "teacher_forced_scoring_error",
+}
 
 
 class GpuBusy(RuntimeError):
@@ -175,17 +190,31 @@ class PlanScoringInputs:
 class TeacherForcedPlanKL:
     """Teacher-forced top-k plan KL on one frozen reference plan.
 
-    Both A sides score the same ``frozen_plan_text``. ``mean_kl_nats`` is
-    top-k at the configuration's ``max_logprobs``, not a full-vocabulary
-    claim. Fields stay empty when teacher-force is unavailable. No
-    threshold or pass/fail is applied.
+    ``status`` separates a scored top-k KL from each reason the KL is
+    absent. ``mean_kl_nats`` is set only for ``scored``, at the
+    configuration's ``max_logprobs``. It is not a full-vocabulary claim.
+    No threshold or pass/fail is applied.
     """
 
+    status: str
     frozen_plan_text: str | None = None
     mean_kl_nats: float | None = None
     position_kl_nats: tuple[float, ...] | None = None
     reference_top_k: tuple[tuple[tuple[int, float], ...], ...] | None = None
     candidate_top_k: tuple[tuple[tuple[int, float], ...], ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in TEACHER_FORCED_KL_STATUSES:
+            raise EpisodeRejected("teacher-forced KL status is unknown")
+        scored = self.status == "scored"
+        if scored and (
+            self.mean_kl_nats is None or self.position_kl_nats is None
+        ):
+            raise EpisodeRejected("scored teacher-forced KL requires a KL")
+        if not scored and (
+            self.mean_kl_nats is not None or self.position_kl_nats is not None
+        ):
+            raise EpisodeRejected("unscored teacher-forced KL must not carry a KL")
 
 
 @dataclass(frozen=True)
@@ -389,11 +418,13 @@ def _support_ids(
 
 
 def _unscored_forced(
+    status: str,
     frozen_plan_text: str,
     reference_positions: Sequence[Sequence[TokenLogprob]] | None = None,
     candidate_positions: Sequence[Sequence[TokenLogprob]] | None = None,
 ) -> TeacherForcedPlanKL:
     return TeacherForcedPlanKL(
+        status=status,
         frozen_plan_text=frozen_plan_text,
         reference_top_k=(
             None
@@ -419,20 +450,22 @@ def teacher_forced_plan_kl(
 
     Reuses the offline-gate pattern: same messages, same plan text, score
     with ``score_top_k`` only when both sides expose the same token ids in
-    the same order. A support mismatch leaves the KL empty and keeps both
-    tables. Missing teacher-force leaves KL fields empty rather than
-    falling back to independently generated plans.
+    the same order. A support mismatch keeps both tables and records
+    ``support_mismatch``. Missing teacher-force records
+    ``teacher_force_unavailable`` rather than falling back to independently
+    generated plans.
     """
 
+    unavailable = TeacherForcedPlanKL(status="teacher_force_unavailable")
     teacher_force = getattr(runtime.agent, "teacher_force_plan", None)
     if not callable(teacher_force):
-        return TeacherForcedPlanKL()
+        return unavailable
     session = runtime.session_factory(task_id)
     try:
         context = session.context()
         messages = _matched_messages(runtime.agent, context, configuration)
         if messages is None:
-            return TeacherForcedPlanKL()
+            return unavailable
         runtime.agent.begin(context, configuration)
         try:
             reference_positions = teacher_force(
@@ -441,7 +474,7 @@ def teacher_forced_plan_kl(
             )
         except Exception as error:
             if "unsupported" in str(error).lower():
-                return TeacherForcedPlanKL()
+                return unavailable
             raise
         runtime.agent.begin(context, configuration)
         try:
@@ -451,18 +484,25 @@ def teacher_forced_plan_kl(
             )
         except Exception as error:
             if "unsupported" in str(error).lower():
-                return TeacherForcedPlanKL()
+                return unavailable
             raise
     finally:
         session.close()
     if not isinstance(reference_positions, tuple) or not isinstance(
         candidate_positions, tuple
     ):
-        return TeacherForcedPlanKL(frozen_plan_text=frozen_plan_text)
+        return TeacherForcedPlanKL(
+            status="scoring_error",
+            frozen_plan_text=frozen_plan_text,
+        )
     if not reference_positions or not candidate_positions:
-        return TeacherForcedPlanKL(frozen_plan_text=frozen_plan_text)
+        return TeacherForcedPlanKL(
+            status="empty_positions",
+            frozen_plan_text=frozen_plan_text,
+        )
     if _support_ids(reference_positions) != _support_ids(candidate_positions):
         return _unscored_forced(
+            "support_mismatch",
             frozen_plan_text,
             reference_positions,
             candidate_positions,
@@ -474,11 +514,13 @@ def teacher_forced_plan_kl(
         )
     except (ScoringError, TruncatedKLError):
         return _unscored_forced(
+            "scoring_error",
             frozen_plan_text,
             reference_positions,
             candidate_positions,
         )
     return TeacherForcedPlanKL(
+        status="scored",
         frozen_plan_text=frozen_plan_text,
         mean_kl_nats=scored.mean_kl_nats,
         position_kl_nats=scored.position_kl_nats,
@@ -663,6 +705,37 @@ def assert_gpu_processes_allowed(
     return tuple(matched)
 
 
+def _same_gpu_process(left: GpuProcess, right: GpuProcess) -> bool:
+    if left.pid != right.pid:
+        return False
+    if left.name is not None and right.name is not None and left.name != right.name:
+        return False
+    return True
+
+
+def assert_baseline_identity_unchanged(
+    initial_matched: Sequence[GpuProcess],
+    final_matched: Sequence[GpuProcess],
+) -> None:
+    """Raise ``GpuBusy`` when an allowed process disappears or is replaced.
+
+    An idle capture stays idle: both matched sets are empty. A pid match
+    with two reported names that differ is a replacement, not the same
+    baseline server.
+    """
+
+    if len(initial_matched) != len(final_matched):
+        raise GpuBusy("allowed GPU process changed during capture")
+    unused = list(final_matched)
+    for process in initial_matched:
+        for index, other in enumerate(unused):
+            if _same_gpu_process(process, other):
+                del unused[index]
+                break
+        else:
+            raise GpuBusy("allowed GPU process changed during capture")
+
+
 def _snapshot(probe: Callable[[], GpuSnapshot] | None) -> tuple[GpuSnapshot, str]:
     if probe is None:
         return read_nvidia_smi_snapshot(), "nvidia-smi"
@@ -726,8 +799,10 @@ def capture_aa(
     for that pair. Reference and candidate runs are distinct identities of
     this same configuration. ``observe_hardware`` false leaves cost numbers
     unset and does not shell out to ``nvidia-smi``. When it is true, every
-    compute process must be covered by ``allowed_gpu_processes`` or the
-    capture raises ``GpuBusy`` before any episode starts.
+    compute process must be covered by ``allowed_gpu_processes`` before any
+    episode starts and again after the capture. The allowed process
+    identities must be the same set at both snapshots. Either failure
+    raises ``GpuBusy`` and does not return a capture.
     """
 
     if not isinstance(configuration, RunConfiguration):
@@ -773,7 +848,7 @@ def capture_aa(
         if mode == "plan":
             frozen = pair.reference.plan_text
             if frozen is None or not str(frozen).strip():
-                forced_kl = TeacherForcedPlanKL()
+                forced_kl = TeacherForcedPlanKL(status="empty_positions")
             else:
                 forced_kl = teacher_forced_plan_kl(
                     runtime=runtime,
@@ -802,6 +877,8 @@ def capture_aa(
         after, after_source = _snapshot(gpu_probe)
         if after_source != source:
             raise RuntimeUnavailable("GPU probe source changed during capture")
+        final_matched = assert_gpu_processes_allowed(after, allowed)
+        assert_baseline_identity_unchanged(matched_allowed, final_matched)
         cost = _cost(
             before,
             after,
@@ -840,20 +917,74 @@ def capture_aa(
     )
 
 
+def teacher_forced_status_counts(result: AACaptureResult) -> dict[str, int]:
+    """Count plan pairs by teacher-forced status. Execute pairs are omitted.
+
+    A plan pair with no teacher-forced record counts as unavailable so an
+    unscored pair is not dropped from the total.
+    """
+
+    counts = {name: 0 for name in _TEACHER_FORCED_COUNT_KEYS.values()}
+    plan_pairs = 0
+    for record in result.records:
+        if record.mode != "plan":
+            continue
+        plan_pairs += 1
+        kl = record.teacher_forced_plan_kl
+        if kl is None:
+            counts["teacher_forced_unavailable"] += 1
+            continue
+        counts[_TEACHER_FORCED_COUNT_KEYS[kl.status]] += 1
+    return {"plan_pairs": plan_pairs, **counts}
+
+
+def _scored_teacher_forced_kl(result: AACaptureResult) -> float | None:
+    values = [
+        record.teacher_forced_plan_kl.mean_kl_nats
+        for record in result.records
+        if record.teacher_forced_plan_kl is not None
+        and record.teacher_forced_plan_kl.status == "scored"
+        and record.teacher_forced_plan_kl.mean_kl_nats is not None
+    ]
+    if not values:
+        return None
+    return fmean(values)
+
+
 def format_summary(result: AACaptureResult) -> str:
     """Return counts only. Task ids, plans, and trajectories stay out."""
 
+    counts = teacher_forced_status_counts(result)
+    kl_floor = _scored_teacher_forced_kl(result)
     lines = [
+        f"configuration_hash: {result.configuration_hash}",
+        f"task_set_hash: {result.task_set_hash}",
+        f"repetitions: {result.repetitions}",
+        f"concurrency: {result.concurrency}",
+        f"modes: {','.join(result.modes)}",
         f"pairs: {len(result.records)}",
         f"evaluated: {result.evaluated_pairs}",
         f"disagreements: {result.disagreement_count}",
         f"missing_outcomes: {result.missing_outcome_count}",
+        f"plan_pairs: {counts['plan_pairs']}",
+        f"teacher_forced_scored: {counts['teacher_forced_scored']}",
+        f"teacher_forced_support_mismatch: {counts['teacher_forced_support_mismatch']}",
+        f"teacher_forced_unavailable: {counts['teacher_forced_unavailable']}",
+        f"teacher_forced_empty: {counts['teacher_forced_empty']}",
+        f"teacher_forced_scoring_error: {counts['teacher_forced_scoring_error']}",
+        "teacher_forced_kl_nats:"
+        if kl_floor is None
+        else f"teacher_forced_kl_nats: {kl_floor}",
         f"hardware_observed: {str(result.cost.hardware_observed).lower()}",
         f"hardware_source: {result.cost.source}",
     ]
     if result.cost.hardware_observed:
         lines.append(f"memory_used_mib: {result.cost.memory_used_mib}")
         lines.append(f"wall_seconds: {result.cost.wall_seconds}")
+        if result.cost.initial is not None:
+            lines.append(f"initial_process_count: {result.cost.initial.process_count}")
+        if result.cost.final is not None:
+            lines.append(f"final_process_count: {result.cost.final.process_count}")
     return "\n".join(lines) + "\n"
 
 
@@ -900,19 +1031,23 @@ def live_runtime_factory(base_url: str) -> Callable[[str], RuntimeDependencies]:
     """Build a runtime that opens one AppWorld world and talks to vLLM.
 
     Import of the live adapters happens when a pair is created. AppWorld
-    itself is imported only when a world opens.
+    itself is imported only when a world opens. The clock is ``wall_now``
+    because opening a world freezes ``datetime.now`` to the task date, and
+    episode bounds have to stay on the same real clock as model steps.
     """
 
     def factory(mode: str) -> RuntimeDependencies:
         from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
         from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
 
+        from llm_behavior_ci.runtime.clock import wall_now
+
         agent = SmolagentsVLLMAgent(base_url)
         agent.set_mode(mode)
         return RuntimeDependencies(
             session_factory=LiveAppWorldSession,
             agent=agent,
-            clock=lambda: datetime.now(timezone.utc),
+            clock=wall_now,
         )
 
     return factory
