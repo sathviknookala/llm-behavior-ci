@@ -170,6 +170,12 @@ def _execute_output_is_error(value: str) -> bool:
 class LiveAppWorldSession:
     """AppWorld session adapter that imports AppWorld only when a world is opened.
 
+    A second session for the same task does not open its world while
+    another live world is still open. AppWorld starts nested time
+    freezers that cannot be stopped safely in that state. The deferred
+    session serves ``context`` from the open world, then opens its own
+    world after that one has closed.
+
     ``context`` reads the task instruction and renders API docs without
     executing. ``execute`` prints a single call expression before handing
     it to AppWorld, so the return value is on stdout instead of being
@@ -181,22 +187,60 @@ class LiveAppWorldSession:
     ``initial_state_identity`` method.
     """
 
+    _open_stack: list[LiveAppWorldSession] = []
+
     def __init__(
         self,
         task_id: str,
         *,
         opener: Callable[[str], object] | None = None,
     ) -> None:
+        self._closed = False
+        self._task_id = task_id
+        self._opener = opener or _open_appworld
+        self._world: object | None = None
+        if any(
+            session._world is not None and not session._closed
+            for session in type(self)._open_stack
+        ):
+            return
+        self._open_world()
+
+    def _open_world(self) -> None:
         try:
-            self._world = (opener or _open_appworld)(task_id)
+            self._world = self._opener(self._task_id)
         except ImportError as error:
             from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 
             raise RuntimeUnavailable("AppWorld is not installed") from error
-        self._closed = False
-        self._task_id = task_id
+        type(self)._open_stack.append(self)
+
+    def required_apps(self) -> tuple[str, ...]:
+        if self._world is None:
+            self._open_world()
+        ground_truth = getattr(self._world.task, "ground_truth", None)
+        if ground_truth is None:
+            return ()
+        apps = getattr(ground_truth, "required_apps", ())
+        return tuple(str(app) for app in apps)
+
+    def complete_without_work(self) -> None:
+        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+        result = self.execute("apis.supervisor.complete_task()")
+        if result.error_message is not None:
+            raise RuntimeUnavailable("do-nothing completion failed")
 
     def context(self) -> TaskContext:
+        if self._world is None:
+            for session in reversed(type(self)._open_stack):
+                if (
+                    session._task_id == self._task_id
+                    and session._world is not None
+                    and not session._closed
+                ):
+                    return session.context()
+            self._open_world()
         task = self._world.task
         return TaskContext(
             task_id=self._task_id,
@@ -205,6 +249,8 @@ class LiveAppWorldSession:
         )
 
     def execute(self, action: str) -> ToolResult:
+        if self._world is None:
+            self._open_world()
         try:
             value = self._world.execute(_code_for_execute(action))
         except Exception as error:
@@ -235,6 +281,8 @@ class LiveAppWorldSession:
     def evaluate(self) -> EvaluationResult:
         from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 
+        if self._world is None:
+            self._open_world()
         raw = self._world.evaluate()
         success = bool(raw.success)
         if hasattr(raw, "pass_count") and hasattr(raw, "num_tests"):
@@ -260,6 +308,11 @@ class LiveAppWorldSession:
         if self._closed:
             return
         self._closed = True
+        if self._world is None:
+            return
+        stack = type(self)._open_stack
+        if self in stack:
+            stack.remove(self)
         closer = getattr(self._world, "close", None)
         if callable(closer):
             closer()

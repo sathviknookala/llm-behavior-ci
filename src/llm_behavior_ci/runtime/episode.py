@@ -447,13 +447,17 @@ def run_do_nothing_episode(
     on_start: Callable[[EpisodeIdentity, RunIdentity], None] | None = None,
     scenario_id: str | None = None,
 ) -> EpisodeResult:
-    """Evaluate one execute episode without model or tool steps.
+    """Evaluate one execute episode that completes immediately and does no work.
 
-    Opens the same AppWorld session factory ``run_episode`` uses, leaves the
-    initial world untouched, calls ``session.evaluate()``, and finishes through
-    the shared record path. There is no agent turn, no ``apis.*`` call, and no
-    ``complete_task``. Plan mode is rejected. AppWorld or evaluate failures
-    stay unevaluated, matching ``run_episode``.
+    Opens the same AppWorld session factory ``run_episode`` uses, calls
+    ``complete_without_work`` once, then ``session.evaluate()``. That call
+    is ``apis.supervisor.complete_task()`` with the API's default answer and
+    status. It persists the supervisor task answer and status.
+    Evaluating the untouched world is a different measurement: one train
+    task produced different requirement counts after that call than before
+    it. There is no model turn and no recorded tool step. Plan mode is
+    rejected. A missing completion method, a failed completion, or an
+    evaluate failure stays unevaluated, matching ``run_episode``.
     """
 
     _reject(task_id, config, "execute", run)
@@ -463,6 +467,10 @@ def run_do_nothing_episode(
     session = runtime.session_factory(task_id)
     try:
         started_at = runtime.clock()
+        complete = getattr(session, "complete_without_work", None)
+        if not callable(complete):
+            raise RuntimeUnavailable("do-nothing completion is unavailable")
+        complete()
         evaluation = session.evaluate()
         return _finish(
             identity=identity,

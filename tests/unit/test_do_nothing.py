@@ -19,6 +19,7 @@ from llm_behavior_ci.records import (
 )
 from llm_behavior_ci.runtime.appworld import (
     EvaluationResult,
+    LiveAppWorldSession,
     TaskContext,
     ToolResult,
 )
@@ -173,9 +174,12 @@ class FakeSession:
     def __init__(self, task_id: str = "task-1") -> None:
         self.task_id = task_id
         self.execute_count = 0
+        self.complete_count = 0
         self.evaluate_count = 0
         self.close_count = 0
         self.context_count = 0
+        self.complete_error: BaseException | None = None
+        self.required = ("spotify", "supervisor", "admin")
         self.evaluation = EvaluationResult(
             success=False,
             passed_requirements=0,
@@ -195,6 +199,14 @@ class FakeSession:
     def execute(self, action: str) -> ToolResult:
         self.execute_count += 1
         raise AssertionError(f"do-nothing must not execute: {action}")
+
+    def required_apps(self) -> tuple[str, ...]:
+        return self.required
+
+    def complete_without_work(self) -> None:
+        self.complete_count += 1
+        if self.complete_error is not None:
+            raise self.complete_error
 
     def evaluate(self) -> EvaluationResult:
         self.evaluate_count += 1
@@ -217,7 +229,7 @@ class ForbiddenAgent:
 
 
 class DoNothingEpisodeTests(unittest.TestCase):
-    def test_evaluates_untouched_world_without_model_or_tools(self) -> None:
+    def test_completes_immediately_without_model_or_tool_steps(self) -> None:
         config = _config()
         run = new_run_identity(config)
         session = FakeSession("task-42")
@@ -244,6 +256,7 @@ class DoNothingEpisodeTests(unittest.TestCase):
 
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].execute_count, 0)
+        self.assertEqual(sessions[0].complete_count, 1)
         self.assertEqual(sessions[0].evaluate_count, 1)
         self.assertEqual(sessions[0].close_count, 1)
         self.assertEqual(sessions[0].context_count, 0)
@@ -281,9 +294,94 @@ class DoNothingEpisodeTests(unittest.TestCase):
                     clock=_clock(),
                 ),
             )
+        self.assertEqual(session.complete_count, 1)
         self.assertEqual(session.evaluate_count, 1)
         self.assertEqual(session.execute_count, 0)
         self.assertEqual(session.close_count, 1)
+
+    def test_completion_failure_does_not_evaluate(self) -> None:
+        config = _config()
+        run = new_run_identity(config)
+        session = FakeSession()
+        session.complete_error = RuntimeError("do-nothing completion failed")
+
+        with self.assertRaisesRegex(RuntimeError, "completion failed"):
+            run_do_nothing_episode(
+                "task-1",
+                config,
+                run=run,
+                runtime=RuntimeDependencies(
+                    session_factory=lambda task_id: session,
+                    agent=ForbiddenAgent(),
+                    clock=_clock(),
+                ),
+            )
+        self.assertEqual(session.complete_count, 1)
+        self.assertEqual(session.evaluate_count, 0)
+        self.assertEqual(session.close_count, 1)
+
+
+class CompletionCallTests(unittest.TestCase):
+    def test_live_session_calls_only_complete_task(self) -> None:
+        class GroundTruth:
+            required_apps = ("venmo", "supervisor", "admin")
+
+        class Task:
+            ground_truth = GroundTruth()
+
+        class World:
+            def __init__(self) -> None:
+                self.code: str | None = None
+                self.task = Task()
+
+            def execute(self, code: str) -> str:
+                self.code = code
+                return '{"message": "ok"}'
+
+            def close(self) -> None:
+                return None
+
+        world = World()
+        session = LiveAppWorldSession("task-1", opener=lambda task_id: world)
+        session.complete_without_work()
+        self.assertEqual(world.code, "print(apis.supervisor.complete_task())")
+        self.assertEqual(session.required_apps(), ("venmo", "supervisor", "admin"))
+        session.close()
+
+    def test_second_session_waits_until_the_first_world_closes(self) -> None:
+        LiveAppWorldSession._open_stack.clear()
+        opened: list[str] = []
+
+        class Task:
+            instruction = "do the thing"
+            api_docs = ""
+
+        class World:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.task = Task()
+
+            def close(self) -> None:
+                return None
+
+        names = iter(("reference", "candidate"))
+
+        def opener(task_id: str) -> World:
+            del task_id
+            name = next(names)
+            opened.append(name)
+            return World(name)
+
+        reference = LiveAppWorldSession("task-1", opener=opener)
+        candidate = LiveAppWorldSession("task-1", opener=opener)
+        self.assertEqual(opened, ["reference"])
+        self.assertEqual(candidate.context().instruction, "do the thing")
+        self.assertEqual(opened, ["reference"])
+        reference.close()
+        candidate.context()
+        self.assertEqual(opened, ["reference", "candidate"])
+        candidate.close()
+        self.assertEqual(LiveAppWorldSession._open_stack, [])
 
 
 class DoNothingRecordTests(unittest.TestCase):
