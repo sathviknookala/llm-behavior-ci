@@ -1,21 +1,27 @@
 """Full-vocabulary teacher-forced plan scoring for truncation checks.
 
-Scores one frozen plan through an injected scorer (tests inject fakes; a
-Transformers forward stays behind that seam and is not imported until a
-caller invokes a scorer that loads it). Top-k at 20 and at a larger caller
-k are cuts of the same full distribution. Numeric truncation error is
-delegated to ``compare_plan_kl``; this module does not choose full vs
-top-k or write a protocol threshold.
+Scores one frozen plan through an injected scorer. ``load_transformers_bundle``
+imports Transformers only when a caller asks it to load the configuration's
+pinned repository and revision. Top-k slices are cuts of that same dense
+distribution. Numeric truncation error goes through ``compare_plan_kl``.
+vLLM-versus-dense top-k agreement is a separate report. This module does
+not choose full versus top-k, a protocol tolerance, or a threshold.
+
+The collection order is sequential because the dense model is not assumed
+to fit beside the running vLLM server: persist the frozen plan locally,
+stop vLLM, load Transformers, score the same plan, then compare.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from llm_behavior_ci.config import RunConfiguration, run_configuration_hash
 from llm_behavior_ci.experiments.validation import (
     KLApproximationReport,
     KLPositionSample,
@@ -24,9 +30,15 @@ from llm_behavior_ci.experiments.validation import (
 )
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.scoring import (
+    FidelityProofError,
     PositionAlignmentError,
+    ScoredPosition,
+    ScoringContract,
     SupportAlignmentError,
+    _is_normalized,
     fingerprint_messages,
+    verify_fidelity_claim,
+    verify_scoring_contracts,
 )
 
 DEFAULT_TOP_K = 20
@@ -339,3 +351,446 @@ def _positive_int(value: object, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise FullVocabError(f"{name} must be a positive int")
     return value
+
+
+@dataclass(frozen=True)
+class TransformersBundle:
+    """A loaded tokenizer and a next-token log-probability forward."""
+
+    tokenizer: object
+    forward: Callable[[Sequence[int]], Sequence[Sequence[float]]]
+    vocabulary_size: int
+
+
+@dataclass(frozen=True)
+class FullVocabEvidence:
+    """One full-vocabulary score bound to model, tokenizer, and prefix identity."""
+
+    contract: ScoringContract
+    forced_token_ids: tuple[int, ...]
+    configuration_hash: str
+
+
+@dataclass(frozen=True)
+class BackendAgreementReport:
+    """vLLM top-k versus the dense top-k slice. Not a truncation-error report.
+
+    ``logprob_tolerance`` is a caller-supplied diagnostic. It is not a
+    protocol choice.
+    """
+
+    logprob_tolerance: float
+    position_count: int
+    forced_token_mismatches: int
+    support_mismatches: int
+    logprob_mismatches: int
+    max_abs_logprob_delta: float | None
+    status: str
+
+
+def render_plan_token_ids(
+    tokenizer: object,
+    messages: Sequence[Mapping[str, str]],
+    plan_text: str,
+    *,
+    enable_thinking: bool,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Tokenize the vLLM prefix and the forced plan with the same template.
+
+    The prefix uses ``add_generation_prompt=True``. The forced request
+    appends the plan as the assistant message with
+    ``add_generation_prompt=False``. The forced ids must start with the
+    prefix ids. The returned continuation is every token after that
+    boundary, including the template's end-of-turn tokens.
+    """
+
+    if plan_text == "":
+        raise FullVocabError("plan_text is required for teacher forcing")
+    prefix = _apply_template(
+        tokenizer,
+        list(messages),
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+    forced = _apply_template(
+        tokenizer,
+        list(messages) + [{"role": "assistant", "content": plan_text}],
+        add_generation_prompt=False,
+        enable_thinking=enable_thinking,
+    )
+    if not prefix or forced[: len(prefix)] != prefix:
+        raise FullVocabError(
+            "forced prompt does not start with the plan prefix tokens"
+        )
+    continuation = tuple(forced[len(prefix) :])
+    if not continuation:
+        raise FullVocabError("forced plan produced no tokens after the prefix")
+    return tuple(prefix), continuation
+
+
+def log_probabilities_for_continuation(
+    full_ids: Sequence[int],
+    prefix_length: int,
+    next_token_log_probabilities: Sequence[Sequence[float]],
+    *,
+    vocabulary_size: int,
+) -> DenseFullVocabResult:
+    """Slice next-token rows onto the forced continuation.
+
+    ``next_token_log_probabilities[t]`` is the distribution of
+    ``full_ids[t + 1]``. Rows must be normalized and ``vocabulary_size``
+    wide. A short or shifted row fails closed.
+    """
+
+    vocabulary = _positive_int(vocabulary_size, "vocabulary_size")
+    if (
+        not isinstance(prefix_length, int)
+        or isinstance(prefix_length, bool)
+        or prefix_length < 1
+        or prefix_length >= len(full_ids)
+    ):
+        raise FullVocabError("prefix_length does not leave a forced continuation")
+    expected_rows = len(full_ids) - 1
+    if len(next_token_log_probabilities) != expected_rows:
+        raise FullVocabError("next-token rows do not cover the forced token ids")
+    start = prefix_length - 1
+    continuation = tuple(int(token_id) for token_id in full_ids[prefix_length:])
+    rows = tuple(
+        tuple(float(value) for value in row)
+        for row in next_token_log_probabilities[start : start + len(continuation)]
+    )
+    if len(rows) != len(continuation):
+        raise FullVocabError("continuation log-probabilities were truncated")
+    for index, (token_id, row) in enumerate(zip(continuation, rows, strict=True)):
+        if len(row) != vocabulary:
+            raise FullVocabError(
+                f"position {index} support length differs from vocabulary_size"
+            )
+        if token_id < 0 or token_id >= vocabulary:
+            raise FullVocabError(
+                f"forced token id out of vocabulary at position {index}"
+            )
+        if not _is_normalized(row):
+            raise FullVocabError(f"position {index} is not a normalized distribution")
+    return DenseFullVocabResult(
+        vocabulary_size=vocabulary,
+        forced_token_ids=continuation,
+        position_log_probabilities=rows,
+    )
+
+
+class TransformersFullVocabScorer:
+    """Teacher-force one frozen plan with the configuration's pinned checkpoint.
+
+    ``device`` is required. Pass ``cpu`` or ``cuda`` only after the vLLM
+    server has been stopped when the device is the shared GPU. The loader
+    is injectable so tests do not download or load weights.
+    """
+
+    def __init__(
+        self,
+        configuration: RunConfiguration,
+        *,
+        device: str,
+        loader: Callable[..., TransformersBundle] | None = None,
+    ) -> None:
+        if not isinstance(configuration, RunConfiguration):
+            raise FullVocabError("scorer requires a run configuration")
+        if not isinstance(device, str) or device == "":
+            raise FullVocabError("device is required")
+        self._configuration = configuration
+        self._device = device
+        self._loader = loader or load_transformers_bundle
+        self._bundle: TransformersBundle | None = None
+
+    def __call__(
+        self,
+        *,
+        messages: Sequence[Mapping[str, str]],
+        plan_text: str,
+    ) -> DenseFullVocabResult:
+        if self._bundle is None:
+            self._bundle = self._loader(self._configuration, device=self._device)
+        prefix, continuation = render_plan_token_ids(
+            self._bundle.tokenizer,
+            messages,
+            plan_text,
+            enable_thinking=self._configuration.agent.prompt.thinking_enabled,
+        )
+        full_ids = prefix + continuation
+        rows = self._bundle.forward(full_ids)
+        return log_probabilities_for_continuation(
+            full_ids,
+            len(prefix),
+            rows,
+            vocabulary_size=self._bundle.vocabulary_size,
+        )
+
+
+def load_transformers_bundle(
+    configuration: RunConfiguration,
+    *,
+    device: str,
+) -> TransformersBundle:
+    """Load the configuration's model and tokenizer revisions. Not ``main``.
+
+    Transformers and torch are imported here, not when this module loads.
+    """
+
+    if not isinstance(configuration, RunConfiguration):
+        raise FullVocabError("scorer requires a run configuration")
+    if not isinstance(device, str) or device == "":
+        raise FullVocabError("device is required")
+    model_repository = configuration.model.model.repository
+    model_revision = configuration.model.model.revision
+    tokenizer_repository = configuration.model.tokenizer.repository
+    tokenizer_revision = configuration.model.tokenizer.revision
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as error:
+        raise FullVocabError("transformers is not installed") from error
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_repository,
+        revision=tokenizer_revision,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_repository,
+        revision=model_revision,
+    )
+    model.eval()
+    model.to(device)
+    tokenizer_size = len(tokenizer)
+    model_size = getattr(getattr(model, "config", None), "vocab_size", None)
+    if not isinstance(model_size, int) or isinstance(model_size, bool):
+        raise FullVocabError("model vocabulary size is missing")
+    if tokenizer_size != model_size:
+        raise FullVocabError("tokenizer and model vocabulary sizes differ")
+
+    def forward(token_ids: Sequence[int]) -> list[list[float]]:
+        tensor = torch.tensor([list(token_ids)], dtype=torch.long, device=device)
+        with torch.inference_mode():
+            logits = model(tensor).logits[0, :-1]
+            if int(logits.shape[-1]) != tokenizer_size:
+                raise FullVocabError("logit width differs from vocabulary size")
+            return torch.log_softmax(logits, dim=-1).tolist()
+
+    return TransformersBundle(
+        tokenizer=tokenizer,
+        forward=forward,
+        vocabulary_size=tokenizer_size,
+    )
+
+
+def bind_full_vocab_evidence(
+    score: FullVocabPlanScore,
+    configuration: RunConfiguration,
+) -> FullVocabEvidence:
+    """Accept the score as full-vocabulary only after the fidelity proof."""
+
+    if not isinstance(configuration, RunConfiguration):
+        raise FullVocabError("evidence requires a run configuration")
+    if len(score.position_log_probabilities) != len(score.forced_token_ids):
+        raise PositionAlignmentError("forced positions and distributions differ")
+    positions: list[ScoredPosition] = []
+    for index, row in enumerate(score.position_log_probabilities):
+        if len(row) != score.vocabulary_size:
+            raise FidelityProofError("incomplete vocabulary support")
+        positions.append(
+            ScoredPosition(
+                position=index,
+                support_token_ids=tuple(range(score.vocabulary_size)),
+                log_probabilities=row,
+            )
+        )
+    contract = ScoringContract(
+        model_repository=configuration.model.model.repository,
+        model_revision=configuration.model.model.revision,
+        tokenizer_repository=configuration.model.tokenizer.repository,
+        tokenizer_revision=configuration.model.tokenizer.revision,
+        input_prefix_fingerprint=score.input_prefix_fingerprint,
+        positions=tuple(positions),
+        fidelity="full",
+        declared_vocabulary_size=score.vocabulary_size,
+    )
+    verify_fidelity_claim(contract)
+    return FullVocabEvidence(
+        contract=contract,
+        forced_token_ids=tuple(score.forced_token_ids),
+        configuration_hash=run_configuration_hash(configuration),
+    )
+
+
+def assert_full_vocab_comparable(
+    reference: FullVocabEvidence,
+    candidate: FullVocabEvidence,
+) -> None:
+    """Fail closed on tokenizer, prefix, position, support, or forced-token mismatch."""
+
+    verify_scoring_contracts(reference.contract, candidate.contract)
+    if len(reference.forced_token_ids) != len(candidate.forced_token_ids):
+        raise PositionAlignmentError("forced position counts differ")
+    if reference.forced_token_ids != candidate.forced_token_ids:
+        raise SupportAlignmentError("forced token ids differ")
+
+
+def measure_backend_agreement(
+    score: FullVocabPlanScore,
+    vllm_positions: Sequence[Sequence[TokenLogprob]],
+    *,
+    logprob_tolerance: float,
+) -> BackendAgreementReport:
+    """Compare vLLM top-k with the dense top-k slice at a caller tolerance.
+
+    Position count must match or this fails closed. Forced-token, support,
+    and log-probability disagreements are counted. They are not truncation
+    error.
+    """
+
+    if (
+        isinstance(logprob_tolerance, bool)
+        or not isinstance(logprob_tolerance, (int, float))
+        or not math.isfinite(float(logprob_tolerance))
+        or float(logprob_tolerance) < 0.0
+    ):
+        raise FullVocabError("logprob_tolerance must be a nonnegative finite float")
+    tolerance = float(logprob_tolerance)
+    if len(score.forced_token_ids) != len(vllm_positions):
+        raise PositionAlignmentError(
+            "full-vocabulary and vLLM scored a different number of positions"
+        )
+    forced_mismatches = 0
+    support_mismatches = 0
+    logprob_mismatches = 0
+    max_delta: float | None = None
+    for index, (forced_id, position, row) in enumerate(
+        zip(
+            score.forced_token_ids,
+            vllm_positions,
+            score.position_log_probabilities,
+            strict=True,
+        )
+    ):
+        if not position:
+            raise SupportAlignmentError(f"vLLM support is empty at position {index}")
+        if int(position[0].token_id) != int(forced_id):
+            forced_mismatches += 1
+        dense_slice = top_k_slice(row, len(position))
+        vllm_ids = tuple(int(item.token_id) for item in position)
+        dense_ids = tuple(item.token_id for item in dense_slice)
+        support_matches = set(vllm_ids) == set(dense_ids) and len(vllm_ids) == len(
+            set(vllm_ids)
+        )
+        if not support_matches:
+            support_mismatches += 1
+        dense_by_id = {item.token_id: float(item.logprob) for item in dense_slice}
+        vllm_by_id = {int(item.token_id): float(item.logprob) for item in position}
+        position_disagrees = False
+        for token_id in set(dense_by_id) & set(vllm_by_id):
+            delta = abs(vllm_by_id[token_id] - dense_by_id[token_id])
+            max_delta = delta if max_delta is None else max(max_delta, delta)
+            if delta > tolerance:
+                position_disagrees = True
+        if position_disagrees:
+            logprob_mismatches += 1
+    disagreements = forced_mismatches + support_mismatches + logprob_mismatches
+    return BackendAgreementReport(
+        logprob_tolerance=tolerance,
+        position_count=len(score.forced_token_ids),
+        forced_token_mismatches=forced_mismatches,
+        support_mismatches=support_mismatches,
+        logprob_mismatches=logprob_mismatches,
+        max_abs_logprob_delta=max_delta,
+        status="agree" if disagreements == 0 else "disagree",
+    )
+
+
+def public_backend_agreement(report: BackendAgreementReport) -> dict[str, object]:
+    """Public counts for one backend-agreement report. No token strings."""
+
+    return {
+        "logprob_tolerance": report.logprob_tolerance,
+        "position_count": report.position_count,
+        "forced_token_mismatches": report.forced_token_mismatches,
+        "support_mismatches": report.support_mismatches,
+        "logprob_mismatches": report.logprob_mismatches,
+        "max_abs_logprob_delta": report.max_abs_logprob_delta,
+        "status": report.status,
+    }
+
+
+def write_local_plan_inputs(
+    path: Path,
+    *,
+    messages: Sequence[Mapping[str, str]],
+    plan_text: str,
+    configuration: RunConfiguration,
+    results_root: Path | None = None,
+) -> None:
+    """Persist one frozen plan for a later Transformers pass. Refuses ``results/``."""
+
+    if not isinstance(configuration, RunConfiguration):
+        raise FullVocabError("plan inputs require a run configuration")
+    root = results_root if results_root is not None else default_results_root()
+    resolved = path.resolve()
+    base = root.resolve()
+    if resolved == base or base in resolved.parents:
+        raise FullVocabError("refusing to write under results/")
+    payload = {
+        "visibility": "local",
+        "model_repository": configuration.model.model.repository,
+        "model_revision": configuration.model.model.revision,
+        "tokenizer_repository": configuration.model.tokenizer.repository,
+        "tokenizer_revision": configuration.model.tokenizer.revision,
+        "configuration_hash": run_configuration_hash(configuration),
+        "enable_thinking": configuration.agent.prompt.thinking_enabled,
+        "input_prefix_fingerprint": fingerprint_messages(messages),
+        "messages": [
+            {"role": str(message["role"]), "content": str(message["content"])}
+            for message in messages
+        ],
+        "plan_text": plan_text,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _apply_template(
+    tokenizer: object,
+    messages: list[dict[str, str]],
+    *,
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+) -> list[int]:
+    apply = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(apply):
+        raise FullVocabError("tokenizer has no chat template")
+    try:
+        rendered = apply(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=True,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError as error:
+        raise FullVocabError("chat template rejected enable_thinking") from error
+    except Exception as error:
+        raise FullVocabError("chat template failed") from error
+    if hasattr(rendered, "input_ids"):
+        rendered = rendered["input_ids"]
+    if isinstance(rendered, tuple):
+        rendered = list(rendered)
+    if (
+        isinstance(rendered, list)
+        and rendered
+        and isinstance(rendered[0], list)
+    ):
+        rendered = rendered[0]
+    if not isinstance(rendered, list) or not all(
+        isinstance(token, int) and not isinstance(token, bool) for token in rendered
+    ):
+        raise FullVocabError("tokenizer did not return token ids")
+    return rendered
