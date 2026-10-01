@@ -32,7 +32,7 @@
     "smolagents_version": "1.22.0",
     "action_interface": "code",
     "prompt": {
-      "prompt_version": "prompt-v3",
+      "prompt_version": "prompt-v4",
       "plan_format_version": "plan-v1",
       "thinking_enabled": false
     },

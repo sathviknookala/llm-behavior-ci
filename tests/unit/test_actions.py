@@ -111,6 +111,110 @@ class ActionParserTests(unittest.TestCase):
         self.assertIn("CALL <app> <api>", legacy)
         self.assertNotIn("Do not guess usernames", legacy)
 
+    def test_prompt_v3_execute_text_is_unchanged(self) -> None:
+        text = render_system_text(
+            prompt_version="prompt-v3",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="execute",
+        )
+        self.assertIn(
+            "Before calling any app API that requires authentication, first obtain "
+            "the existing user's credentials using the documented supervisor "
+            "credential APIs, then log into that app using exactly the returned "
+            "credentials.",
+            text,
+        )
+        self.assertIn("apis.<app>.<api>(...)", text)
+        self.assertNotIn("supervisor.login", text)
+        self.assertNotIn("complete_task() only as the final action", text)
+        legacy = render_system_text(
+            prompt_version="prompt-v3",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="tool_calling",
+            mode="execute",
+        )
+        self.assertIn("CALL <app> <api>", legacy)
+
+    def test_prompt_v4_execute_keeps_native_format_and_invariants(self) -> None:
+        text = render_system_text(
+            prompt_version="prompt-v4",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="execute",
+        )
+        self.assertIn("apis.<app>.<api>(...)", text)
+        self.assertIn("apis.supervisor.complete_task(...)", text)
+        self.assertIn("Pass every argument by keyword.", text)
+        self.assertIn("Do not repeat a call that just failed.", text)
+        self.assertIn(
+            "Before calling any app API that requires authentication, retrieve "
+            "the existing user's credentials using the documented supervisor "
+            "credential APIs.",
+            text,
+        )
+        self.assertIn(
+            "Use the returned username and password exactly to log into that app.",
+            text,
+        )
+        self.assertIn(
+            "Reuse the returned access token for later authenticated calls.",
+            text,
+        )
+        self.assertIn(
+            "Never fabricate usernames, passwords, tokens, IDs, or "
+            "authentication state.",
+            text,
+        )
+        self.assertIn("such as supervisor.login", text)
+        self.assertIn(
+            "Do not create a new account unless the user task explicitly "
+            "requests account creation.",
+            text,
+        )
+        self.assertIn(
+            "return to the credential-retrieval and login flow",
+            text,
+        )
+        self.assertIn(
+            "Call complete_task() only as the final action, after the requested "
+            "work has actually been performed.",
+            text,
+        )
+        self.assertIn(
+            "Never call complete_task() merely because authentication or "
+            "another tool call failed.",
+            text,
+        )
+        self.assertIn(
+            "do not repeat the same failed call unchanged.",
+            text,
+        )
+        self.assertIn(
+            "do not repeatedly issue the identical successful read",
+            text,
+        )
+        self.assertIn(
+            "Continue to the next unresolved subgoal instead of looping",
+            text,
+        )
+        self.assertNotIn("CALL <app> <api>", text)
+        self.assertNotIn("STOP", text)
+        with self.assertRaisesRegex(
+            ValueError,
+            "prompt-v4 does not support tool_calling action interface",
+        ):
+            render_system_text(
+                prompt_version="prompt-v4",
+                plan_format_version="plan-v1",
+                thinking_enabled=False,
+                action_interface="tool_calling",
+                mode="execute",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,6 +67,44 @@ _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
             "API calls whenever later calls require them.\n"
         ),
     ),
+    "prompt-v4": PromptTemplate(
+        version="prompt-v4",
+        system_body=(
+            "You are an AppWorld tool-using agent.\n"
+            "Follow the task instruction and the API documentation.\n"
+            "Mutate state only through AppWorld-executed actions.\n"
+            "Do not invent APIs that are absent from the documentation.\n"
+            "Before calling any app API that requires authentication, retrieve "
+            "the existing user's credentials using the documented supervisor "
+            "credential APIs.\n"
+            "Use the returned username and password exactly to log into that app.\n"
+            "Reuse the returned access token for later authenticated calls.\n"
+            "Never fabricate usernames, passwords, tokens, IDs, or "
+            "authentication state.\n"
+            "Do not call nonexistent or undocumented authentication APIs such "
+            "as supervisor.login.\n"
+            "Do not create a new account unless the user task explicitly "
+            "requests account creation.\n"
+            "If an authenticated call fails because authentication is missing "
+            "or invalid, return to the credential-retrieval and login flow "
+            "rather than continuing with guesses.\n"
+            "Reuse credentials, tokens, IDs, and other values returned by "
+            "earlier API calls whenever later calls require them.\n"
+            "Call complete_task() only as the final action, after the requested "
+            "work has actually been performed.\n"
+            "Never call complete_task() merely because authentication or "
+            "another tool call failed.\n"
+            "Before completing, verify from the conversation and tool results "
+            "that the requested lookup, mutation, or answer-producing work has "
+            "been carried out.\n"
+            "If a tool call fails, do not repeat the same failed call unchanged.\n"
+            "If a read succeeds, do not repeatedly issue the identical "
+            "successful read without using its returned information to advance "
+            "the task.\n"
+            "Continue to the next unresolved subgoal instead of looping on the "
+            "current action.\n"
+        ),
+    ),
 }
 
 _PLAN_FORMAT_REGISTRY: dict[str, PlanFormatTemplate] = {
@@ -172,13 +210,13 @@ def render_system_text(
 
 def _execute_instruction(*, prompt_version: str, action_interface: str) -> str:
     if action_interface == "code":
-        if prompt_version in {"prompt-v2", "prompt-v3"}:
+        if prompt_version in {"prompt-v2", "prompt-v3", "prompt-v4"}:
             return _NATIVE_CODE_EXECUTE
         return _LEGACY_CODE_EXECUTE
     if action_interface == "tool_calling":
-        if prompt_version == "prompt-v2":
+        if prompt_version in {"prompt-v2", "prompt-v4"}:
             raise ValueError(
-                "prompt-v2 does not support tool_calling action interface"
+                f"{prompt_version} does not support tool_calling action interface"
             )
         return _LEGACY_TOOL_CALLING_EXECUTE
     raise ValueError(f"unsupported action_interface: {action_interface}")

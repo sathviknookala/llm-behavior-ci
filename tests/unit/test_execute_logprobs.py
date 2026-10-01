@@ -354,7 +354,7 @@ class ExecuteHorizonTests(unittest.TestCase):
 
 
 class PilotConfigurationTests(unittest.TestCase):
-    def test_pilot_differs_from_production_only_in_the_three_overrides(self) -> None:
+    def test_pilot_differs_from_production_only_in_pilot_settings(self) -> None:
         production = json.loads(
             (_ROOT / "configs/models/qwen3_4b_production.json").read_text(encoding="utf-8")
         )
@@ -363,6 +363,8 @@ class PilotConfigurationTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
+        self.assertEqual(pilot["agent"]["prompt"].pop("prompt_version"), "prompt-v4")
+        self.assertEqual(production["agent"]["prompt"].pop("prompt_version"), "prompt-v2")
         self.assertEqual(pilot["agent"].pop("execute_max_model_turns"), 20)
         self.assertEqual(
             pilot["agent"].pop("tool_access_profile"),
