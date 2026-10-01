@@ -64,8 +64,14 @@ class LaunchSpecTests(unittest.TestCase):
         index = spec.argv.index("--quantization")
         self.assertEqual(spec.argv[index + 1], "fp8")
 
+        awq = _model(quantization=QuantizationSettings(method="awq"))
+        awq_spec = build_vllm_launch_spec(awq)
+        awq_index = awq_spec.argv.index("--quantization")
+        self.assertEqual(awq_spec.argv[awq_index + 1], "awq")
+
         healthy = build_vllm_launch_spec(_model())
         self.assertNotEqual(spec.argv, healthy.argv)
+        self.assertNotEqual(awq_spec.argv, healthy.argv)
 
     def test_batch_invariant_sets_the_env_var_only(self) -> None:
         serving = replace(_model().serving, batch_invariant=True)

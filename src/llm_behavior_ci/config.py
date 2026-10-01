@@ -87,7 +87,7 @@ none of their fields enter the run-configuration hash.
 
 Closed tokens: splits are train, dev, test_normal, and test_challenge;
 action interfaces are code and tool_calling; quantization methods are
-none, fp8, and nvfp4; model dtypes are bfloat16, float16, and float32;
+none, fp8, nvfp4, and awq; model dtypes are bfloat16, float16, and float32;
 KV-cache dtypes are bfloat16, float16, and fp8. Model revisions,
 tokenizer revisions, and git_commit are 40-character lowercase git ids.
 task_set_hash and a present protocol_hash are 64-character lowercase
@@ -128,7 +128,7 @@ _T = TypeVar("_T")
 
 SPLITS = frozenset({"train", "dev", "test_normal", "test_challenge"})
 ACTION_INTERFACES = frozenset({"code", "tool_calling"})
-QUANTIZATION_METHODS = frozenset({"none", "fp8", "nvfp4"})
+QUANTIZATION_METHODS = frozenset({"none", "fp8", "nvfp4", "awq"})
 MODEL_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 KV_CACHE_DTYPES = frozenset({"bfloat16", "float16", "fp8"})
 SAMPLER_BACKENDS = frozenset({"flashinfer", "native"})

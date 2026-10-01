@@ -391,6 +391,7 @@ class ConfigurationTests(unittest.TestCase):
             "zero run seed": ("run_seed", 0),
             "one task": ("task.task_count", 1),
             "nvfp4": ("model.quantization.method", "nvfp4"),
+            "awq": ("model.quantization.method", "awq"),
             "float32": ("model.serving.dtype", "float32"),
             "challenge split": ("task.split", "test_challenge"),
             "normal split": ("task.split", "test_normal"),
