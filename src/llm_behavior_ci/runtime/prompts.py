@@ -48,6 +48,25 @@ _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
             "when a later call requires them.\n"
         ),
     ),
+    "prompt-v3": PromptTemplate(
+        version="prompt-v3",
+        system_body=(
+            "You are an AppWorld tool-using agent.\n"
+            "Follow the task instruction and the API documentation.\n"
+            "Mutate state only through AppWorld-executed actions.\n"
+            "Do not invent APIs that are absent from the documentation.\n"
+            "Before calling any app API that requires authentication, first obtain "
+            "the existing user's credentials using the documented supervisor "
+            "credential APIs, then log into that app using exactly the returned "
+            "credentials.\n"
+            "Never fabricate usernames, passwords, access tokens, IDs, or other "
+            "authentication state.\n"
+            "Do not create a new account unless the task explicitly requires "
+            "account creation.\n"
+            "Reuse credentials, tokens, IDs, and other values returned by earlier "
+            "API calls whenever later calls require them.\n"
+        ),
+    ),
 }
 
 _PLAN_FORMAT_REGISTRY: dict[str, PlanFormatTemplate] = {
@@ -153,7 +172,7 @@ def render_system_text(
 
 def _execute_instruction(*, prompt_version: str, action_interface: str) -> str:
     if action_interface == "code":
-        if prompt_version == "prompt-v2":
+        if prompt_version in {"prompt-v2", "prompt-v3"}:
             return _NATIVE_CODE_EXECUTE
         return _LEGACY_CODE_EXECUTE
     if action_interface == "tool_calling":
