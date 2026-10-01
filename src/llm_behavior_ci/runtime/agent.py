@@ -67,6 +67,7 @@ class AgentTurn:
     prompt_text: str
     output_text: str
     top_k_logprobs: tuple[tuple[TokenLogprob, ...], ...]
+    generated_token_count: int
     latency_seconds: float
     started_at: datetime
     action: str | None
@@ -119,6 +120,25 @@ def _logprob_token_id(entry: object) -> int:
             "token_id is missing: logprob token is not a token_id:<id> string"
         )
     return int(digits)
+
+
+def generated_token_count(choice: Mapping[object, object]) -> int:
+    """The number of generated tokens from a choice's ``token_ids``.
+
+    ``completion_payload`` sets ``return_token_ids``, so vLLM returns the
+    generated ids on every choice whether or not logprobs were requested.
+    A missing or malformed list fails closed.
+    """
+
+    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+    token_ids = choice.get("token_ids")
+    if not isinstance(token_ids, list) or not all(
+        isinstance(token, int) and not isinstance(token, bool) and token >= 0
+        for token in token_ids
+    ):
+        raise RuntimeUnavailable("endpoint did not return generated token_ids")
+    return len(token_ids)
 
 
 def parse_logprobs(choice: Mapping[object, object]) -> tuple[tuple[TokenLogprob, ...], ...]:
@@ -496,19 +516,25 @@ class SmolagentsVLLMAgent(_SmolModel):
         extension fields (``top_k``, ``min_p``, ``chat_template_kwargs``,
         ``return_tokens_as_token_ids``, ``return_token_ids``) sit at the top
         level; vLLM ignores a literal ``extra_body`` key.
+
+        Plan mode requests ``logprobs`` and ``top_logprobs`` because plan
+        capture reads those tables. Execute mode omits both: its A/A metrics
+        use the parsed action, the tool trajectory, and the evaluator
+        outcome, and its token count comes from ``token_ids``. The
+        teacher-forced plan KL request is ``teacher_force_payload``.
+        ``max_tokens`` is ``SamplingSettings.generation_max_tokens`` for
+        the current mode.
         """
 
         state = self._state()
         validate_chat_request(state.config)
         sampling = state.config.agent.sampling
-        return {
+        payload: dict[str, object] = {
             "model": served_model_id(state.config),
             "temperature": sampling.temperature,
             "top_p": sampling.top_p,
-            "max_tokens": sampling.max_tokens,
+            "max_tokens": sampling.generation_max_tokens(self._mode),
             "seed": sampling.seed,
-            "logprobs": True,
-            "top_logprobs": state.config.model.serving.max_logprobs,
             "messages": messages,
             "top_k": sampling.top_k,
             "min_p": sampling.min_p,
@@ -518,6 +544,10 @@ class SmolagentsVLLMAgent(_SmolModel):
                 "enable_thinking": state.config.agent.prompt.thinking_enabled
             },
         }
+        if self._mode == "plan":
+            payload["logprobs"] = True
+            payload["top_logprobs"] = state.config.model.serving.max_logprobs
+        return payload
 
     def teacher_force_payload(
         self,
@@ -621,11 +651,14 @@ class SmolagentsVLLMAgent(_SmolModel):
         output_text = chat_message.content or ""
         raw = chat_message.raw
         choice = raw["choices"][0]
-        logprobs = parse_logprobs(choice)
-        rejection = None
+        token_count = generated_token_count(choice)
         if self._mode == "plan":
+            logprobs = parse_logprobs(choice)
             action, app_name, api_name = None, None, None
+            rejection = None
         else:
+            logprobs = ()
+            rejection = None
             try:
                 action, app_name, api_name = parse_model_output(output_text)
             except ActionRejected as error:
@@ -636,6 +669,7 @@ class SmolagentsVLLMAgent(_SmolModel):
             prompt_text=messages[-1]["content"],
             output_text=output_text,
             top_k_logprobs=logprobs,
+            generated_token_count=token_count,
             latency_seconds=latency_seconds,
             started_at=started_at,
             action=action,

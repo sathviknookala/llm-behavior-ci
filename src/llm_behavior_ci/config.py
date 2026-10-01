@@ -44,12 +44,15 @@ agent.prompt.prompt_version
 agent.prompt.plan_format_version
 agent.prompt.thinking_enabled
 agent.step_limit
+agent.execute_max_model_turns
 agent.sampling.temperature
 agent.sampling.top_p
 agent.sampling.top_k
 agent.sampling.min_p
 agent.sampling.seed
 agent.sampling.max_tokens
+agent.sampling.execute_max_tokens
+agent.sampling.plan_max_tokens
 agent.api_docs_version
 agent.api_docs_app
 task.appworld_version
@@ -91,14 +94,17 @@ SHA-256 digests. top_k is -1 or a positive integer. The sampling seed
 is required. KL fidelity modes are full and top_k; runtime/scoring.py
 is where full is proven rather than merely claimed.
 
-model.lora.repository, model.lora.revision, agent.api_docs_version, and
-agent.api_docs_app are optional hashed leaves: ``ModelConfiguration.lora``
-and ``AgentConfiguration.api_docs_version``/``api_docs_app`` default to
-unset, and an unset leaf is omitted from canonical JSON entirely rather
+model.lora.repository, model.lora.revision, agent.api_docs_version,
+agent.api_docs_app, agent.execute_max_model_turns,
+agent.sampling.execute_max_tokens, and agent.sampling.plan_max_tokens are
+optional hashed leaves: ``ModelConfiguration.lora``,
+``AgentConfiguration.api_docs_version``/``api_docs_app``,
+``AgentConfiguration.execute_max_model_turns``, and the two mode-specific
+``SamplingSettings`` token caps default to unset, and an unset leaf is omitted from canonical JSON entirely rather
 than serialized as null, so a configuration that never names a LoRA
 adapter or a corrupted API-documentation source hashes identically to one
-built before these fields existed. Setting, clearing, or changing either
-pair still changes the digest, because canonical JSON then differs.
+built before these fields existed. Setting, clearing, or changing any of
+them still changes the digest, because canonical JSON then differs.
 ``leaf_value``/``hashed_values`` read these leaves through
 ``MISSING_HASHED_LEAF`` rather than raising, so a caller comparing two
 configurations' hashed fields sees "unset" as one comparable value
@@ -153,12 +159,15 @@ HASHED_FIELDS = frozenset(
         "agent.prompt.plan_format_version",
         "agent.prompt.thinking_enabled",
         "agent.step_limit",
+        "agent.execute_max_model_turns",
         "agent.sampling.temperature",
         "agent.sampling.top_p",
         "agent.sampling.top_k",
         "agent.sampling.min_p",
         "agent.sampling.seed",
         "agent.sampling.max_tokens",
+        "agent.sampling.execute_max_tokens",
+        "agent.sampling.plan_max_tokens",
         "agent.api_docs_version",
         "agent.api_docs_app",
         "task.appworld_version",
@@ -655,12 +664,22 @@ class PromptSettings:
 
 @dataclass(frozen=True)
 class SamplingSettings:
+    """Request sampling settings.
+
+    ``max_tokens`` is the generation cap for every mode unless the mode's
+    optional override is set: ``execute_max_tokens`` for execute turns and
+    ``plan_max_tokens`` for plan generation. An unset override is omitted
+    from ``to_dict``. ``generation_max_tokens`` resolves the cap.
+    """
+
     temperature: float
     top_p: float
     top_k: int
     min_p: float
     seed: int
     max_tokens: int
+    execute_max_tokens: int | None = None
+    plan_max_tokens: int | None = None
 
     def __post_init__(self) -> None:
         _temperature(self.temperature)
@@ -669,9 +688,24 @@ class SamplingSettings:
         _closed_unit(self.min_p, "min_p")
         _integer(self.seed, "seed")
         _positive(self.max_tokens, "max_tokens")
+        if self.execute_max_tokens is not None:
+            _positive(self.execute_max_tokens, "execute_max_tokens")
+        if self.plan_max_tokens is not None:
+            _positive(self.plan_max_tokens, "plan_max_tokens")
+
+    def generation_max_tokens(self, mode: str) -> int:
+        if mode == "execute" and self.execute_max_tokens is not None:
+            return self.execute_max_tokens
+        if mode == "plan" and self.plan_max_tokens is not None:
+            return self.plan_max_tokens
+        return self.max_tokens
 
     def to_dict(self) -> dict[str, object]:
-        return _plain_dict(self, SamplingSettings)
+        document = _plain_dict(self, SamplingSettings)
+        for key in ("execute_max_tokens", "plan_max_tokens"):
+            if document[key] is None:
+                del document[key]
+        return document
 
     @classmethod
     def from_dict(
@@ -680,7 +714,12 @@ class SamplingSettings:
         name: str = "sampling",
     ) -> SamplingSettings:
         mapping = _object(payload, name)
-        _require_fields(mapping, cls, name)
+        _require_fields(
+            mapping,
+            cls,
+            name,
+            optional=frozenset({"execute_max_tokens", "plan_max_tokens"}),
+        )
         return _construct(name, lambda: _load(cls, mapping))
 
 
@@ -692,6 +731,10 @@ class AgentConfiguration:
     the healthy configuration leaves both unset, and the ``api_documentation``
     fault kind's whole effect is naming a corruption transform
     (``api_docs_version``) and the one app it targets (``api_docs_app``).
+
+    ``execute_max_model_turns`` overrides ``step_limit`` as the execute
+    episode horizon when set; ``execute_turn_limit`` resolves it. An unset
+    override is omitted from ``to_dict``.
     """
 
     smolagents_version: str
@@ -701,6 +744,7 @@ class AgentConfiguration:
     sampling: SamplingSettings
     api_docs_version: str | None = None
     api_docs_app: str | None = None
+    execute_max_model_turns: int | None = None
 
     def __post_init__(self) -> None:
         _text(self.smolagents_version, "smolagents_version")
@@ -715,6 +759,14 @@ class AgentConfiguration:
         if self.api_docs_version is not None:
             _text(self.api_docs_version, "api_docs_version")
             _text(self.api_docs_app, "api_docs_app")
+        if self.execute_max_model_turns is not None:
+            _positive(self.execute_max_model_turns, "execute_max_model_turns")
+
+    @property
+    def execute_turn_limit(self) -> int:
+        if self.execute_max_model_turns is not None:
+            return self.execute_max_model_turns
+        return self.step_limit
 
     def to_dict(self) -> dict[str, object]:
         document: dict[str, object] = {
@@ -727,6 +779,8 @@ class AgentConfiguration:
         if self.api_docs_version is not None:
             document["api_docs_version"] = self.api_docs_version
             document["api_docs_app"] = self.api_docs_app
+        if self.execute_max_model_turns is not None:
+            document["execute_max_model_turns"] = self.execute_max_model_turns
         return document
 
     @classmethod
@@ -740,7 +794,9 @@ class AgentConfiguration:
             mapping,
             cls,
             name,
-            optional=frozenset({"api_docs_version", "api_docs_app"}),
+            optional=frozenset(
+                {"api_docs_version", "api_docs_app", "execute_max_model_turns"}
+            ),
         )
         prompt = PromptSettings.from_dict(mapping["prompt"])
         sampling = SamplingSettings.from_dict(mapping["sampling"])
@@ -753,6 +809,7 @@ class AgentConfiguration:
                 sampling=sampling,
                 api_docs_version=mapping.get("api_docs_version"),
                 api_docs_app=mapping.get("api_docs_app"),
+                execute_max_model_turns=mapping.get("execute_max_model_turns"),
             ),
         )
 

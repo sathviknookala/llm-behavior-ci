@@ -127,6 +127,7 @@ def _model_step(index: int, turn: AgentTurn) -> ModelStep:
         prompt_text=turn.prompt_text,
         output_text=turn.output_text,
         top_k_logprobs=turn.top_k_logprobs,
+        generated_token_count=turn.generated_token_count,
         latency_seconds=turn.latency_seconds,
         started_at=turn.started_at,
     )
@@ -192,7 +193,8 @@ def run_episode(
     set, git commit, or protocol. Mints one episode identity, opens a session
     from ``runtime.session_factory``, and always closes that session. Plan
     mode takes one model turn and never executes or evaluates. Execute mode
-    enforces the configured step limit and records tool results. It evaluates
+    enforces ``config.agent.execute_turn_limit`` (``execute_max_model_turns``
+    when set, else ``step_limit``) and records tool results. It evaluates
     when the agent stops, when ``complete_task`` succeeds, and when the step
     limit is reached. A step-limit evaluation does not change the failed
     status. Unrecoverable runtime and tool failures are not evaluated.
@@ -263,7 +265,7 @@ def run_episode(
         tool_output: str | None = None
         next_index = 0
         while True:
-            if model_turns >= config.agent.step_limit:
+            if model_turns >= config.agent.execute_turn_limit:
                 evaluation = session.evaluate()
                 return _finish(
                     identity=identity,

@@ -24,6 +24,7 @@ from llm_behavior_ci.experiments.faults import (
     measure_harm,
 )
 from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
     TaskSet,
@@ -151,6 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         candidate = RunConfiguration.from_dict(_load_json(Path(args.candidate)))
         task_set = _load_task_set(_load_json(Path(args.task_set)))
         fault = load_fault(Path(args.fault))
+        enforce_committed_provenance(base)
         runtime = _load_runtime(runtime_spec)
         label = measure_harm(
             base,
@@ -185,7 +187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path.write_text(text + "\n", encoding="utf-8")
         print(text)
         return 0
-    except (FaultError, ConfigError, SelectionError) as error:
+    except (FaultError, ConfigError, SelectionError, ProvenanceError) as error:
         print(str(error) or "harm characterization failed", file=sys.stderr)
         return 1
     except Exception:

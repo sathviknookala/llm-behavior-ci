@@ -1269,6 +1269,7 @@ def _episode(
                         TokenLogprob(token_id=4, logprob=-1.0, rank=1),
                     ),
                 ),
+                generated_token_count=1,
                 latency_seconds=0.1,
                 started_at=step_at,
             ),

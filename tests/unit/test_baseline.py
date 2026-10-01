@@ -95,6 +95,7 @@ class StopAgent:
             prompt_text="prompt",
             output_text="stop",
             top_k_logprobs=((TokenLogprob(token_id=1, logprob=-0.1, rank=0),),),
+            generated_token_count=1,
             latency_seconds=0.0,
             started_at=_clock_holder[0](),
             action=None,

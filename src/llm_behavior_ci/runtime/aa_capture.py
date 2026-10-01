@@ -19,6 +19,13 @@ snapshot is taken. A caller-supplied probe is not GPU evidence;
 With no expected-process allowance, any compute process refuses a timed
 start. An explicit caller allowance names the baseline server by pid
 and/or exact process name; unexpected concurrent GPU work still refuses.
+
+Concurrency 1 runs every pair in this process. Concurrency above 1 runs
+each pair in a spawned child process: AppWorld worlds and their SQLite
+state cannot cross threads. A child builds its own agent, runtime, and
+worlds from an ``AAProcessJob`` and returns the finished ``AAPairRecord``,
+because ``run_pair`` keeps ``PairExecution`` in process-local memory. Every
+child talks to the same vLLM endpoint; no model is loaded per worker.
 """
 
 from __future__ import annotations
@@ -31,15 +38,17 @@ import time
 from statistics import fmean
 from collections import Counter
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Literal
 
 from llm_behavior_ci.config import (
     ConfigError,
     RunConfiguration,
+    RunIdentity,
     StreamSettings,
     new_run_identity,
 )
@@ -52,6 +61,12 @@ from llm_behavior_ci.runtime.episode import (
     evaluator_difference,
     pair_execution,
     run_pair,
+)
+from llm_behavior_ci.runtime.provenance import (
+    ProvenanceError,
+    RepositoryState,
+    read_repository_state,
+    require_committed_provenance,
 )
 from llm_behavior_ci.runtime.scoring import ScoringError, score_top_k
 from llm_behavior_ci.stats.chi_square import ChiSquareError, ChiSquareResult, chi_square_homogeneity
@@ -78,6 +93,10 @@ _TEACHER_FORCED_COUNT_KEYS = {
 
 class GpuBusy(RuntimeError):
     """The GPU already has compute work, so a timed capture must not start."""
+
+
+class AAJobFailed(RuntimeError):
+    """A process-pool pair failed. The message names the job, task, and mode."""
 
 
 @dataclass(frozen=True)
@@ -564,6 +583,152 @@ def _record(
     )
 
 
+def _run_job(
+    runtime: RuntimeDependencies,
+    item: ScheduledInput,
+    mode: ModeName,
+    configuration: RunConfiguration,
+    reference_run: RunIdentity,
+    candidate_run: RunIdentity,
+) -> AAPairRecord:
+    pair = run_pair(
+        item.task_id,
+        configuration,
+        configuration,
+        reference_run=reference_run,
+        candidate_run=candidate_run,
+        runtime=runtime,
+        mode=mode,
+        scenario_id=item.scenario_id,
+    )
+    forced_kl: TeacherForcedPlanKL | None = None
+    if mode == "plan":
+        frozen = pair.reference.plan_text
+        if frozen is None or not str(frozen).strip():
+            forced_kl = TeacherForcedPlanKL(status="empty_positions")
+        else:
+            forced_kl = teacher_forced_plan_kl(
+                runtime=runtime,
+                task_id=item.task_id,
+                configuration=configuration,
+                frozen_plan_text=frozen,
+            )
+    return _record(item, mode, pair, forced_kl=forced_kl)
+
+
+def build_live_runtime(base_url: str, mode: str) -> RuntimeDependencies:
+    """Build a runtime that opens one AppWorld world and talks to vLLM.
+
+    Import of the live adapters happens here. AppWorld itself is imported
+    only when a world opens. The clock is ``wall_now`` because opening a
+    world freezes ``datetime.now`` to the task date, and episode bounds have
+    to stay on the same real clock as model steps.
+    """
+
+    from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
+    from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
+    from llm_behavior_ci.runtime.clock import wall_now
+
+    agent = SmolagentsVLLMAgent(base_url)
+    agent.set_mode(mode)
+    return RuntimeDependencies(
+        session_factory=LiveAppWorldSession,
+        agent=agent,
+        clock=wall_now,
+    )
+
+
+@dataclass(frozen=True)
+class ProcessRuntimeFactory:
+    """A picklable runtime factory: an endpoint and a module-level builder.
+
+    ``builder(vllm_base_url, mode)`` must be importable by name in a spawned
+    child, so it is a module-level function, never a closure. Called with a
+    mode, the factory builds a runtime in the current process.
+    """
+
+    vllm_base_url: str
+    builder: Callable[[str, str], RuntimeDependencies] = build_live_runtime
+
+    def __call__(self, mode: str) -> RuntimeDependencies:
+        return self.builder(self.vllm_base_url, mode)
+
+
+@dataclass(frozen=True)
+class AAProcessJob:
+    """One pair to run in a child process. Every field pickles by value or name."""
+
+    index: int
+    item: ScheduledInput
+    mode: ModeName
+    configuration: RunConfiguration
+    reference_run: RunIdentity
+    candidate_run: RunIdentity
+    vllm_base_url: str
+    runtime_builder: Callable[[str, str], RuntimeDependencies] = build_live_runtime
+
+
+def _job_context(job: AAProcessJob) -> str:
+    return (
+        f"A/A job {job.index} failed (repetition={job.item.repetition}, "
+        f"arrival_index={job.item.arrival_index}, task_id={job.item.task_id}, "
+        f"mode={job.mode})"
+    )
+
+
+def run_process_job(job: AAProcessJob) -> tuple[int, AAPairRecord]:
+    """Build the runtime, run the pair, and build its record in this process.
+
+    A failure is re-raised as ``AAJobFailed`` with the job context and the
+    original error type and message, so the parent can report it without
+    unpickling a live-runtime exception.
+    """
+
+    try:
+        runtime = job.runtime_builder(job.vllm_base_url, job.mode)
+        record = _run_job(
+            runtime,
+            job.item,
+            job.mode,
+            job.configuration,
+            job.reference_run,
+            job.candidate_run,
+        )
+    except Exception as error:
+        raise AAJobFailed(
+            f"{_job_context(job)}: {type(error).__name__}: {error}"
+        ) from None
+    return job.index, record
+
+
+def _run_process_pool(
+    jobs: Sequence[AAProcessJob],
+    worker_count: int,
+) -> list[AAPairRecord]:
+    slots: list[AAPairRecord | None] = [None] * len(jobs)
+    with ProcessPoolExecutor(
+        max_workers=worker_count,
+        mp_context=get_context("spawn"),
+    ) as pool:
+        futures = [(job, pool.submit(run_process_job, job)) for job in jobs]
+        for job, future in futures:
+            try:
+                index, record = future.result()
+            except AAJobFailed:
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise
+            except Exception as error:
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise AAJobFailed(
+                    f"{_job_context(job)}: {type(error).__name__}: {error}"
+                ) from error
+            slots[index] = record
+    records = [record for record in slots if record is not None]
+    if len(records) != len(slots):
+        raise EpisodeRejected("capture dropped a paired episode")
+    return records
+
+
 def _tool_selection(records: Sequence[AAPairRecord]) -> ChiSquareResult | None:
     counts_left: Counter[str] = Counter()
     counts_right: Counter[str] = Counter()
@@ -796,7 +961,9 @@ def capture_aa(
     """Pair one configuration with itself on a supplied stream.
 
     ``runtime_factory`` receives the mode and must return a fresh runtime
-    for that pair. Reference and candidate runs are distinct identities of
+    for that pair. Concurrency above 1 requires a ``ProcessRuntimeFactory``:
+    each pair runs in a spawned child that calls its builder there, and
+    records come back in schedule order. Reference and candidate runs are distinct identities of
     this same configuration. ``observe_hardware`` false leaves cost numbers
     unset and does not shell out to ``nvidia-smi``. When it is true, every
     compute process must be covered by ``allowed_gpu_processes`` before any
@@ -826,50 +993,41 @@ def capture_aa(
         matched_allowed = assert_gpu_processes_allowed(before, allowed)
     reference_run = new_run_identity(configuration)
     candidate_run = new_run_identity(configuration)
-    jobs: list[tuple[int, ScheduledInput, ModeName]] = []
-    for item in schedule:
-        for mode in chosen:
-            jobs.append((len(jobs), item, mode))
-    slots: list[AAPairRecord | None] = [None] * len(jobs)
-
-    def run_job(index: int, item: ScheduledInput, mode: ModeName) -> None:
-        runtime = runtime_factory(mode)
-        pair = run_pair(
-            item.task_id,
-            configuration,
-            configuration,
-            reference_run=reference_run,
-            candidate_run=candidate_run,
-            runtime=runtime,
-            mode=mode,
-            scenario_id=item.scenario_id,
+    if worker_count > 1 and not isinstance(runtime_factory, ProcessRuntimeFactory):
+        raise EpisodeRejected(
+            "concurrency above 1 requires a ProcessRuntimeFactory"
         )
-        forced_kl: TeacherForcedPlanKL | None = None
-        if mode == "plan":
-            frozen = pair.reference.plan_text
-            if frozen is None or not str(frozen).strip():
-                forced_kl = TeacherForcedPlanKL(status="empty_positions")
-            else:
-                forced_kl = teacher_forced_plan_kl(
-                    runtime=runtime,
-                    task_id=item.task_id,
-                    configuration=configuration,
-                    frozen_plan_text=frozen,
-                )
-        slots[index] = _record(item, mode, pair, forced_kl=forced_kl)
-
+    pending = [(item, mode) for item in schedule for mode in chosen]
     started = time.perf_counter()
     if worker_count == 1:
-        for index, item, mode in jobs:
-            run_job(index, item, mode)
+        records_list = [
+            _run_job(
+                runtime_factory(mode),
+                item,
+                mode,
+                configuration,
+                reference_run,
+                candidate_run,
+            )
+            for item, mode in pending
+        ]
     else:
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            futures = [
-                pool.submit(run_job, index, item, mode)
-                for index, item, mode in jobs
-            ]
-            for future in futures:
-                future.result()
+        records_list = _run_process_pool(
+            [
+                AAProcessJob(
+                    index=index,
+                    item=item,
+                    mode=mode,
+                    configuration=configuration,
+                    reference_run=reference_run,
+                    candidate_run=candidate_run,
+                    vllm_base_url=runtime_factory.vllm_base_url,
+                    runtime_builder=runtime_factory.builder,
+                )
+                for index, (item, mode) in enumerate(pending)
+            ],
+            worker_count,
+        )
     wall_seconds = time.perf_counter() - started
     if before is None:
         cost = _unobserved()
@@ -886,8 +1044,8 @@ def capture_aa(
             source,
             allowed_processes=matched_allowed,
         )
-    records = tuple(record for record in slots if record is not None)
-    if len(records) != len(slots):
+    records = tuple(records_list)
+    if len(records) != len(pending):
         raise EpisodeRejected("capture dropped a paired episode")
     evaluated = tuple(
         record
@@ -1027,30 +1185,10 @@ def write_local_capture(
     )
 
 
-def live_runtime_factory(base_url: str) -> Callable[[str], RuntimeDependencies]:
-    """Build a runtime that opens one AppWorld world and talks to vLLM.
+def live_runtime_factory(base_url: str) -> ProcessRuntimeFactory:
+    """The live runtime factory for one vLLM endpoint; see ``build_live_runtime``."""
 
-    Import of the live adapters happens when a pair is created. AppWorld
-    itself is imported only when a world opens. The clock is ``wall_now``
-    because opening a world freezes ``datetime.now`` to the task date, and
-    episode bounds have to stay on the same real clock as model steps.
-    """
-
-    def factory(mode: str) -> RuntimeDependencies:
-        from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
-        from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
-
-        from llm_behavior_ci.runtime.clock import wall_now
-
-        agent = SmolagentsVLLMAgent(base_url)
-        agent.set_mode(mode)
-        return RuntimeDependencies(
-            session_factory=LiveAppWorldSession,
-            agent=agent,
-            clock=wall_now,
-        )
-
-    return factory
+    return ProcessRuntimeFactory(vllm_base_url=base_url)
 
 
 def _load_json(path: Path) -> object:
@@ -1087,8 +1225,17 @@ def default_results_root() -> Path:
     return Path(__file__).resolve().parents[3] / "results"
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run one A/A capture. Missing arguments exit through argparse."""
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    repository_state: RepositoryState | None = None,
+) -> int:
+    """Run one A/A capture. Missing arguments exit through argparse.
+
+    Refuses to start when ``git_commit`` is not repository HEAD or when
+    tracked source or config files are dirty. ``repository_state`` supplies
+    that check in tests so they do not need a git repository.
+    """
 
     parser = argparse.ArgumentParser(description="Capture paired A/A episodes.")
     parser.add_argument("--configuration", required=True)
@@ -1137,6 +1284,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise EpisodeRejected(
                 "capture output cannot be written as a public result"
             )
+        state = (
+            repository_state
+            if repository_state is not None
+            else read_repository_state()
+        )
+        require_committed_provenance(configuration, state)
         allowed = tuple(
             [AllowedGpuProcess(pid=pid) for pid in args.allow_gpu_pids]
             + [
@@ -1166,6 +1319,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         StreamError,
         GpuBusy,
         RuntimeUnavailable,
+        AAJobFailed,
+        ProvenanceError,
     ) as error:
         print(str(error), file=sys.stderr, flush=True)
         return 1

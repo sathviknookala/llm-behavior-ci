@@ -3,7 +3,9 @@
 Requires --configuration, --task-set, --task-index, --base-url, and --store.
 APPWORLD_ROOT must be set to an existing directory. Bare invocation exits 2.
 Store paths under a directory named results are refused. Prints one public-safe
-JSON object. Not a benchmark and not a gate.
+JSON object. Not a benchmark and not a gate. This development smoke stamps
+the current HEAD and does not refuse a dirty tree. A capture, live gate,
+harm measurement, or benchmark does.
 """
 
 from __future__ import annotations

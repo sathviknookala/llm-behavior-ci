@@ -16,6 +16,7 @@ from llm_behavior_ci.lifecycle.offline_gate import (
 )
 from llm_behavior_ci.records import assert_public_payload, public_record_dict
 from llm_behavior_ci.runtime.episode import RuntimeDependencies, build_runtime
+from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
 from llm_behavior_ci.storage import EpisodeStore, StorageError
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
@@ -230,6 +231,7 @@ def main(
                 )
             active_runtime = runtime
         elif args.live_runtime:
+            enforce_committed_provenance(reference)
             if args.reference_endpoint is None or args.candidate_endpoint is None:
                 raise GateExecutionError(
                     "--live-runtime requires --reference-endpoint and --candidate-endpoint"
@@ -259,7 +261,13 @@ def main(
                 store.append_validation_artifact(decision.artifact)
             finally:
                 store.close()
-    except (GateExecutionError, ConfigError, SelectionError, StorageError) as error:
+    except (
+        GateExecutionError,
+        ConfigError,
+        SelectionError,
+        StorageError,
+        ProvenanceError,
+    ) as error:
         print(str(error) or "offline gate execution failed", file=sys.stderr)
         return 2
     except Exception:

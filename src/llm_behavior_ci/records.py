@@ -436,6 +436,7 @@ class ModelStep(Record):
     prompt_text: str
     output_text: str
     top_k_logprobs: tuple[tuple[TokenLogprob, ...], ...]
+    generated_token_count: int
     latency_seconds: float
     started_at: datetime
 
@@ -443,6 +444,7 @@ class ModelStep(Record):
         _nonnegative_int(self.index, "index")
         _body(self.prompt_text, "prompt_text")
         _body(self.output_text, "output_text", allow_empty=True)
+        _nonnegative_int(self.generated_token_count, "generated_token_count")
         _nonnegative_float(self.latency_seconds, "latency_seconds")
         _timestamp(self.started_at, "started_at")
         if not isinstance(self.top_k_logprobs, tuple):
@@ -458,6 +460,20 @@ class ModelStep(Record):
                 token_ids.append(alternative.token_id)
             if len(set(ranks)) != len(ranks) or len(set(token_ids)) != len(token_ids):
                 raise RecordError("top_k_logprobs repeats a rank or token")
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str | None = None,
+    ) -> ModelStep:
+        label = name or cls.record_name
+        mapping = dict(_prepare(cls, payload, label))
+        if "generated_token_count" not in mapping:
+            positions = mapping.get("top_k_logprobs")
+            if isinstance(positions, (list, tuple)):
+                mapping["generated_token_count"] = len(positions)
+        return _from_mapping(cls, mapping, label)
 
 
 @dataclass(frozen=True)

@@ -17,10 +17,12 @@ from llm_behavior_ci.config import RunConfiguration, StreamSettings, new_run_ide
 from llm_behavior_ci.records import RecordError, assert_public_payload
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.aa_capture import (
+    AAJobFailed,
     AllowedGpuProcess,
     GpuBusy,
     GpuProcess,
     GpuSnapshot,
+    ProcessRuntimeFactory,
     assert_baseline_identity_unchanged,
     assert_gpu_processes_allowed,
     capture_aa,
@@ -140,6 +142,7 @@ def _turn(
         prompt_text="plan the next action",
         output_text=output_text,
         top_k_logprobs=_LOGPROBS,
+        generated_token_count=len(_LOGPROBS),
         latency_seconds=0.1,
         started_at=started_at,
         action=action,
@@ -755,6 +758,38 @@ class PairedExecutionTests(unittest.TestCase):
         self.assertEqual(built.agent.base_url, "http://127.0.0.1:8000")
 
 
+def _process_builder(base_url: str, mode: str) -> RuntimeDependencies:
+    """A spawn-safe fake runtime builder. ``base_url`` carries the fake's options.
+
+    ``fake://ok`` is healthy, ``fake://slow=<task>`` delays that task's
+    worlds, and ``fake://fail=<task>`` makes that task's world open fail.
+    The world token records the builder pid and the world pid.
+    """
+
+    option = base_url.removeprefix("fake://")
+    builder_pid = os.getpid()
+    clock = Clock()
+    agent = PairAgent(clock, mode=mode, diverge=False)
+
+    def session_factory(task_id: str) -> World:
+        if option == f"slow={task_id}":
+            time.sleep(0.2)
+        if option == f"fail={task_id}":
+            raise RuntimeError("world open failed")
+        return World(task_id, f"builder={builder_pid};world={os.getpid()}")
+
+    return RuntimeDependencies(
+        session_factory=session_factory,
+        agent=agent,
+        clock=clock,
+    )
+
+
+def _pids(record) -> tuple[int, int]:
+    builder, world = record.execution.initial_state_identity.split(";")
+    return int(builder.removeprefix("builder=")), int(world.removeprefix("world="))
+
+
 class AACaptureTests(unittest.TestCase):
     def _factory(
         self,
@@ -819,7 +854,9 @@ class AACaptureTests(unittest.TestCase):
             repetitions=2,
             concurrency=2,
             modes=("execute",),
-            runtime_factory=self._factory(diverge=False, slow_task=slow),
+            runtime_factory=ProcessRuntimeFactory(
+                f"fake://slow={slow}", _process_builder
+            ),
             observe_hardware=False,
         )
         self.assertEqual(first.schedule, second.schedule)
@@ -845,6 +882,100 @@ class AACaptureTests(unittest.TestCase):
         summary = format_summary(first)
         for task_id in task_set.task_ids:
             self.assertNotIn(task_id, summary)
+
+    def test_process_pool_runs_pairs_in_spawned_children_in_schedule_order(
+        self,
+    ) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))
+        config = _stream_config(task_set)
+        slow = arrivals[0].task_id
+        results = [
+            capture_aa(
+                config,
+                arrivals,
+                task_set_hash=task_set.task_set_hash,
+                repetitions=2,
+                concurrency=3,
+                modes=("plan", "execute"),
+                runtime_factory=ProcessRuntimeFactory(
+                    f"fake://slow={slow}", _process_builder
+                ),
+                observe_hardware=False,
+            )
+            for _ in range(2)
+        ]
+        expected = [
+            (item.repetition, item.task_id, mode)
+            for item in results[0].schedule
+            for mode in ("plan", "execute")
+        ]
+        parent = os.getpid()
+        for result in results:
+            self.assertEqual(len(result.records), len(arrivals) * 2 * 2)
+            self.assertEqual(
+                [
+                    (record.schedule.repetition, record.schedule.task_id, record.mode)
+                    for record in result.records
+                ],
+                expected,
+            )
+            for record in result.records:
+                builder_pid, world_pid = _pids(record)
+                self.assertNotEqual(builder_pid, parent)
+                self.assertEqual(world_pid, builder_pid)
+                self.assertEqual(record.execution.execution_order, ("reference", "candidate"))
+            plans = [record for record in result.records if record.mode == "plan"]
+            self.assertTrue(
+                all(
+                    record.teacher_forced_plan_kl is not None
+                    and record.teacher_forced_plan_kl.status == "teacher_force_unavailable"
+                    for record in plans
+                )
+            )
+            self.assertEqual(result.evaluated_pairs, len(arrivals) * 2)
+            self.assertEqual(result.disagreement_count, 0)
+
+    def test_process_pool_failure_names_the_job_task_and_mode(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))
+        config = _stream_config(task_set)
+        failing = arrivals[-1].task_id
+        with self.assertRaises(AAJobFailed) as caught:
+            capture_aa(
+                config,
+                arrivals,
+                task_set_hash=task_set.task_set_hash,
+                repetitions=1,
+                concurrency=2,
+                modes=("execute",),
+                runtime_factory=ProcessRuntimeFactory(
+                    f"fake://fail={failing}", _process_builder
+                ),
+                observe_hardware=False,
+            )
+        message = str(caught.exception)
+        self.assertIn(f"A/A job {len(arrivals) - 1} failed", message)
+        self.assertIn(f"task_id={failing}", message)
+        self.assertIn("repetition=0", message)
+        self.assertIn("mode=execute", message)
+        self.assertIn("world open failed", message)
+
+    def test_process_pool_rejects_an_unpicklable_runtime_factory(self) -> None:
+        task_set = _task_set()
+        arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))
+        config = _stream_config(task_set)
+        with self.assertRaisesRegex(EpisodeRejected, "ProcessRuntimeFactory"):
+            capture_aa(
+                config,
+                arrivals,
+                task_set_hash=task_set.task_set_hash,
+                repetitions=1,
+                concurrency=2,
+                modes=("execute",),
+                runtime_factory=self._factory(diverge=False),
+                observe_hardware=False,
+            )
 
     def test_capture_records_outcomes_divergence_and_plan_inputs(self) -> None:
         task_set = _task_set()

@@ -67,6 +67,7 @@ def _model_step(index: int = 0, started_at: datetime = _MID) -> ModelStep:
                 TokenLogprob(token_id=4, logprob=float("-inf"), rank=1),
             ),
         ),
+        generated_token_count=1,
         latency_seconds=0.1,
         started_at=started_at,
     )
@@ -604,6 +605,48 @@ class PublicRecordTests(unittest.TestCase):
             observed_at=_END,
         )
         self.assertEqual(fraction.value, 0.0)
+
+
+class ModelStepCompatibilityTests(unittest.TestCase):
+    def test_old_format_infers_generated_token_count_from_logprob_positions(self) -> None:
+        payload = {
+            "visibility": "local",
+            "index": 0,
+            "prompt_text": "plan the task",
+            "output_text": "open the app",
+            "top_k_logprobs": [
+                [
+                    {"token_id": 3, "logprob": -0.5, "rank": 0},
+                    {"token_id": 4, "logprob": -1.5, "rank": 1},
+                ],
+                [{"token_id": 8, "logprob": -0.2, "rank": 0}],
+            ],
+            "latency_seconds": 0.1,
+            "started_at": _MID.isoformat(),
+        }
+        loaded = ModelStep.from_dict(payload)
+        self.assertIsInstance(loaded, ModelStep)
+        self.assertEqual(loaded.generated_token_count, 2)
+        self.assertEqual(len(loaded.top_k_logprobs), 2)
+        written = loaded.to_dict()
+        self.assertEqual(written["generated_token_count"], 2)
+
+    def test_new_format_round_trips_generated_token_count(self) -> None:
+        step = ModelStep(
+            index=0,
+            prompt_text="plan the task",
+            output_text="open the app",
+            top_k_logprobs=(),
+            generated_token_count=5,
+            latency_seconds=0.1,
+            started_at=_MID,
+        )
+        payload = json.loads(json.dumps(step.to_dict()))
+        self.assertEqual(payload["generated_token_count"], 5)
+        self.assertEqual(payload["top_k_logprobs"], [])
+        restored = ModelStep.from_dict(payload)
+        self.assertEqual(restored, step)
+        self.assertEqual(restored.generated_token_count, 5)
 
 
 class PackageContractTests(unittest.TestCase):

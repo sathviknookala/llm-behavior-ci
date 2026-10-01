@@ -148,6 +148,7 @@ def _turn(output_text: str, action: str | None, started_at: datetime) -> AgentTu
         prompt_text="plan the next action",
         output_text=output_text,
         top_k_logprobs=((TokenLogprob(token_id=7, logprob=-0.5, rank=0),),),
+        generated_token_count=1,
         latency_seconds=0.1,
         started_at=started_at,
         action=action,

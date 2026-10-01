@@ -187,6 +187,7 @@ def _turn(
         prompt_text=prompt_text,
         output_text=output_text,
         top_k_logprobs=_LOGPROBS,
+        generated_token_count=len(_LOGPROBS),
         latency_seconds=0.1,
         started_at=started_at,
         action=action,

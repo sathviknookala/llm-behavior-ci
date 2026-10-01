@@ -227,6 +227,7 @@ class PlanAgent:
             prompt_text="plan the next action",
             output_text=_PLAN,
             top_k_logprobs=_LOGPROBS,
+            generated_token_count=len(_LOGPROBS),
             latency_seconds=0.1,
             started_at=self._clock(),
             action=None,

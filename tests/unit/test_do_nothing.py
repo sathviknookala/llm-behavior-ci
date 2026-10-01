@@ -52,6 +52,7 @@ def _model_step() -> ModelStep:
         prompt_text="plan the task",
         output_text="open the app",
         top_k_logprobs=((TokenLogprob(token_id=3, logprob=-0.5, rank=0),),),
+        generated_token_count=1,
         latency_seconds=0.1,
         started_at=_START,
     )

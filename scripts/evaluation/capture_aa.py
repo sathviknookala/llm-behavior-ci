@@ -3,7 +3,8 @@
 Requires --configuration, --task-set, --stream-settings, --repetitions,
 --concurrency, --modes, --output, and --vllm-base-url. Rejects test_normal.
 Does not apply a protocol threshold. Bare invocation exits 2. Output under
-results/ is refused.
+results/ is refused. Refuses a git_commit that is not HEAD and a dirty
+tracked source or config tree.
 """
 
 from __future__ import annotations

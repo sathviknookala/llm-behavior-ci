@@ -551,14 +551,51 @@ def load_fault_catalog(directory: Path) -> tuple[FaultSpec, ...]:
     return tuple(loaded)
 
 
+def _patches_for_base(
+    base: RunConfiguration,
+    fault: FaultSpec,
+) -> tuple[FaultPatch, ...]:
+    """Retarget a step-limit patch onto the horizon ``run_episode`` enforces.
+
+    The catalog names ``agent.step_limit``. When ``execute_max_model_turns``
+    is set, that field is the execute horizon and a patch that only edits
+    ``step_limit`` would not change it. The written value must be lower than
+    the horizon it replaces. Other kinds keep their declared paths.
+    """
+
+    if fault.kind != "step_limit":
+        return fault.patches
+    rewritten: list[FaultPatch] = []
+    for patch in fault.patches:
+        if patch.path != "agent.step_limit":
+            rewritten.append(patch)
+            continue
+        value = patch.value
+        if isinstance(value, bool) or not isinstance(value, int):
+            rewritten.append(patch)
+            continue
+        if base.agent.execute_max_model_turns is not None:
+            current = base.agent.execute_max_model_turns
+            path = "agent.execute_max_model_turns"
+        else:
+            current = base.agent.step_limit
+            path = "agent.step_limit"
+        if value >= current:
+            raise FaultError("step_limit fault does not reduce the execute horizon")
+        rewritten.append(FaultPatch(path=path, value=value))
+    return tuple(rewritten)
+
+
 def apply_fault(base: RunConfiguration, fault: FaultSpec) -> RunConfiguration:
     """Return a new configuration with only the fault's declared hashed leaves changed.
 
     Does not mutate ``base``. Schema-gap faults raise and do not return a
     configuration. Live-unavailable representable faults may still patch
-    hashed leaves; ``live_fault_available`` reports execution status. After
+    hashed leaves; ``live_fault_available`` reports execution status. A
+    ``step_limit`` patch is applied to ``execute_max_model_turns`` when that
+    override is set, and to ``agent.step_limit`` otherwise. After
     reconstruction, the set of changed ``HASHED_FIELDS`` must equal the
-    declared patch paths.
+    paths actually written.
     """
 
     if not isinstance(base, RunConfiguration):
@@ -568,8 +605,9 @@ def apply_fault(base: RunConfiguration, fault: FaultSpec) -> RunConfiguration:
     if not fault.representable:
         raise FaultError(str(fault.schema_request))
     document = copy.deepcopy(base.to_dict())
-    declared = frozenset(patch.path for patch in fault.patches)
-    for patch in fault.patches:
+    patches = _patches_for_base(base, fault)
+    declared = frozenset(patch.path for patch in patches)
+    for patch in patches:
         _set_leaf(document, patch.path, patch.value)
     try:
         produced = RunConfiguration.from_dict(document)

@@ -70,12 +70,15 @@ _REPLACEMENTS = {
     "agent.prompt.plan_format_version": "plan-v2",
     "agent.prompt.thinking_enabled": True,
     "agent.step_limit": 41,
+    "agent.execute_max_model_turns": 21,
     "agent.sampling.temperature": 1.0,
     "agent.sampling.top_p": 0.9,
     "agent.sampling.top_k": -1,
     "agent.sampling.min_p": 0.1,
     "agent.sampling.seed": 18,
     "agent.sampling.max_tokens": 513,
+    "agent.sampling.execute_max_tokens": 193,
+    "agent.sampling.plan_max_tokens": 1025,
     "agent.api_docs_version": "api-docs-corrupt-v2",
     "agent.api_docs_app": "other_app",
     "task.appworld_version": "0.1.3.post2",
@@ -137,6 +140,7 @@ def _payload() -> dict[str, object]:
                 "thinking_enabled": False,
             },
             "step_limit": 40,
+            "execute_max_model_turns": 20,
             "sampling": {
                 "temperature": 0.0,
                 "top_p": 1.0,
@@ -144,6 +148,8 @@ def _payload() -> dict[str, object]:
                 "min_p": 0.0,
                 "seed": 17,
                 "max_tokens": 512,
+                "execute_max_tokens": 192,
+                "plan_max_tokens": 1024,
             },
             "api_docs_version": "api-docs-corrupt-v1",
             "api_docs_app": "calendar",
@@ -594,6 +600,56 @@ class OptionalHashedLeafTests(unittest.TestCase):
             run_configuration_hash(other_docs),
             run_configuration_hash(with_lora),
         )
+
+    def test_mode_limit_overrides_are_optional_hashed_leaves(self) -> None:
+        unset_payload = _payload()
+        del unset_payload["agent"]["execute_max_model_turns"]
+        del unset_payload["agent"]["sampling"]["execute_max_tokens"]
+        del unset_payload["agent"]["sampling"]["plan_max_tokens"]
+        unset = RunConfiguration.from_dict(unset_payload)
+        document = json.loads(canonical_configuration_json(unset))
+        self.assertNotIn("execute_max_model_turns", document["agent"])
+        self.assertNotIn("execute_max_tokens", document["agent"]["sampling"])
+        self.assertNotIn("plan_max_tokens", document["agent"]["sampling"])
+        self.assertEqual(unset.agent.execute_turn_limit, 40)
+        self.assertEqual(unset.agent.sampling.generation_max_tokens("execute"), 512)
+        self.assertEqual(unset.agent.sampling.generation_max_tokens("plan"), 512)
+        values = hashed_values(unset)
+        for path in (
+            "agent.execute_max_model_turns",
+            "agent.sampling.execute_max_tokens",
+            "agent.sampling.plan_max_tokens",
+        ):
+            self.assertIs(values[path], MISSING_HASHED_LEAF)
+        unset_hash = run_configuration_hash(unset)
+        for path, value in (
+            ("agent.execute_max_model_turns", 20),
+            ("agent.sampling.execute_max_tokens", 192),
+            ("agent.sampling.plan_max_tokens", 1024),
+        ):
+            with self.subTest(path=path):
+                one = json.loads(json.dumps(unset_payload))
+                _assign(one, path, value)
+                changed = RunConfiguration.from_dict(one)
+                self.assertNotEqual(run_configuration_hash(changed), unset_hash)
+                _assign(one, path, value + 1)
+                self.assertNotEqual(
+                    run_configuration_hash(RunConfiguration.from_dict(one)),
+                    run_configuration_hash(changed),
+                )
+        configured = _configuration()
+        self.assertEqual(configured.agent.execute_turn_limit, 20)
+        self.assertEqual(configured.agent.sampling.generation_max_tokens("execute"), 192)
+        self.assertEqual(configured.agent.sampling.generation_max_tokens("plan"), 1024)
+        for path in (
+            "agent.execute_max_model_turns",
+            "agent.sampling.execute_max_tokens",
+            "agent.sampling.plan_max_tokens",
+        ):
+            for bad in (0, -1, True, 1.5):
+                with self.subTest(path=path, bad=bad):
+                    with self.assertRaises(ConfigError):
+                        RunConfiguration.from_dict(_with(path, bad))
 
     def test_api_docs_version_and_app_must_be_set_together(self) -> None:
         only_version = _payload()

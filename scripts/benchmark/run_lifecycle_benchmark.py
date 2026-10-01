@@ -23,6 +23,7 @@ from llm_behavior_ci.lifecycle.offline_gate import (
     plan_evidence_from_dict,
 )
 from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
     TaskSet,
@@ -186,6 +187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         protocol = require_protocol_lock(Path(args.protocol))
+        enforce_committed_provenance(*protocol.configurations)
         faults = tuple(load_fault(Path(path)) for path in args.faults)
         train_tasks = _load_task_set(_load_json(Path(args.train_tasks)))
         test_normal_tasks = _load_task_set(_load_json(Path(args.test_normal_tasks)))
@@ -224,6 +226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ConfigError,
         SelectionError,
         GateExecutionError,
+        ProvenanceError,
     ) as error:
         print(str(error) or "lifecycle benchmark failed", file=sys.stderr)
         return 1

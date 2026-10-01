@@ -62,6 +62,7 @@ def _model_step() -> ModelStep:
                 TokenLogprob(token_id=4, logprob=float("-inf"), rank=1),
             ),
         ),
+        generated_token_count=1,
         latency_seconds=0.1,
         started_at=_MID,
     )

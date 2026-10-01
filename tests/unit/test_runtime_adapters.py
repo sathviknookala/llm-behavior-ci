@@ -230,16 +230,19 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertIsNone(failed.output_text)
         self.assertTrue(failed.recoverable)
         self.assertTrue(failed.error_message.startswith("Execution failed."))
-        ok = LiveAppWorldSession(
+        successful = LiveAppWorldSession(
             "task-1",
             opener=lambda task_id: SimpleNamespace(
                 task=world.task,
                 execute=lambda action: "Execution successful.",
                 close=lambda: None,
             ),
-        ).execute("apis.calendar.show()")
+        )
+        ok = successful.execute("apis.calendar.show()")
         self.assertEqual(ok.output_text, "Execution successful.")
         self.assertIsNone(ok.error_message)
+        session.close()
+        successful.close()
 
     def test_live_execute_prints_a_single_call_so_stdout_keeps_the_body(self) -> None:
         seen: list[str] = []
@@ -262,6 +265,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(seen[-1], "print(apis.supervisor.show_profile())")
         session.execute("name = apis.supervisor.show_profile()")
         self.assertEqual(seen[-1], "name = apis.supervisor.show_profile()")
+        session.close()
 
     def test_live_evaluate_uses_num_tests_not_the_recorded_pair_count(self) -> None:
         world = FakeWorld()
@@ -279,6 +283,7 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertFalse(evaluation.success)
         self.assertEqual(evaluation.passed_requirements, 1)
         self.assertEqual(evaluation.total_requirements, 3)
+        session.close()
 
     def test_rendered_api_docs_are_sorted_lines_the_corruptor_can_redact(self) -> None:
         rendered = render_api_documentation(

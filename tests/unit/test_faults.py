@@ -7,7 +7,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from llm_behavior_ci.config import RunConfiguration, run_configuration_hash
+from llm_behavior_ci.config import (
+    RunConfiguration,
+    hashed_values,
+    new_run_identity,
+    run_configuration_hash,
+)
 from llm_behavior_ci.experiments.faults import (
     FaultError,
     FaultPatch,
@@ -25,7 +30,7 @@ from llm_behavior_ci.experiments.faults import (
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
-from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.runtime.episode import RuntimeDependencies, run_episode
 from llm_behavior_ci.stats.bootstrap import clustered_paired_bootstrap
 from llm_behavior_ci.tasks.selection import (
     TaskSet,
@@ -205,6 +210,7 @@ class ActingAgent:
             prompt_text="plan the next action",
             output_text="call",
             top_k_logprobs=_LOGPROBS,
+            generated_token_count=len(_LOGPROBS),
             latency_seconds=0.1,
             started_at=self._clock(),
             action="calendar.lookup()",
@@ -234,6 +240,7 @@ class StopAgent:
             prompt_text="plan the next action",
             output_text=text,
             top_k_logprobs=_LOGPROBS,
+            generated_token_count=len(_LOGPROBS),
             latency_seconds=0.1,
             started_at=self._clock(),
             action=None,
@@ -805,6 +812,78 @@ class FaultCatalogTests(unittest.TestCase):
         self.assertNotEqual(baseline, stripped)
         self.assertIn("API documentation", baseline)
         self.assertNotIn("API documentation", stripped)
+
+
+def _changed_leaves(
+    base: RunConfiguration,
+    candidate: RunConfiguration,
+) -> set[str]:
+    before = hashed_values(base)
+    after = hashed_values(candidate)
+    return {path for path in before if before[path] != after[path]}
+
+
+def _run_execute(config: RunConfiguration):
+    clock = Clock()
+
+    def factory(task_id: str) -> World:
+        return World(task_id, success=False)
+
+    return run_episode(
+        "task-a",
+        config,
+        "execute",
+        run=new_run_identity(config),
+        runtime=RuntimeDependencies(
+            session_factory=factory,
+            agent=ActingAgent(clock),
+            clock=clock,
+        ),
+    )
+
+
+class StepLimitFaultTests(unittest.TestCase):
+    def test_legacy_step_limit_is_the_horizon_run_episode_enforces(self) -> None:
+        fault = load_fault(_CATALOG / "step_limit_reduced.v1.json")
+        base = _base()
+        candidate = apply_fault(base, fault)
+        self.assertEqual(base.agent.execute_turn_limit, 40)
+        self.assertEqual(candidate.agent.step_limit, 4)
+        self.assertIsNone(candidate.agent.execute_max_model_turns)
+        self.assertEqual(candidate.agent.execute_turn_limit, 4)
+        self.assertEqual(_changed_leaves(base, candidate), {"agent.step_limit"})
+        self.assertNotEqual(
+            run_configuration_hash(base),
+            run_configuration_hash(candidate),
+        )
+        self.assertEqual(len(_run_execute(base).model_steps), 40)
+        faulted = _run_execute(candidate)
+        self.assertEqual(faulted.termination_reason, "step_limit")
+        self.assertEqual(len(faulted.model_steps), 4)
+
+    def test_execute_override_is_the_horizon_the_fault_reduces(self) -> None:
+        fault = load_fault(_CATALOG / "step_limit_reduced.v1.json")
+        payload = _payload()
+        payload["agent"]["execute_max_model_turns"] = 20
+        base = RunConfiguration.from_dict(payload)
+        candidate = apply_fault(base, fault)
+        self.assertEqual(base.agent.step_limit, 40)
+        self.assertEqual(base.agent.execute_turn_limit, 20)
+        self.assertEqual(candidate.agent.step_limit, 40)
+        self.assertEqual(candidate.agent.execute_max_model_turns, 4)
+        self.assertEqual(candidate.agent.execute_turn_limit, 4)
+        self.assertEqual(
+            _changed_leaves(base, candidate),
+            {"agent.execute_max_model_turns"},
+        )
+        self.assertNotEqual(
+            run_configuration_hash(base),
+            run_configuration_hash(candidate),
+        )
+        self.assertEqual(len(_run_execute(base).model_steps), 20)
+        faulted = _run_execute(candidate)
+        self.assertEqual(faulted.termination_reason, "step_limit")
+        self.assertEqual(len(faulted.model_steps), 4)
 
 
 if __name__ == "__main__":
