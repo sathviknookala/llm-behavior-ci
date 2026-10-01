@@ -167,6 +167,114 @@ def _execute_output_is_error(value: str) -> bool:
     return stripped.startswith(_EXECUTION_FAILED) or stripped.startswith(_NO_CODE)
 
 
+_SPOTIFY_CAPABILITY_PROFILE = "spotify_capability_v1"
+
+_SPOTIFY_SUPERVISOR_APIS = frozenset(
+    {
+        "show_profile",
+        "show_account_passwords",
+        "complete_task",
+    }
+)
+
+_SPOTIFY_API_DOC_APIS = frozenset(
+    {
+        "show_api_descriptions",
+        "show_api_doc",
+    }
+)
+
+
+def _call_target(action: str) -> tuple[str, str]:
+    """Return ``(app, api)`` for one ``apis.<app>.<api>(...)`` call."""
+
+    stripped = action.strip()
+    tree = ast.parse(stripped, mode="exec")
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Expr):
+        raise ValueError("action must be one call")
+    call = tree.body[0].value
+    if not isinstance(call, ast.Call):
+        raise ValueError("action must be one call")
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        raise ValueError("action must target apis.<app>.<api>")
+    api_name = func.attr
+    app_node = func.value
+    if (
+        not isinstance(app_node, ast.Attribute)
+        or not isinstance(app_node.value, ast.Name)
+        or app_node.value.id != "apis"
+    ):
+        raise ValueError("action must target apis.<app>.<api>")
+    return app_node.attr, api_name
+
+
+def _keyword_string(action: str, name: str) -> str | None:
+    """Return one string keyword from a call, or None when it is absent."""
+
+    tree = ast.parse(action.strip(), mode="exec")
+    call = tree.body[0].value
+    if not isinstance(call, ast.Call):
+        return None
+    for keyword in call.keywords:
+        if keyword.arg != name:
+            continue
+        if isinstance(keyword.value, ast.Constant) and isinstance(
+            keyword.value.value, str
+        ):
+            return keyword.value.value
+    return None
+
+
+def _spotify_capability_allows(action: str) -> bool:
+    """Whether one action stays inside the Spotify capability profile.
+
+    Spotify APIs are allowed. Supervisor is limited to profile, account
+    passwords, and task completion. ApiDocs is limited to the two lookup
+    helpers, and only when the requested app is Spotify, so those helpers
+    cannot browse an unrelated app.
+    """
+
+    try:
+        app_name, api_name = _call_target(action)
+    except (SyntaxError, ValueError):
+        return False
+    if app_name == "spotify":
+        return True
+    if app_name == "supervisor":
+        return api_name in _SPOTIFY_SUPERVISOR_APIS
+    if app_name == "api_docs":
+        if api_name not in _SPOTIFY_API_DOC_APIS:
+            return False
+        return _keyword_string(action, "app_name") == "spotify"
+    return False
+
+
+def _spotify_capability_docs(documentation: object) -> object:
+    """Keep Spotify and the approved supervisor and api_docs helpers."""
+
+    if not isinstance(documentation, Mapping):
+        return documentation
+    selected: dict[str, object] = {}
+    if "spotify" in documentation:
+        selected["spotify"] = documentation["spotify"]
+    supervisor = documentation.get("supervisor")
+    if isinstance(supervisor, Mapping):
+        selected["supervisor"] = {
+            name: doc
+            for name, doc in supervisor.items()
+            if name in _SPOTIFY_SUPERVISOR_APIS
+        }
+    api_docs = documentation.get("api_docs")
+    if isinstance(api_docs, Mapping):
+        selected["api_docs"] = {
+            name: doc
+            for name, doc in api_docs.items()
+            if name in _SPOTIFY_API_DOC_APIS
+        }
+    return selected
+
+
 class LiveAppWorldSession:
     """AppWorld session adapter that imports AppWorld only when a world is opened.
 
@@ -185,6 +293,11 @@ class LiveAppWorldSession:
     ``evaluate`` reads ``pass_count`` and ``num_tests`` from the
     ``TestTracker``. ``close`` is idempotent. The live world has no
     ``initial_state_identity`` method.
+
+    ``tool_access_profile`` ``spotify_capability_v1`` renders only the
+    Spotify app plus the approved supervisor and api_docs helpers, and
+    ``execute`` rejects every other API before AppWorld runs it. Any
+    other value, including unset, leaves the existing surface unchanged.
     """
 
     _open_stack: list[LiveAppWorldSession] = []
@@ -194,10 +307,12 @@ class LiveAppWorldSession:
         task_id: str,
         *,
         opener: Callable[[str], object] | None = None,
+        tool_access_profile: str | None = None,
     ) -> None:
         self._closed = False
         self._task_id = task_id
         self._opener = opener or _open_appworld
+        self._tool_access_profile = tool_access_profile
         self._world: object | None = None
         if any(
             session._world is not None and not session._closed
@@ -242,13 +357,25 @@ class LiveAppWorldSession:
                     return session.context()
             self._open_world()
         task = self._world.task
+        raw_docs = getattr(task, "api_docs", "")
+        if self._tool_access_profile == _SPOTIFY_CAPABILITY_PROFILE:
+            raw_docs = _spotify_capability_docs(raw_docs)
         return TaskContext(
             task_id=self._task_id,
             instruction=task.instruction,
-            api_documentation=render_api_documentation(getattr(task, "api_docs", "")),
+            api_documentation=render_api_documentation(raw_docs),
         )
 
     def execute(self, action: str) -> ToolResult:
+        if self._tool_access_profile == _SPOTIFY_CAPABILITY_PROFILE:
+            if not _spotify_capability_allows(action):
+                return ToolResult(
+                    output_text=None,
+                    error_message="API is outside the configured capability profile",
+                    recoverable=True,
+                    app_name=None,
+                    api_name=None,
+                )
         if self._world is None:
             self._open_world()
         try:

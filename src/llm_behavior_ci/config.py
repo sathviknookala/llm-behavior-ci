@@ -45,6 +45,7 @@ agent.prompt.plan_format_version
 agent.prompt.thinking_enabled
 agent.step_limit
 agent.execute_max_model_turns
+agent.tool_access_profile
 agent.sampling.temperature
 agent.sampling.top_p
 agent.sampling.top_k
@@ -95,16 +96,18 @@ is required. KL fidelity modes are full and top_k; runtime/scoring.py
 is where full is proven rather than merely claimed.
 
 model.lora.repository, model.lora.revision, agent.api_docs_version,
-agent.api_docs_app, agent.execute_max_model_turns,
+agent.api_docs_app, agent.execute_max_model_turns, agent.tool_access_profile,
 agent.sampling.execute_max_tokens, and agent.sampling.plan_max_tokens are
 optional hashed leaves: ``ModelConfiguration.lora``,
 ``AgentConfiguration.api_docs_version``/``api_docs_app``,
-``AgentConfiguration.execute_max_model_turns``, and the two mode-specific
+``AgentConfiguration.execute_max_model_turns``,
+``AgentConfiguration.tool_access_profile``, and the two mode-specific
 ``SamplingSettings`` token caps default to unset, and an unset leaf is omitted from canonical JSON entirely rather
 than serialized as null, so a configuration that never names a LoRA
-adapter or a corrupted API-documentation source hashes identically to one
-built before these fields existed. Setting, clearing, or changing any of
-them still changes the digest, because canonical JSON then differs.
+adapter, a corrupted API-documentation source, or a tool-access profile
+hashes identically to one built before these fields existed. Setting,
+clearing, or changing any of them still changes the digest, because
+canonical JSON then differs.
 ``leaf_value``/``hashed_values`` read these leaves through
 ``MISSING_HASHED_LEAF`` rather than raising, so a caller comparing two
 configurations' hashed fields sees "unset" as one comparable value
@@ -160,6 +163,7 @@ HASHED_FIELDS = frozenset(
         "agent.prompt.thinking_enabled",
         "agent.step_limit",
         "agent.execute_max_model_turns",
+        "agent.tool_access_profile",
         "agent.sampling.temperature",
         "agent.sampling.top_p",
         "agent.sampling.top_k",
@@ -735,6 +739,9 @@ class AgentConfiguration:
     ``execute_max_model_turns`` overrides ``step_limit`` as the execute
     episode horizon when set; ``execute_turn_limit`` resolves it. An unset
     override is omitted from ``to_dict``.
+
+    ``tool_access_profile`` names an optional runtime allowlist. Unset is
+    omitted from ``to_dict``. Setting or changing it changes the run hash.
     """
 
     smolagents_version: str
@@ -744,6 +751,7 @@ class AgentConfiguration:
     sampling: SamplingSettings
     api_docs_version: str | None = None
     api_docs_app: str | None = None
+    tool_access_profile: str | None = None
     execute_max_model_turns: int | None = None
 
     def __post_init__(self) -> None:
@@ -759,6 +767,8 @@ class AgentConfiguration:
         if self.api_docs_version is not None:
             _text(self.api_docs_version, "api_docs_version")
             _text(self.api_docs_app, "api_docs_app")
+        if self.tool_access_profile is not None:
+            _text(self.tool_access_profile, "tool_access_profile")
         if self.execute_max_model_turns is not None:
             _positive(self.execute_max_model_turns, "execute_max_model_turns")
 
@@ -776,6 +786,8 @@ class AgentConfiguration:
             "step_limit": self.step_limit,
             "sampling": self.sampling.to_dict(),
         }
+        if self.tool_access_profile is not None:
+            document["tool_access_profile"] = self.tool_access_profile
         if self.api_docs_version is not None:
             document["api_docs_version"] = self.api_docs_version
             document["api_docs_app"] = self.api_docs_app
@@ -795,7 +807,12 @@ class AgentConfiguration:
             cls,
             name,
             optional=frozenset(
-                {"api_docs_version", "api_docs_app", "execute_max_model_turns"}
+                {
+                    "api_docs_version",
+                    "api_docs_app",
+                    "execute_max_model_turns",
+                    "tool_access_profile",
+                }
             ),
         )
         prompt = PromptSettings.from_dict(mapping["prompt"])
@@ -810,6 +827,7 @@ class AgentConfiguration:
                 api_docs_version=mapping.get("api_docs_version"),
                 api_docs_app=mapping.get("api_docs_app"),
                 execute_max_model_turns=mapping.get("execute_max_model_turns"),
+                tool_access_profile=mapping.get("tool_access_profile"),
             ),
         )
 

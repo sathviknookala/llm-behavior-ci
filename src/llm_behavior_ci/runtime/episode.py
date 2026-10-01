@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from dataclasses import dataclass, replace
+from functools import partial
 from datetime import datetime
 from typing import Callable, Literal
 
@@ -66,18 +67,32 @@ def is_live_runtime(runtime: RuntimeDependencies) -> bool:
     candidate through one gate call) exposes them through
     ``underlying_agents()``; every one of them must be a real
     ``SmolagentsVLLMAgent`` for the runtime to count as live.
+    ``build_runtime`` binds ``tool_access_profile`` with
+    ``functools.partial``; that partial is live when it wraps
+    ``LiveAppWorldSession`` and names no other argument.
     """
 
     from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
-    from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
 
-    if runtime.session_factory is not LiveAppWorldSession:
+    if not _is_live_session_factory(runtime.session_factory):
         return False
     underlying = getattr(runtime.agent, "underlying_agents", None)
     agents = underlying() if callable(underlying) else (runtime.agent,)
     return len(agents) > 0 and all(
         isinstance(agent, SmolagentsVLLMAgent) for agent in agents
     )
+
+
+def _is_live_session_factory(factory: object) -> bool:
+    from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
+
+    if factory is LiveAppWorldSession:
+        return True
+    if not isinstance(factory, partial) or factory.func is not LiveAppWorldSession:
+        return False
+    if factory.args:
+        return False
+    return set(factory.keywords or {}) <= {"tool_access_profile"}
 
 
 def _reject(
@@ -684,7 +699,9 @@ def build_runtime(
     checked before the runtime is returned. Actions still execute through
     ``AppWorldSession.execute``, reached by ``run_episode`` via
     ``build_appworld_executor`` and never by smolagents'
-    ``LocalPythonExecutor``.
+    ``LocalPythonExecutor``. The session factory is a partial of
+    ``LiveAppWorldSession`` bound to ``agent.tool_access_profile``, so
+    the hashed profile is the only selector for a capability allowlist.
     """
 
     if not isinstance(configuration, RunConfiguration):
@@ -713,8 +730,12 @@ def build_runtime(
 
     agent = SmolagentsVLLMAgent(endpoint_url)
     agent.set_mode(mode)
+    session_factory = partial(
+        LiveAppWorldSession,
+        tool_access_profile=configuration.agent.tool_access_profile,
+    )
     return RuntimeDependencies(
-        session_factory=LiveAppWorldSession,
+        session_factory=session_factory,
         agent=agent,
         clock=clock or wall_now,
     )

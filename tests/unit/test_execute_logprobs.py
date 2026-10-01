@@ -364,6 +364,10 @@ class PilotConfigurationTests(unittest.TestCase):
             )
         )
         self.assertEqual(pilot["agent"].pop("execute_max_model_turns"), 20)
+        self.assertEqual(
+            pilot["agent"].pop("tool_access_profile"),
+            "spotify_capability_v1",
+        )
         self.assertEqual(pilot["agent"]["sampling"].pop("execute_max_tokens"), 192)
         self.assertEqual(pilot["agent"]["sampling"].pop("plan_max_tokens"), 1024)
         self.assertEqual(pilot, production)

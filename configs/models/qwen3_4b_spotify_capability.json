@@ -38,6 +38,7 @@
     },
     "step_limit": 40,
     "execute_max_model_turns": 20,
+    "tool_access_profile": "spotify_capability_v1",
     "sampling": {
       "temperature": 0.0,
       "top_p": 1.0,

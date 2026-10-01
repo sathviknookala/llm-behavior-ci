@@ -71,6 +71,7 @@ _REPLACEMENTS = {
     "agent.prompt.thinking_enabled": True,
     "agent.step_limit": 41,
     "agent.execute_max_model_turns": 21,
+    "agent.tool_access_profile": "other_profile",
     "agent.sampling.temperature": 1.0,
     "agent.sampling.top_p": 0.9,
     "agent.sampling.top_k": -1,
@@ -141,6 +142,7 @@ def _payload() -> dict[str, object]:
             },
             "step_limit": 40,
             "execute_max_model_turns": 20,
+            "tool_access_profile": "base_profile",
             "sampling": {
                 "temperature": 0.0,
                 "top_p": 1.0,
@@ -680,12 +682,14 @@ class OptionalHashedLeafTests(unittest.TestCase):
         del payload["model"]["lora"]
         del payload["agent"]["api_docs_version"]
         del payload["agent"]["api_docs_app"]
+        del payload["agent"]["tool_access_profile"]
         unset = RunConfiguration.from_dict(payload)
         values = hashed_values(unset)
         self.assertIs(values["model.lora.repository"], MISSING_HASHED_LEAF)
         self.assertIs(values["model.lora.revision"], MISSING_HASHED_LEAF)
         self.assertIs(values["agent.api_docs_version"], MISSING_HASHED_LEAF)
         self.assertIs(values["agent.api_docs_app"], MISSING_HASHED_LEAF)
+        self.assertIs(values["agent.tool_access_profile"], MISSING_HASHED_LEAF)
         self.assertEqual(MISSING_HASHED_LEAF, MISSING_HASHED_LEAF)
 
         present = hashed_values(_configuration())
