@@ -25,9 +25,9 @@ SELECTION_RULE = "fixed_spotify_capability"
 SELECTION_SEED = 17
 
 TASK_IDS = (
-    "b0a8eae_1",
-    "b0a8eae_2",
-    "b0a8eae_3",
+    "82e2fac_1",
+    "82e2fac_2",
+    "82e2fac_3",
     "287e338_1",
     "287e338_2",
     "287e338_3",
