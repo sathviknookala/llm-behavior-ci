@@ -1,0 +1,51 @@
+{
+  "complete_task_termination_count": 12,
+  "concurrency": 1,
+  "configuration_hash": "3fa2db8c44d2cbe0605a5abcf25a99c24955ec5e202df92285f21bf5047aacbb",
+  "easy_success_count": 0,
+  "episodes_hitting_execute_turn_cap": 8,
+  "evaluator_success_count": 0,
+  "evaluator_success_rate": 0.0,
+  "execute_token_cap": 192,
+  "execute_turn_cap": 20,
+  "generated_tokens": {
+    "max": 51,
+    "p50": 19,
+    "p90": 30,
+    "p95": 33,
+    "p99": 33
+  },
+  "generations_hitting_execute_token_cap": 0,
+  "git_commit": "2950555486195616de306ff7700a54734ca4a7e9",
+  "medium_success_count": 0,
+  "mode": "execute",
+  "model_turns": {
+    "max": 20,
+    "p50": 4,
+    "p90": 20,
+    "p95": 20
+  },
+  "other_success_count": 0,
+  "parser_error_count": 2,
+  "recoverable_tool_error_count": 178,
+  "repeated_tool_call_count": 56,
+  "task_count": 20,
+  "task_set_hash": "a20fe52d28164e1d458266331c242277788d2ed0af29b054b7df926345db3a04",
+  "termination_reason_counts": {
+    "agent_stopped": 0,
+    "appworld_completed": 12,
+    "cancelled": 0,
+    "do_nothing": 0,
+    "invalid_action": 0,
+    "runtime_error": 0,
+    "step_limit": 8,
+    "timeout": 0,
+    "unrecoverable_tool_error": 0
+  },
+  "tool_calls": {
+    "max": 20,
+    "p50": 4,
+    "p90": 20,
+    "p95": 20
+  }
+}
