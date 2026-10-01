@@ -294,7 +294,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_rejects_unknown_fields_and_malformed_objects(self) -> None:
         cases = {
-            "task ids": ("task.task_ids", ["82e2fac_1"]),
+            "task ids": ("task.task_ids", ["task_0001"]),
             "task content": ("task.instruction", "book a ride"),
             "misspelled utilization": (
                 "model.serving.gpu_memory_utilisation",

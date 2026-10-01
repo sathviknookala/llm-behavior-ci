@@ -20,6 +20,6 @@
 
 `replay/replay_detectors.py` runs `replay_detectors` on one frozen observation sequence. With no arguments it exits 2. It requires `--observations`, `--schedule`, `--factories`, and `--output`. Any of those paths under a directory named `results` is refused. It writes a public JSON document and does not start an agent. The GitHub workflow only checks that a bare invocation exits 2; it does not run this script with real arguments.
 
-`data/` is still a placeholder for AppWorld install checks, deterministic task-set selection, and manifest entry points.
+`data/build_spotify_capability_set.py` builds the fixed Spotify capability set. It requires `--task-ids`, a local JSON list of the twenty approved `train` task ids, and `--manifest`, the local manifest it writes; it refuses either path unless git ignores it, so both live under `data/processed/`. It opens each task, refuses the set unless every task requires exactly Spotify at difficulty 1 or 2, and writes only the hash, counts, split, rule, and seed to `configs/tasks/train_spotify_capability.json`. With no arguments it exits 2. `tests/unit/test_spotify_capability_set.py` fails if a tracked source, config, or test file contains an AppWorld task id literal.
 
 The harm-study and validity commands plan from supplied inputs. They do not measure an AppWorld baseline or a live truncation floor.
