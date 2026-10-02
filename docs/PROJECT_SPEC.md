@@ -39,6 +39,16 @@ seeded AppWorld task stream (simulated users)
 
 This table defines the target ownership, not completion. As of 2026-09-28, the repo contains configuration and record schemas, deterministic task-set selection and streams, a plan/execute episode path, a paired runner that calls that path twice on separate worlds, an A/A capture command over a supplied stream, fake-based CPU tests, lazy live adapters, the statistics implementations, a validation runner over those statistics, versioned fault diffs, a plan-only offline gate, a canary controller, a production monitor, a local SQLite episode store, and public aggregate export. The capture records evaluator disagreement, requirement fractions, trajectory divergence, and plan-scoring inputs. It applies no protocol threshold. A synthetic run is not a noise-floor result. The validation runner scores supplied seeds, reference values, and A/A rows, and it writes no measurement under `results/`. The gate, canary, and monitor decide from caller-supplied settings on injected worlds. The repo does not contain a served canary, a webhook, filled model or container contexts, protocol validity evidence, or measurements. `STAGES.md` records implementation progress separately from gate completion. On 2026-09-29 the live runtime integration was closed by one execute episode that called vLLM, ran AppWorld actions, evaluated the world, and persisted the episode (`docs/RUNTIME_CONTEXT.md`, `docs/DECISIONS.md` D18). Model task success is not part of that close. Baseline capability is stage 1.
 
+### Execute path ownership
+
+The AppWorld runtime owns world initialization, authentication and session setup, credential and token handling, API transport, and capability filtering. `LiveAppWorldSession.prepare()` runs before the agent starts.
+
+`WorkflowControlledAgent` in `runtime/workflow.py` is the execute-time controller for policy `plan_progress_v1`. It owns the model-generated semantic plan, the model-declared progress ledger, structural ledger validation, exact-repeat detection, generic stall signaling, and completion gating. It does not read AppWorld ground truth, evaluator requirements, or evaluator pass/failure. An execute turn makes one model generation. That first generation contains both the initial plan and the first action. The controller does not make a hidden model call to plan, update progress, check completion, replan, or detect a stall.
+
+The model still owns API selection, entity selection, ids, filters, pagination, workflow semantics, observation interpretation, mutation choice, task-specific sequencing, and whether the observed tool results support marking a plan step complete.
+
+Plan mode stays on `SmolagentsVLLMAgent` and is not wrapped, so Tier 1 plan traces and teacher-forced plan KL stay on the unwrapped agent. `plan_progress_v1` is enabled only on the 14B Spotify capability configuration. It is a Stage-1 baseline candidate, not a qualified baseline.
+
 Rule for the integration boundary: every environment mutation goes through AppWorld, so its evaluator sees the true final state. smolagents' local Python executor is never the place an action runs.
 
 ## Evaluation lifecycle

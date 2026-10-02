@@ -56,6 +56,11 @@ agent.sampling.execute_max_tokens
 agent.sampling.plan_max_tokens
 agent.api_docs_version
 agent.api_docs_app
+agent.workflow.policy
+agent.workflow.repeat_action_limit
+agent.workflow.no_progress_turns
+agent.workflow.completion_gate
+agent.workflow.max_plan_steps
 task.appworld_version
 task.split
 task.selection_rule
@@ -98,17 +103,21 @@ is where full is proven rather than merely claimed.
 
 model.lora.repository, model.lora.revision, agent.api_docs_version,
 agent.api_docs_app, agent.execute_max_model_turns, agent.tool_access_profile,
-agent.sampling.execute_max_tokens, agent.sampling.plan_max_tokens, and
+agent.sampling.execute_max_tokens, agent.sampling.plan_max_tokens,
+agent.workflow.policy, agent.workflow.repeat_action_limit,
+agent.workflow.no_progress_turns, agent.workflow.completion_gate,
+agent.workflow.max_plan_steps, and
 task.appworld_setup_profile are
 optional hashed leaves: ``ModelConfiguration.lora``,
 ``AgentConfiguration.api_docs_version``/``api_docs_app``,
 ``AgentConfiguration.execute_max_model_turns``,
 ``AgentConfiguration.tool_access_profile``, the two mode-specific
-``SamplingSettings`` token caps, and ``TaskConfiguration.appworld_setup_profile``
+``SamplingSettings`` token caps, ``AgentConfiguration.workflow``, and
+``TaskConfiguration.appworld_setup_profile``
 default to unset, and an unset leaf is omitted from canonical JSON entirely rather
 than serialized as null, so a configuration that never names a LoRA
 adapter, a corrupted API-documentation source, a tool-access profile,
-or an AppWorld setup profile
+a workflow controller, or an AppWorld setup profile
 hashes identically to one built before these fields existed. Setting,
 clearing, or changing any of them still changes the digest, because
 canonical JSON then differs.
@@ -137,6 +146,7 @@ MODEL_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 KV_CACHE_DTYPES = frozenset({"bfloat16", "float16", "fp8"})
 SAMPLER_BACKENDS = frozenset({"flashinfer", "native"})
 KL_FIDELITY_MODES = frozenset({"full", "top_k"})
+WORKFLOW_POLICIES = frozenset({"plan_progress_v1"})
 HASHED_FIELDS = frozenset(
     {
         "model.model.repository",
@@ -178,6 +188,11 @@ HASHED_FIELDS = frozenset(
         "agent.sampling.plan_max_tokens",
         "agent.api_docs_version",
         "agent.api_docs_app",
+        "agent.workflow.policy",
+        "agent.workflow.repeat_action_limit",
+        "agent.workflow.no_progress_turns",
+        "agent.workflow.completion_gate",
+        "agent.workflow.max_plan_steps",
         "task.appworld_version",
         "task.split",
         "task.selection_rule",
@@ -733,6 +748,39 @@ class SamplingSettings:
 
 
 @dataclass(frozen=True)
+class WorkflowSettings:
+    policy: str
+    repeat_action_limit: int
+    no_progress_turns: int
+    completion_gate: bool
+    max_plan_steps: int
+
+    def __post_init__(self) -> None:
+        _choice(self.policy, WORKFLOW_POLICIES, "workflow policy")
+        _positive(self.repeat_action_limit, "repeat_action_limit")
+        _positive(self.no_progress_turns, "no_progress_turns")
+        _flag(self.completion_gate, "completion_gate")
+        _positive(self.max_plan_steps, "max_plan_steps")
+        if self.repeat_action_limit < 2:
+            raise ConfigError("repeat_action_limit must be at least 2")
+        if not 2 <= self.max_plan_steps <= 8:
+            raise ConfigError("max_plan_steps must be between 2 and 8")
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, WorkflowSettings)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "workflow",
+    ) -> WorkflowSettings:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+@dataclass(frozen=True)
 class AgentConfiguration:
     """One agent's runtime configuration.
 
@@ -747,6 +795,10 @@ class AgentConfiguration:
 
     ``tool_access_profile`` names an optional runtime allowlist. Unset is
     omitted from ``to_dict``. Setting or changing it changes the run hash.
+
+    ``workflow`` names an optional execute-time controller. Unset is omitted
+    from ``to_dict``. Setting or changing it changes the run hash. Plan mode
+    does not wrap the agent when this field is set.
     """
 
     smolagents_version: str
@@ -758,6 +810,7 @@ class AgentConfiguration:
     api_docs_app: str | None = None
     tool_access_profile: str | None = None
     execute_max_model_turns: int | None = None
+    workflow: WorkflowSettings | None = None
 
     def __post_init__(self) -> None:
         _text(self.smolagents_version, "smolagents_version")
@@ -776,6 +829,8 @@ class AgentConfiguration:
             _text(self.tool_access_profile, "tool_access_profile")
         if self.execute_max_model_turns is not None:
             _positive(self.execute_max_model_turns, "execute_max_model_turns")
+        if self.workflow is not None:
+            _kind(self.workflow, WorkflowSettings, "workflow")
 
     @property
     def execute_turn_limit(self) -> int:
@@ -798,6 +853,8 @@ class AgentConfiguration:
             document["api_docs_app"] = self.api_docs_app
         if self.execute_max_model_turns is not None:
             document["execute_max_model_turns"] = self.execute_max_model_turns
+        if self.workflow is not None:
+            document["workflow"] = self.workflow.to_dict()
         return document
 
     @classmethod
@@ -817,11 +874,17 @@ class AgentConfiguration:
                     "api_docs_app",
                     "execute_max_model_turns",
                     "tool_access_profile",
+                    "workflow",
                 }
             ),
         )
         prompt = PromptSettings.from_dict(mapping["prompt"])
         sampling = SamplingSettings.from_dict(mapping["sampling"])
+        workflow = (
+            None
+            if "workflow" not in mapping
+            else WorkflowSettings.from_dict(mapping["workflow"])
+        )
         return _construct(
             name,
             lambda: _load(
@@ -833,6 +896,7 @@ class AgentConfiguration:
                 api_docs_app=mapping.get("api_docs_app"),
                 execute_max_model_turns=mapping.get("execute_max_model_turns"),
                 tool_access_profile=mapping.get("tool_access_profile"),
+                workflow=workflow,
             ),
         )
 

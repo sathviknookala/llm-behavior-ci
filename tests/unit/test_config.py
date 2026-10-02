@@ -82,6 +82,10 @@ _REPLACEMENTS = {
     "agent.sampling.plan_max_tokens": 1025,
     "agent.api_docs_version": "api-docs-corrupt-v2",
     "agent.api_docs_app": "other_app",
+    "agent.workflow.repeat_action_limit": 3,
+    "agent.workflow.no_progress_turns": 4,
+    "agent.workflow.completion_gate": False,
+    "agent.workflow.max_plan_steps": 6,
     "task.appworld_version": "0.1.3.post2",
     "task.split": "dev",
     "task.selection_rule": "fixed-v2",
@@ -156,6 +160,13 @@ def _payload() -> dict[str, object]:
             },
             "api_docs_version": "api-docs-corrupt-v1",
             "api_docs_app": "calendar",
+            "workflow": {
+                "policy": "plan_progress_v1",
+                "repeat_action_limit": 2,
+                "no_progress_turns": 3,
+                "completion_gate": True,
+                "max_plan_steps": 5,
+            },
         },
         "task": {
             "appworld_version": "0.1.3.post1",
@@ -467,7 +478,10 @@ class ConfigurationTests(unittest.TestCase):
             canonical_configuration_json(reordered),
             canonical_configuration_json(configuration),
         )
-        self.assertEqual(set(_REPLACEMENTS), set(HASHED_FIELDS))
+        self.assertEqual(
+            set(HASHED_FIELDS) - set(_REPLACEMENTS),
+            {"agent.workflow.policy"},
+        )
         payload = _payload()
         for path, value in _REPLACEMENTS.items():
             with self.subTest(path=path):
@@ -711,6 +725,125 @@ class OptionalHashedLeafTests(unittest.TestCase):
         document = agent.to_dict()
         self.assertNotIn("api_docs_version", document)
         self.assertNotIn("api_docs_app", document)
+
+
+_WORKFLOW_LEAVES = (
+    "agent.workflow.policy",
+    "agent.workflow.repeat_action_limit",
+    "agent.workflow.no_progress_turns",
+    "agent.workflow.completion_gate",
+    "agent.workflow.max_plan_steps",
+)
+
+
+class WorkflowConfigurationTests(unittest.TestCase):
+    def test_omitted_workflow_is_absent_and_hashes_as_missing(self) -> None:
+        payload = _payload()
+        del payload["agent"]["workflow"]
+        configuration = RunConfiguration.from_dict(payload)
+        self.assertIsNone(configuration.agent.workflow)
+        self.assertNotIn("workflow", configuration.agent.to_dict())
+        self.assertNotIn("workflow", configuration.to_dict()["agent"])
+        values = hashed_values(configuration)
+        for path in _WORKFLOW_LEAVES:
+            self.assertIs(values[path], MISSING_HASHED_LEAF)
+
+    def test_configured_workflow_round_trips(self) -> None:
+        configuration = _configuration()
+        workflow = configuration.agent.workflow
+        self.assertIsNotNone(workflow)
+        assert workflow is not None
+        self.assertEqual(workflow.policy, "plan_progress_v1")
+        self.assertEqual(workflow.repeat_action_limit, 2)
+        self.assertEqual(workflow.no_progress_turns, 3)
+        self.assertIs(workflow.completion_gate, True)
+        self.assertEqual(workflow.max_plan_steps, 5)
+        restored = RunConfiguration.from_dict(configuration.to_dict())
+        self.assertEqual(restored.agent.workflow, workflow)
+        self.assertIs(restored.agent.workflow.completion_gate, True)
+
+    def test_workflow_policy_changes_the_hash(self) -> None:
+        configured = _configuration()
+        payload = _payload()
+        del payload["agent"]["workflow"]
+        omitted = RunConfiguration.from_dict(payload)
+        self.assertNotEqual(
+            run_configuration_hash(configured),
+            run_configuration_hash(omitted),
+        )
+        self.assertEqual(
+            hashed_values(configured)["agent.workflow.policy"],
+            "plan_progress_v1",
+        )
+        self.assertIs(
+            hashed_values(omitted)["agent.workflow.policy"],
+            MISSING_HASHED_LEAF,
+        )
+
+    def test_each_mutable_workflow_leaf_changes_the_hash(self) -> None:
+        base_hash = run_configuration_hash(_configuration())
+        changes = {
+            "agent.workflow.repeat_action_limit": 3,
+            "agent.workflow.no_progress_turns": 4,
+            "agent.workflow.completion_gate": False,
+            "agent.workflow.max_plan_steps": 6,
+        }
+        for path, value in changes.items():
+            with self.subTest(path=path):
+                changed = RunConfiguration.from_dict(_with(path, value))
+                self.assertNotEqual(run_configuration_hash(changed), base_hash)
+                self.assertEqual(hashed_values(changed)[path], value)
+
+    def test_workflow_settings_reject_closed_bounds(self) -> None:
+        cases = {
+            "unknown policy": ("agent.workflow.policy", "other_policy"),
+            "repeat limit 1": ("agent.workflow.repeat_action_limit", 1),
+            "max plan steps 1": ("agent.workflow.max_plan_steps", 1),
+            "max plan steps 9": ("agent.workflow.max_plan_steps", 9),
+        }
+        for label, (path, value) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ConfigError):
+                    RunConfiguration.from_dict(_with(path, value))
+
+    def test_capability_configs_enable_workflow_only_on_14b(self) -> None:
+        root = Path(configuration_module.__file__).parents[2]
+        pilot = json.loads(
+            (root / "configs/models/qwen3_14b_awq_spotify_capability.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        previous = json.loads(
+            (root / "configs/models/qwen3_4b_spotify_capability.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            pilot["agent"]["workflow"],
+            {
+                "policy": "plan_progress_v1",
+                "repeat_action_limit": 2,
+                "no_progress_turns": 3,
+                "completion_gate": True,
+                "max_plan_steps": 5,
+            },
+        )
+        self.assertEqual(
+            pilot["agent"]["prompt"]["prompt_version"],
+            "prompt-runtime-auth-v1",
+        )
+        self.assertEqual(pilot["agent"]["execute_max_model_turns"], 20)
+        self.assertEqual(pilot["agent"]["sampling"]["execute_max_tokens"], 192)
+        self.assertEqual(pilot["agent"]["sampling"]["temperature"], 0.0)
+        self.assertEqual(pilot["agent"]["sampling"]["seed"], 17)
+        self.assertEqual(pilot["model"]["model"]["repository"], "Qwen/Qwen3-14B-AWQ")
+        self.assertEqual(
+            pilot["model"]["model"]["revision"],
+            "31c69efc29464b6bb0aee1398b5a7b50a99340c3",
+        )
+        self.assertEqual(pilot["model"]["serving"]["dtype"], "float16")
+        self.assertEqual(pilot["model"]["serving"]["kv_cache_dtype"], "float16")
+        self.assertNotIn("workflow", previous["agent"])
 
 
 if __name__ == "__main__":

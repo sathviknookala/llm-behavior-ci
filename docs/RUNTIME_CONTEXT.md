@@ -182,3 +182,13 @@ This episode terminated through `apis.supervisor.complete_task` before the step 
 | `total_requirements` | 8 |
 
 The stored episode is `finished` and its `evaluator_outcome` is non-null. That closes the live runtime integration: a real vLLM call, real AppWorld actions and observations, termination, `evaluate()`, and a persisted `EpisodeResult`. Model task success is not part of the close. One of eight requirements passed. Baseline AppWorld capability is stage 1. A later failure to solve a task is an experimental outcome unless it exposes a runtime defect.
+
+## Workflow controller
+
+This section is an ownership note, not a measurement.
+
+The AppWorld runtime owns initialization, authentication and session setup, credential and token handling, API transport, and capability filtering. `WorkflowControlledAgent` owns the model-generated semantic plan, the model-declared progress ledger, structural validation of that ledger, exact-repeat detection, generic stall signaling, and completion gating. It has no access to evaluator results or ground truth.
+
+An execute turn performs one model generation. The initial plan is part of that same first generation as the first action. The model still chooses the API, the entity, ids, filters, pagination, how to read an observation, which mutation to make, the task-specific sequence, and whether the observation supports marking a plan step complete.
+
+`plan_progress_v1` on the 14B Spotify capability configuration is a Stage-1 baseline candidate. It is not a qualified baseline. No 20-task pilot of this controller is recorded here.

@@ -74,6 +74,7 @@ class AgentTurn:
     app_name: str | None
     api_name: str | None
     rejection: str | None = None
+    feedback: str | None = None
 
 
 class AgentLoop(Protocol):
@@ -639,12 +640,20 @@ class SmolagentsVLLMAgent(_SmolModel):
                 output_text = content
         return _build_chat_message(role="assistant", content=output_text, raw=raw)
 
-    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+    def generate_turn(
+        self,
+        *,
+        tool_output: str | None,
+        extra_instruction: str | None = None,
+        parse_action: bool = True,
+    ) -> AgentTurn:
         state = self._state()
         started_at = wall_now()
         if tool_output is not None:
             state.history.append({"role": "user", "content": tool_output})
         messages = self.messages()
+        if extra_instruction is not None:
+            messages.append({"role": "user", "content": extra_instruction})
         began = monotonic()
         chat_message = self.generate(messages)
         latency_seconds = monotonic() - began
@@ -656,7 +665,7 @@ class SmolagentsVLLMAgent(_SmolModel):
             logprobs = parse_logprobs(choice)
             action, app_name, api_name = None, None, None
             rejection = None
-        else:
+        elif parse_action:
             logprobs = ()
             rejection = None
             try:
@@ -664,6 +673,10 @@ class SmolagentsVLLMAgent(_SmolModel):
             except ActionRejected as error:
                 action, app_name, api_name = None, None, None
                 rejection = str(error)
+        else:
+            logprobs = ()
+            action, app_name, api_name = None, None, None
+            rejection = None
         state.history.append({"role": "assistant", "content": output_text})
         return AgentTurn(
             prompt_text=messages[-1]["content"],
@@ -676,6 +689,13 @@ class SmolagentsVLLMAgent(_SmolModel):
             app_name=app_name,
             api_name=api_name,
             rejection=rejection,
+        )
+
+    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+        return self.generate_turn(
+            tool_output=tool_output,
+            extra_instruction=None,
+            parse_action=True,
         )
 
     def plan_prefix_payload(

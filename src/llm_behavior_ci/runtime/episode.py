@@ -373,9 +373,10 @@ def run_episode(
             if on_step is not None:
                 on_step(step)
             if turn.rejection is not None:
-                tool_output = (
+                tool_output = turn.feedback or (
                     "That output was not one apis.<app>.<api>(...) call. "
-                    "Emit exactly one call, with keyword arguments, and no other text."
+                    "Emit exactly one call, with keyword arguments, "
+                    "and no other text."
                 )
                 continue
             if turn.action is None:
@@ -445,6 +446,9 @@ def run_episode(
             next_index += 1
             if on_step is not None:
                 on_step(tool_step)
+            observer = getattr(runtime.agent, "observe_tool_result", None)
+            if callable(observer):
+                observer(turn.action, result)
             if result.error_message is not None and not result.recoverable:
                 return _finish(
                     identity=identity,
@@ -769,8 +773,14 @@ def build_runtime(
     except ValueError as error:
         raise RuntimeUnavailable(str(error)) from error
 
-    agent = SmolagentsVLLMAgent(endpoint_url)
-    agent.set_mode(mode)
+    base_agent = SmolagentsVLLMAgent(endpoint_url)
+    base_agent.set_mode(mode)
+    if mode == "execute" and configuration.agent.workflow is not None:
+        from llm_behavior_ci.runtime.workflow import WorkflowControlledAgent
+
+        agent = WorkflowControlledAgent(base_agent, configuration.agent.workflow)
+    else:
+        agent = base_agent
     session_factory = partial(
         LiveAppWorldSession,
         tool_access_profile=configuration.agent.tool_access_profile,

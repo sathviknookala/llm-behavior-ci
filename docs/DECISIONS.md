@@ -167,3 +167,13 @@ In each Tier 2 canary pair, the candidate's episode is the served result and pro
 **Why:** A canary's cost is what a bad candidate served. If production's episode were served, that cost would always be zero.
 
 `run_pair` currently calls the reference episode and then the candidate on one runtime, so a paired episode cannot use two base URLs. That call order is recorded and is not this served-result rule. `CanaryController` counts candidate episodes as served and can roll back from `CanarySettings`. `service.py` `create_app` is a FastAPI gateway; HTTP `POST /deployment/rollback` sets admission only and does not roll `CanaryController` back. That is not this served-result rule.
+
+## D22 — Workflow controller
+
+**Status:** IMPLEMENTED as a Stage-1 baseline candidate (2026-10-02). Not a qualified baseline.
+
+Execute episodes whose agent configuration sets `workflow.policy` to `plan_progress_v1` run through `WorkflowControlledAgent`. Each execute turn makes one model generation. The model returns one JSON envelope containing its semantic plan or its progress ledger and exactly one `apis.<app>.<api>(...)` action. The controller validates that ledger, blocks an exact repeated action after the configured limit, signals a generic stall, and gates `complete_task` on the model-declared ledger. The first generation carries the initial plan and the first action together. There is no separate model call for planning, progress updates, completion checks, replanning, or stall detection.
+
+The controller does not read AppWorld ground truth, evaluator requirements, or evaluator pass/failure. The runtime still owns AppWorld initialization, authentication, token handling, API transport, and capability filtering. The model still owns API and entity choice, ids, filters, pagination, observation interpretation, mutation choice, task-specific sequencing, and whether observed results support marking a plan step complete.
+
+`plan_progress_v1` is set only on `configs/models/qwen3_14b_awq_spotify_capability.json`: `repeat_action_limit` 2, `no_progress_turns` 3, `completion_gate` true, `max_plan_steps` 5. Plan mode is not wrapped. This decision does not record a capability-pilot result, and Stage 1 has not succeeded.

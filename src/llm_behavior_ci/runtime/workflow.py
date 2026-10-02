@@ -1,0 +1,497 @@
+from __future__ import annotations
+
+import ast
+import json
+import threading
+from dataclasses import dataclass, replace
+
+from llm_behavior_ci.config import RunConfiguration, WorkflowSettings
+from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
+from llm_behavior_ci.runtime.agent import AgentTurn, SmolagentsVLLMAgent
+from llm_behavior_ci.runtime.appworld import TaskContext, ToolResult
+
+_MIN_PLAN_STEPS = 2
+_MAX_PLAN_STEP_CHARS = 120
+_POLICY = "plan_progress_v1"
+_FIRST_KEYS = frozenset(
+    {
+        "plan",
+        "completed_steps",
+        "active_step",
+        "ready_to_complete",
+        "unfinished_steps",
+        "action",
+    }
+)
+_LATER_KEYS = frozenset(
+    {
+        "completed_steps",
+        "active_step",
+        "ready_to_complete",
+        "unfinished_steps",
+        "action",
+    }
+)
+_ENVELOPE_FEEDBACK = (
+    "Your workflow response was invalid. "
+    "Return exactly the required workflow JSON object. "
+    "Preserve all previously completed steps and propose "
+    "exactly one documented apis.<app>.<api>(...) action."
+)
+_ACTION_FEEDBACK = (
+    "The action field must contain exactly one documented "
+    "apis.<app>.<api>(...) call."
+)
+_COMPLETION_FEEDBACK = (
+    "Completion was blocked because your workflow ledger "
+    "still has unfinished steps. Continue with one action "
+    "that advances an unfinished step. Do not call "
+    "complete_task until every declared plan step is complete."
+)
+_REPEAT_FEEDBACK = (
+    "The exact same action has already repeated without "
+    "sufficient progress. Choose a different documented "
+    "action that advances an unfinished plan step."
+)
+
+
+@dataclass(frozen=True)
+class WorkflowEnvelope:
+    plan: tuple[str, ...] | None
+    completed_steps: tuple[int, ...]
+    active_step: int | None
+    ready_to_complete: bool
+    unfinished_steps: tuple[int, ...]
+    action: str
+
+
+@dataclass
+class WorkflowState:
+    plan: tuple[str, ...] | None = None
+    completed_steps: frozenset[int] = frozenset()
+    active_step: int | None = None
+    no_progress_turns: int = 0
+    executed_tool_actions: int = 0
+    last_action_key: str | None = None
+    consecutive_same_action_count: int = 0
+    last_action_had_error: bool | None = None
+    stall_reason: str | None = None
+
+
+class WorkflowEnvelopeError(ValueError):
+    pass
+
+
+def canonical_action(action: str) -> str:
+    tree = ast.parse(action.strip(), mode="exec")
+    return ast.dump(tree, annotate_fields=True, include_attributes=False)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _reject_keys(payload: dict[str, object], allowed: frozenset[str]) -> None:
+    if set(payload) != allowed:
+        raise WorkflowEnvelopeError("workflow response keys are not the required set")
+
+
+def _parse_plan(value: object, settings: WorkflowSettings) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise WorkflowEnvelopeError("plan must be a list")
+    if not _MIN_PLAN_STEPS <= len(value) <= settings.max_plan_steps:
+        raise WorkflowEnvelopeError("plan length is outside the allowed range")
+    steps: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item == "" or item != item.strip():
+            raise WorkflowEnvelopeError("plan step must be a non-empty trimmed string")
+        if "\n" in item or "\r" in item:
+            raise WorkflowEnvelopeError("plan step must be one line")
+        if len(item) > _MAX_PLAN_STEP_CHARS:
+            raise WorkflowEnvelopeError("plan step exceeds 120 characters")
+        steps.append(item)
+    if len(set(steps)) != len(steps):
+        raise WorkflowEnvelopeError("plan steps must be unique")
+    return tuple(steps)
+
+
+def _parse_completed(value: object, step_count: int) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise WorkflowEnvelopeError("completed_steps must be a list")
+    numbers: list[int] = []
+    for item in value:
+        if not _is_int(item):
+            raise WorkflowEnvelopeError("completed_steps must contain integers")
+        if not 1 <= item <= step_count:
+            raise WorkflowEnvelopeError("completed_steps must stay inside the plan")
+        numbers.append(item)
+    if any(
+        numbers[index] >= numbers[index + 1] for index in range(len(numbers) - 1)
+    ):
+        raise WorkflowEnvelopeError("completed_steps must be strictly ascending")
+    return tuple(numbers)
+
+
+def _parse_unfinished(
+    value: object,
+    completed: tuple[int, ...],
+    step_count: int,
+) -> tuple[int, ...]:
+    if not isinstance(value, list) or not all(_is_int(item) for item in value):
+        raise WorkflowEnvelopeError("unfinished_steps must be a list of integers")
+    expected = tuple(
+        sorted(set(range(1, step_count + 1)) - set(completed))
+    )
+    if tuple(value) != expected:
+        raise WorkflowEnvelopeError(
+            "unfinished_steps must be the complement of completed_steps"
+        )
+    return expected
+
+
+def _parse_ready(value: object, unfinished: tuple[int, ...]) -> bool:
+    if not isinstance(value, bool):
+        raise WorkflowEnvelopeError("ready_to_complete must be a boolean")
+    if value != (len(unfinished) == 0):
+        raise WorkflowEnvelopeError("ready_to_complete must match an empty unfinished list")
+    return value
+
+
+def _parse_active(value: object, *, ready: bool, unfinished: tuple[int, ...]) -> int | None:
+    if ready:
+        if value is not None:
+            raise WorkflowEnvelopeError("active_step must be null when the plan is complete")
+        return None
+    if not _is_int(value) or value not in unfinished:
+        raise WorkflowEnvelopeError("active_step must be an unfinished plan step")
+    return value
+
+
+def _parse_action_text(value: object) -> str:
+    if not isinstance(value, str) or value == "" or value != value.strip():
+        raise WorkflowEnvelopeError("action must be a non-empty trimmed string")
+    return value
+
+
+def parse_workflow_envelope(
+    text: str,
+    *,
+    state: WorkflowState,
+    settings: WorkflowSettings,
+) -> WorkflowEnvelope:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise WorkflowEnvelopeError("workflow response is not JSON") from error
+    if not isinstance(payload, dict):
+        raise WorkflowEnvelopeError("workflow response must be a JSON object")
+    if state.plan is None:
+        _reject_keys(payload, _FIRST_KEYS)
+        plan = _parse_plan(payload["plan"], settings)
+        step_count = len(plan)
+    else:
+        _reject_keys(payload, _LATER_KEYS)
+        plan = None
+        step_count = len(state.plan)
+    completed = _parse_completed(payload["completed_steps"], step_count)
+    if not state.completed_steps <= frozenset(completed):
+        raise WorkflowEnvelopeError("completed_steps must keep previously completed steps")
+    unfinished = _parse_unfinished(payload["unfinished_steps"], completed, step_count)
+    ready = _parse_ready(payload["ready_to_complete"], unfinished)
+    active = _parse_active(payload["active_step"], ready=ready, unfinished=unfinished)
+    action = _parse_action_text(payload["action"])
+    if state.plan is None:
+        if completed != ():
+            raise WorkflowEnvelopeError("the first ledger must have no completed steps")
+        if ready:
+            raise WorkflowEnvelopeError("the first ledger must not be ready to complete")
+        if unfinished != tuple(range(1, step_count + 1)):
+            raise WorkflowEnvelopeError("the first ledger must leave every step unfinished")
+    return WorkflowEnvelope(
+        plan=plan,
+        completed_steps=completed,
+        active_step=active,
+        ready_to_complete=ready,
+        unfinished_steps=unfinished,
+        action=action,
+    )
+
+
+def _number_list(values: list[int]) -> str:
+    return json.dumps(values)
+
+
+def workflow_instruction(state: WorkflowState, settings: WorkflowSettings) -> str:
+    if state.plan is None:
+        return (
+            "WORKFLOW CONTROLLER: plan_progress_v1\n"
+            "\n"
+            "Before the first tool execution, create a concise semantic plan "
+            "for completing the user's task.\n"
+            "\n"
+            "Return exactly one JSON object and no prose or Markdown.\n"
+            "\n"
+            "Required JSON fields:\n"
+            f'- "plan": 2 to {settings.max_plan_steps} concise semantic task subgoals.\n'
+            '- "completed_steps": [] on this first turn.\n'
+            '- "active_step": the numbered plan step you are currently advancing.\n'
+            '- "ready_to_complete": false on this first turn.\n'
+            '- "unfinished_steps": every numbered plan step.\n'
+            '- "action": exactly one apis.<app>.<api>(...) call as a JSON string.\n'
+            "\n"
+            "Plan rules:\n"
+            "- Describe task outcomes/subgoals, not authentication or runtime setup.\n"
+            "- Do not include complete_task as a plan step.\n"
+            "- Do not invent facts or claim work is already complete.\n"
+            "- Each plan step must be one line and at most 120 characters.\n"
+            "\n"
+            "Action rules:\n"
+            "- Use only APIs present in the supplied documentation.\n"
+            "- Advance one unfinished plan step.\n"
+            "- Do not include reasoning outside the JSON object.\n"
+        )
+    completed = sorted(state.completed_steps)
+    unfinished = sorted(set(range(1, len(state.plan) + 1)) - state.completed_steps)
+    active = "null" if state.active_step is None else str(state.active_step)
+    lines = [
+        "WORKFLOW CONTROLLER: plan_progress_v1",
+        "",
+        "Authoritative plan:",
+    ]
+    lines.extend(
+        f"{number}. {step}" for number, step in enumerate(state.plan, start=1)
+    )
+    lines.extend(
+        [
+            "",
+            "Controller state:",
+            f"completed_steps: {_number_list(completed)}",
+            f"unfinished_steps: {_number_list(unfinished)}",
+            f"active_step: {active}",
+            "",
+            "The latest tool result is already present immediately before "
+            "this workflow instruction.",
+            "",
+            "Update completed_steps only when the observed tool results support "
+            "that the subgoal has been achieved.",
+            "",
+            "Previously completed steps may never become incomplete.",
+            "",
+            "Return exactly one JSON object and no prose or Markdown.",
+            "",
+            "Required fields:",
+            '- "completed_steps"',
+            '- "active_step"',
+            '- "ready_to_complete"',
+            '- "unfinished_steps"',
+            '- "action"',
+            "",
+            'Do not include "plan" again.',
+            "",
+            "The action must be exactly one documented apis.<app>.<api>(...) "
+            "call represented as a JSON string.",
+        ]
+    )
+    if state.stall_reason is not None:
+        lines.extend(
+            [
+                "",
+                f"STALL DETECTED: {state.stall_reason}",
+                "",
+                "Reconsider how to advance an unfinished plan step. "
+                "Do not blindly repeat a non-progressing action.",
+            ]
+        )
+    if state.completed_steps == frozenset(range(1, len(state.plan) + 1)):
+        lines.extend(
+            [
+                "",
+                "All declared plan steps are complete. If that remains supported "
+                "by the observed tool results, the final action should be "
+                "apis.supervisor.complete_task(...).",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _repeated_stall(reason: str | None) -> bool:
+    return reason is not None and reason.startswith("repeated ")
+
+
+def _invalid(raw: AgentTurn, rejection: str, feedback: str) -> AgentTurn:
+    return replace(
+        raw,
+        action=None,
+        app_name=None,
+        api_name=None,
+        rejection=rejection,
+        feedback=feedback,
+    )
+
+
+def _completion_allowed(state: WorkflowState, envelope: WorkflowEnvelope) -> bool:
+    plan = state.plan
+    return (
+        envelope.ready_to_complete is True
+        and not envelope.unfinished_steps
+        and plan is not None
+        and state.completed_steps == frozenset(range(1, len(plan) + 1))
+        and envelope.active_step is None
+    )
+
+
+class WorkflowControlledAgent:
+    def __init__(
+        self,
+        base_agent: SmolagentsVLLMAgent,
+        settings: WorkflowSettings,
+    ) -> None:
+        if settings.policy != _POLICY:
+            raise ValueError("workflow policy must be plan_progress_v1")
+        self._base_agent = base_agent
+        self._settings = settings
+        self._local = threading.local()
+
+    def underlying_agents(self) -> tuple[SmolagentsVLLMAgent, ...]:
+        return (self._base_agent,)
+
+    def _state(self) -> WorkflowState:
+        state = getattr(self._local, "state", None)
+        if state is None:
+            raise RuntimeError("agent begin was not called")
+        return state
+
+    def begin(self, context: TaskContext, config: RunConfiguration) -> None:
+        if config.agent.workflow != self._settings:
+            raise ValueError("workflow settings do not match runtime controller")
+        self._local.state = WorkflowState()
+        self._base_agent.begin(context, config)
+
+    def teacher_force_plan(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        plan_text: str,
+    ):
+        return self._base_agent.teacher_force_plan(
+            messages=messages,
+            plan_text=plan_text,
+        )
+
+    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+        state = self._state()
+        instruction = workflow_instruction(state, self._settings)
+        raw = self._base_agent.generate_turn(
+            tool_output=tool_output,
+            extra_instruction=instruction,
+            parse_action=False,
+        )
+        try:
+            envelope = parse_workflow_envelope(
+                raw.output_text,
+                state=state,
+                settings=self._settings,
+            )
+        except WorkflowEnvelopeError:
+            return _invalid(raw, "workflow_envelope_invalid", _ENVELOPE_FEEDBACK)
+        if state.plan is None:
+            if envelope.plan is None:
+                return _invalid(raw, "workflow_envelope_invalid", _ENVELOPE_FEEDBACK)
+            state.plan = envelope.plan
+        new_completed = frozenset(envelope.completed_steps)
+        made_progress = bool(new_completed - state.completed_steps)
+        if state.executed_tool_actions > 0:
+            if made_progress:
+                state.no_progress_turns = 0
+            else:
+                state.no_progress_turns += 1
+        state.completed_steps = new_completed
+        state.active_step = envelope.active_step
+        if made_progress and (
+            state.stall_reason is not None
+            and state.stall_reason.startswith("no declared plan progress")
+        ):
+            state.stall_reason = None
+        if (
+            state.no_progress_turns >= self._settings.no_progress_turns
+            and not _repeated_stall(state.stall_reason)
+        ):
+            state.stall_reason = (
+                f"no declared plan progress for {state.no_progress_turns} action turns"
+            )
+        try:
+            action, app_name, api_name = parse_model_output(envelope.action)
+            if action is None:
+                raise ActionRejected("STOP is not a workflow action")
+        except ActionRejected as error:
+            return _invalid(raw, str(error), _ACTION_FEEDBACK)
+        completion = app_name == "supervisor" and api_name == "complete_task"
+        if completion and self._settings.completion_gate:
+            if not _completion_allowed(state, envelope):
+                return _invalid(
+                    raw,
+                    "workflow_completion_blocked",
+                    _COMPLETION_FEEDBACK,
+                )
+        else:
+            key = canonical_action(action)
+            if (
+                key == state.last_action_key
+                and state.consecutive_same_action_count
+                >= self._settings.repeat_action_limit
+            ):
+                return _invalid(
+                    raw,
+                    "workflow_repeated_action_blocked",
+                    _REPEAT_FEEDBACK,
+                )
+        return replace(
+            raw,
+            action=action,
+            app_name=app_name,
+            api_name=api_name,
+            rejection=None,
+            feedback=None,
+        )
+
+    def observe_tool_result(self, action: str, result: ToolResult) -> None:
+        state = self._state()
+        state.executed_tool_actions += 1
+        key = canonical_action(action)
+        same = key == state.last_action_key
+        if same:
+            state.consecutive_same_action_count += 1
+        else:
+            state.last_action_key = key
+            state.consecutive_same_action_count = 1
+        state.last_action_had_error = result.error_message is not None
+        if state.consecutive_same_action_count >= self._settings.repeat_action_limit:
+            if result.error_message is not None:
+                state.stall_reason = "repeated failed action"
+            else:
+                state.stall_reason = (
+                    "repeated successful action without declared workflow progress"
+                )
+        elif (
+            not same
+            and result.error_message is None
+            and _repeated_stall(state.stall_reason)
+        ):
+            state.stall_reason = None
+
+
+def workflow_output_has_parseable_action(text: str) -> bool:
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    action = payload.get("action")
+    if not isinstance(action, str):
+        return False
+    try:
+        parsed_action, _, _ = parse_model_output(action)
+    except ActionRejected:
+        return False
+    return parsed_action is not None

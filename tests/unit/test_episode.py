@@ -1,12 +1,15 @@
 import copy
+import importlib.util
 import json
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from llm_behavior_ci.config import (
     RunConfiguration,
+    WorkflowSettings,
     new_run_identity,
 )
 from llm_behavior_ci.records import ModelStep, TokenLogprob, ToolStep
@@ -26,6 +29,7 @@ from llm_behavior_ci.runtime.episode import (
     is_live_runtime,
     run_episode,
 )
+from llm_behavior_ci.runtime.workflow import WorkflowControlledAgent
 
 _START = datetime(2026, 9, 27, 15, 0, tzinfo=timezone.utc)
 _LOGPROBS = (
@@ -122,6 +126,7 @@ def _turn(
     prompt_text: str = _PROMPT,
     started_at: datetime = _START,
     rejection: str | None = None,
+    feedback: str | None = None,
 ) -> AgentTurn:
     return AgentTurn(
         prompt_text=prompt_text,
@@ -134,6 +139,7 @@ def _turn(
         app_name=app_name,
         api_name=api_name,
         rejection=rejection,
+        feedback=feedback,
     )
 
 
@@ -213,6 +219,7 @@ class FakeAgent:
             prompt_text=source.prompt_text,
             started_at=self._clock(),
             rejection=source.rejection,
+            feedback=source.feedback,
         )
 
 
@@ -754,6 +761,448 @@ class EpisodeRunnerTests(unittest.TestCase):
             "That output was not one apis.<app>.<api>(...) call. "
             "Emit exactly one call, with keyword arguments, and no other text."
         ))
+
+
+def _workflow_settings() -> WorkflowSettings:
+    return WorkflowSettings.from_dict(
+        {
+            "policy": "plan_progress_v1",
+            "repeat_action_limit": 2,
+            "no_progress_turns": 3,
+            "completion_gate": True,
+            "max_plan_steps": 5,
+        }
+    )
+
+
+def _with_workflow(config: RunConfiguration, **agent_overrides: object) -> RunConfiguration:
+    return replace(
+        config,
+        agent=replace(
+            config.agent,
+            workflow=_workflow_settings(),
+            **agent_overrides,
+        ),
+    )
+
+
+class ObservingAgent(FakeAgent):
+    def __init__(self, turns: list[AgentTurn] | None = None, *, clock=None) -> None:
+        super().__init__(turns, clock=clock)
+        self.observed: list[tuple[str, object]] = []
+
+    def observe_tool_result(self, action: str, result: object) -> None:
+        self.observed.append((action, result))
+
+
+class _ScriptedBase:
+    def __init__(self, outputs: list[str], clock) -> None:
+        self._outputs = list(outputs)
+        self._clock = clock
+        self.generations = 0
+        self.tool_outputs: list[str | None] = []
+
+    def begin(self, context: TaskContext, config: RunConfiguration) -> None:
+        del context, config
+
+    def generate_turn(
+        self,
+        *,
+        tool_output: str | None,
+        extra_instruction: str | None = None,
+        parse_action: bool = True,
+    ) -> AgentTurn:
+        del extra_instruction, parse_action
+        self.generations += 1
+        self.tool_outputs.append(tool_output)
+        return AgentTurn(
+            prompt_text=_PROMPT,
+            output_text=self._outputs.pop(0),
+            top_k_logprobs=_LOGPROBS,
+            generated_token_count=len(_LOGPROBS),
+            latency_seconds=0.1,
+            started_at=self._clock(),
+            action=None,
+            app_name=None,
+            api_name=None,
+        )
+
+
+def _envelope(
+    action: str,
+    *,
+    plan: list[str] | None = None,
+    completed: list[int] | None = None,
+    unfinished: list[int] | None = None,
+    active: int | None = 1,
+    ready: bool = False,
+) -> str:
+    payload: dict[str, object] = {
+        "completed_steps": list(completed or []),
+        "active_step": active,
+        "ready_to_complete": ready,
+        "unfinished_steps": list(unfinished or []),
+        "action": action,
+    }
+    if plan is not None:
+        payload = {"plan": plan, **payload}
+    return json.dumps(payload)
+
+
+class WorkflowEpisodeTests(unittest.TestCase):
+    def test_rejection_feedback_replaces_the_generic_parser_message(self) -> None:
+        config = _config()
+        clock = _clock()
+        session = FakeSession()
+        agent = FakeAgent(
+            [
+                _turn(
+                    "blocked",
+                    action=None,
+                    rejection="workflow_completion_blocked",
+                    feedback="controller feedback",
+                ),
+                _turn("STOP", action=None),
+            ],
+            clock=clock,
+        )
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(len(result.model_steps), 2)
+        self.assertEqual(result.tool_steps, ())
+        self.assertEqual(session.execute_count, 0)
+        self.assertEqual(agent.tool_outputs[1], "controller feedback")
+        self.assertNotIn("apis.<app>", agent.tool_outputs[1])
+
+    def test_observer_sees_success_and_recoverable_errors_only(self) -> None:
+        config = _config()
+        clock = _clock()
+        session = FakeSession()
+        agent = ObservingAgent(
+            [
+                _turn(_ACTION, action=_ACTION),
+                _turn("STOP", action=None),
+            ],
+            clock=clock,
+        )
+        run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(len(agent.observed), 1)
+        self.assertIsInstance(agent.observed[0][1], ToolResult)
+        self.assertIsNone(agent.observed[0][1].error_message)
+        self.assertEqual(session.evaluate_count, 1)
+        self.assertNotIsInstance(agent.observed[0][1], EvaluationResult)
+
+        clock = _clock()
+        session = FakeSession()
+        session.tool_results = [
+            ToolResult(
+                output_text=None,
+                error_message="missing",
+                recoverable=True,
+                app_name=None,
+                api_name=None,
+            )
+        ]
+        agent = ObservingAgent(
+            [
+                _turn(_ACTION, action=_ACTION),
+                _turn("STOP", action=None),
+            ],
+            clock=clock,
+        )
+        run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(len(agent.observed), 1)
+        observed = agent.observed[0][1]
+        self.assertIsInstance(observed, ToolResult)
+        self.assertEqual(observed.error_message, "missing")
+        self.assertNotIsInstance(observed, EvaluationResult)
+
+        clock = _clock()
+        session = FakeSession()
+        agent = ObservingAgent([_turn("STOP", action=None)], clock=clock)
+        run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, agent, clock),
+        )
+        self.assertEqual(agent.observed, [])
+        self.assertEqual(session.evaluate_count, 1)
+
+    def test_execute_workflow_wraps_the_live_agent_and_plan_mode_does_not(self) -> None:
+        config = _with_workflow(_config())
+        execute_runtime = build_runtime(config, "http://127.0.0.1:9", mode="execute")
+        self.assertIsInstance(execute_runtime.agent, WorkflowControlledAgent)
+        self.assertTrue(is_live_runtime(execute_runtime))
+        self.assertEqual(
+            execute_runtime.agent.underlying_agents(),
+            (execute_runtime.agent._base_agent,),
+        )
+        plan_runtime = build_runtime(config, "http://127.0.0.1:9", mode="plan")
+        self.assertIsInstance(plan_runtime.agent, SmolagentsVLLMAgent)
+        self.assertNotIsInstance(plan_runtime.agent, WorkflowControlledAgent)
+
+    def test_premature_completion_is_blocked_and_the_next_action_runs(self) -> None:
+        read = "apis.calendar.show_calendar()"
+        advance = 'apis.calendar.create_event(title="meetup")'
+        done = "apis.supervisor.complete_task()"
+        plan = ["Read the calendar", "Create the event"]
+        clock = _clock()
+        base = _ScriptedBase(
+            [
+                _envelope(
+                    read,
+                    plan=plan,
+                    completed=[],
+                    unfinished=[1, 2],
+                    active=1,
+                    ready=False,
+                ),
+                _envelope(
+                    done,
+                    completed=[1],
+                    unfinished=[2],
+                    active=2,
+                    ready=False,
+                ),
+                _envelope(
+                    advance,
+                    completed=[1],
+                    unfinished=[2],
+                    active=2,
+                    ready=False,
+                ),
+                _envelope(
+                    done,
+                    completed=[1, 2],
+                    unfinished=[],
+                    active=None,
+                    ready=True,
+                ),
+            ],
+            clock,
+        )
+        config = _with_workflow(_config())
+        controller = WorkflowControlledAgent(base, config.agent.workflow)
+        session = FakeSession()
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, controller, clock),
+        )
+        self.assertEqual(
+            [step.action for step in result.tool_steps],
+            [read, advance, done],
+        )
+        self.assertEqual(
+            base.tool_outputs[2],
+            (
+                "Completion was blocked because your workflow ledger "
+                "still has unfinished steps. Continue with one action "
+                "that advances an unfinished step. Do not call "
+                "complete_task until every declared plan step is complete."
+            ),
+        )
+        self.assertEqual(result.termination_reason, "appworld_completed")
+        self.assertEqual(len(result.model_steps), 4)
+        self.assertEqual(base.generations, 4)
+
+    def test_third_exact_repeat_is_not_executed(self) -> None:
+        action = "apis.calendar.show_calendar()"
+        clock = _clock()
+        later = _envelope(
+            action,
+            completed=[],
+            unfinished=[1, 2],
+            active=1,
+            ready=False,
+        )
+        base = _ScriptedBase(
+            [
+                _envelope(
+                    action,
+                    plan=["Read the calendar", "Create the event"],
+                    completed=[],
+                    unfinished=[1, 2],
+                    active=1,
+                    ready=False,
+                ),
+                later,
+                later,
+                later,
+            ],
+            clock,
+        )
+        config = _with_workflow(_config(), execute_max_model_turns=4)
+        controller = WorkflowControlledAgent(base, config.agent.workflow)
+        session = FakeSession()
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, controller, clock),
+        )
+        self.assertEqual([step.action for step in result.tool_steps], [action, action])
+        self.assertEqual(
+            base.tool_outputs[3],
+            (
+                "The exact same action has already repeated without "
+                "sufficient progress. Choose a different documented "
+                "action that advances an unfinished plan step."
+            ),
+        )
+        self.assertEqual(result.termination_reason, "step_limit")
+        self.assertEqual(len(result.model_steps), 4)
+        self.assertEqual(base.generations, 4)
+
+    def test_completed_ledger_runs_complete_task(self) -> None:
+        read = "apis.calendar.show_calendar()"
+        advance = 'apis.calendar.create_event(title="meetup")'
+        done = "apis.supervisor.complete_task()"
+        clock = _clock()
+        base = _ScriptedBase(
+            [
+                _envelope(
+                    read,
+                    plan=["Read the calendar", "Create the event"],
+                    completed=[],
+                    unfinished=[1, 2],
+                    active=1,
+                    ready=False,
+                ),
+                _envelope(
+                    advance,
+                    completed=[1],
+                    unfinished=[2],
+                    active=2,
+                    ready=False,
+                ),
+                _envelope(
+                    done,
+                    completed=[1, 2],
+                    unfinished=[],
+                    active=None,
+                    ready=True,
+                ),
+            ],
+            clock,
+        )
+        config = _with_workflow(_config())
+        controller = WorkflowControlledAgent(base, config.agent.workflow)
+        seen: list[object] = []
+        original = controller.observe_tool_result
+
+        def _spy(action: str, result: ToolResult) -> None:
+            seen.append(result)
+            original(action, result)
+
+        controller.observe_tool_result = _spy
+        session = FakeSession()
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, controller, clock),
+        )
+        self.assertEqual(result.termination_reason, "appworld_completed")
+        self.assertEqual(
+            [step.action for step in result.tool_steps],
+            [read, advance, done],
+        )
+        self.assertEqual(session.evaluate_count, 1)
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(all(isinstance(item, ToolResult) for item in seen))
+        self.assertTrue(all(not isinstance(item, EvaluationResult) for item in seen))
+
+    def test_parser_accounting_follows_the_workflow_policy(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/evaluation/run_capability_pilot.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "run_capability_pilot_workflow_test",
+            path,
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        pilot = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pilot)
+
+        plain = _config()
+        clock = _clock()
+        stopped = run_episode(
+            "task-1",
+            plain,
+            "execute",
+            run=new_run_identity(plain),
+            runtime=_runtime(
+                FakeSession(),
+                FakeAgent([_turn("STOP", action=None)], clock=clock),
+                clock,
+            ),
+        )
+        self.assertEqual(pilot._parser_errors(plain, stopped), 0)
+        clock = _clock()
+        prose = run_episode(
+            "task-1",
+            plain,
+            "execute",
+            run=new_run_identity(plain),
+            runtime=_runtime(
+                FakeSession(),
+                FakeAgent(
+                    [
+                        _turn(
+                            "not a call",
+                            action=None,
+                            rejection="action is not valid Python",
+                        ),
+                        _turn("STOP", action=None),
+                    ],
+                    clock=clock,
+                ),
+                clock,
+            ),
+        )
+        self.assertEqual(pilot._parser_errors(plain, prose), 1)
+
+        workflow = _with_workflow(_config(), execute_max_model_turns=1)
+        clock = _clock()
+        loose = json.dumps({"action": "apis.calendar.show_calendar()"})
+        base = _ScriptedBase([loose], clock)
+        controller = WorkflowControlledAgent(base, workflow.agent.workflow)
+        loose_episode = run_episode(
+            "task-1",
+            workflow,
+            "execute",
+            run=new_run_identity(workflow),
+            runtime=_runtime(FakeSession(), controller, clock),
+        )
+        self.assertEqual(loose_episode.termination_reason, "step_limit")
+        self.assertEqual(pilot._parser_errors(workflow, loose_episode), 0)
+        self.assertEqual(pilot._parser_errors(plain, loose_episode), 1)
 
 
 if __name__ == "__main__":

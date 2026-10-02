@@ -48,6 +48,13 @@
       "max_tokens": 1024,
       "plan_max_tokens": 1024,
       "execute_max_tokens": 192
+    },
+    "workflow": {
+      "policy": "plan_progress_v1",
+      "repeat_action_limit": 2,
+      "no_progress_turns": 3,
+      "completion_gate": true,
+      "max_plan_steps": 5
     }
   }
 }

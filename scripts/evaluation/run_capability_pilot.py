@@ -38,6 +38,7 @@ from llm_behavior_ci.config import (
 )
 from llm_behavior_ci.records import EXECUTE_TERMINATIONS, EpisodeResult, ModelStep, ToolStep
 from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
+from llm_behavior_ci.runtime.workflow import workflow_output_has_parseable_action
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
     RuntimeUnavailable,
@@ -257,7 +258,18 @@ def _distribution(values: Sequence[int], percents: Sequence[int]) -> dict[str, o
     }
 
 
-def _parser_errors(episode: EpisodeResult) -> int:
+def _parser_errors(
+    configuration: RunConfiguration,
+    episode: EpisodeResult,
+) -> int:
+    workflow = configuration.agent.workflow
+    if workflow is not None and workflow.policy == "plan_progress_v1":
+        return sum(
+            0
+            if workflow_output_has_parseable_action(step.output_text)
+            else 1
+            for step in episode.model_steps
+        )
     count = 0
     for step in episode.model_steps:
         text = step.output_text
@@ -319,7 +331,7 @@ def _aggregate(
             medium += 1
         elif label is not None:
             other += 1
-        parser_errors += _parser_errors(episode)
+        parser_errors += _parser_errors(configuration, episode)
         repeated += _repeated_tool_calls(episode)
         if len(episode.model_steps) >= turn_cap:
             turn_cap_hits += 1
