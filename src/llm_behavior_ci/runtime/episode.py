@@ -67,9 +67,9 @@ def is_live_runtime(runtime: RuntimeDependencies) -> bool:
     candidate through one gate call) exposes them through
     ``underlying_agents()``; every one of them must be a real
     ``SmolagentsVLLMAgent`` for the runtime to count as live.
-    ``build_runtime`` binds ``tool_access_profile`` with
-    ``functools.partial``; that partial is live when it wraps
-    ``LiveAppWorldSession`` and names no other argument.
+    ``build_runtime`` binds ``tool_access_profile`` and
+    ``appworld_setup_profile`` with ``functools.partial``; that partial is
+    live when it wraps ``LiveAppWorldSession`` and names no other argument.
     """
 
     from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
@@ -92,7 +92,10 @@ def _is_live_session_factory(factory: object) -> bool:
         return False
     if factory.args:
         return False
-    return set(factory.keywords or {}) <= {"tool_access_profile"}
+    return set(factory.keywords or {}) <= {
+        "tool_access_profile",
+        "appworld_setup_profile",
+    }
 
 
 def _reject(
@@ -206,7 +209,11 @@ def run_episode(
 
     Rejects a run identity that does not match the configuration hash, task
     set, git commit, or protocol. Mints one episode identity, opens a session
-    from ``runtime.session_factory``, and always closes that session. Plan
+    from ``runtime.session_factory``, and always closes that session. When
+    the session defines ``prepare``, that runs after the session is opened
+    and before ``context`` and ``agent.begin``. Preparation is not a model
+    turn and not a tool step. A preparation failure is a runtime error with
+    no evaluator outcome. Plan
     mode takes one model turn and never executes or evaluates. Execute mode
     enforces ``config.agent.execute_turn_limit`` (``execute_max_model_turns``
     when set, else ``step_limit``) and records tool results. It evaluates
@@ -224,6 +231,34 @@ def run_episode(
     session = runtime.session_factory(task_id)
     try:
         started_at = runtime.clock()
+        prepare = getattr(session, "prepare", None)
+        if callable(prepare):
+            try:
+                prepare()
+            except Exception:
+                return _finish(
+                    identity=identity,
+                    run=run,
+                    task_id=task_id,
+                    config=config,
+                    scenario_id=scenario_id,
+                    mode=mode,
+                    started_at=started_at,
+                    clock=runtime.clock,
+                    model_steps=[],
+                    tool_steps=[],
+                    plan_text=None,
+                    evaluator_outcome=None,
+                    termination_reason="runtime_error",
+                    episode_errors=(
+                        RecordedError(
+                            source="runtime",
+                            recoverable=False,
+                            message="environment setup failed",
+                            step_index=None,
+                        ),
+                    ),
+                )
         context = session.context()
         runtime.agent.begin(context, config)
         model_steps: list[ModelStep] = []
@@ -652,6 +687,11 @@ def _compatible_pair(
         != candidate_config.agent.sampling.seed
     ):
         raise EpisodeRejected("pair episodes must share an execution seed")
+    if (
+        reference_config.task.appworld_setup_profile
+        != candidate_config.task.appworld_setup_profile
+    ):
+        raise EpisodeRejected("setup profiles are not compatible")
 
 
 def _open_worlds(
@@ -700,8 +740,9 @@ def build_runtime(
     ``AppWorldSession.execute``, reached by ``run_episode`` via
     ``build_appworld_executor`` and never by smolagents'
     ``LocalPythonExecutor``. The session factory is a partial of
-    ``LiveAppWorldSession`` bound to ``agent.tool_access_profile``, so
-    the hashed profile is the only selector for a capability allowlist.
+    ``LiveAppWorldSession`` bound to ``agent.tool_access_profile`` and
+    ``task.appworld_setup_profile``, so the hashed profiles select the
+    capability allowlist and the environment setup.
     """
 
     if not isinstance(configuration, RunConfiguration):
@@ -733,6 +774,7 @@ def build_runtime(
     session_factory = partial(
         LiveAppWorldSession,
         tool_access_profile=configuration.agent.tool_access_profile,
+        appworld_setup_profile=configuration.task.appworld_setup_profile,
     )
     return RuntimeDependencies(
         session_factory=session_factory,

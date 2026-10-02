@@ -6,7 +6,8 @@ resolved task ids stay local (docs/DATA.md). Opens each listed task, refuses
 the set unless every task's required apps are exactly Spotify and its
 difficulty is 1 or 2, then writes the local manifest to --manifest and the
 public task metadata to configs/tasks/train_spotify_capability.json. The
-public file is the hash, counts, split, rule, and seed only.
+public file is the hash, counts, split, rule, seed, and
+``appworld_setup_profile``.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ APPWORLD_VERSION = "0.1.3.post1"
 SELECTION_RULE = "fixed_spotify_capability"
 SELECTION_SEED = 17
 TASK_COUNT = 20
+SETUP_PROFILE = "spotify_authenticated_v1"
 PUBLIC_PATH = Path("configs/tasks/train_spotify_capability.json")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -166,6 +168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "task_set_hash",
         )
     }
+    public_config["appworld_setup_profile"] = SETUP_PROFILE
 
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     PUBLIC_PATH.parent.mkdir(parents=True, exist_ok=True)

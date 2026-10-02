@@ -215,6 +215,47 @@ class ActionParserTests(unittest.TestCase):
                 mode="execute",
             )
 
+    def test_runtime_auth_prompt_is_native_and_authentication_neutral(self) -> None:
+        text = render_system_text(
+            prompt_version="prompt-runtime-auth-v1",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="execute",
+        )
+        self.assertIn(
+            "Authentication and session credentials are managed by the runtime.",
+            text,
+        )
+        self.assertIn("Use tool results to progress toward the requested task.", text)
+        self.assertIn("apis.<app>.<api>(...)", text)
+        self.assertIn("apis.supervisor.complete_task(...)", text)
+        self.assertNotIn("credential APIs", text)
+        self.assertNotIn("log into", text)
+        self.assertNotIn("access token", text.lower())
+        self.assertNotIn("signup", text.lower())
+        self.assertNotIn("password", text.lower())
+        self.assertNotIn("CALL <app> <api>", text)
+        previous = render_system_text(
+            prompt_version="prompt-v3",
+            plan_format_version="plan-v1",
+            thinking_enabled=False,
+            action_interface="code",
+            mode="execute",
+        )
+        self.assertIn("credential APIs", previous)
+        with self.assertRaisesRegex(
+            ValueError,
+            "prompt-runtime-auth-v1 does not support tool_calling action interface",
+        ):
+            render_system_text(
+                prompt_version="prompt-runtime-auth-v1",
+                plan_format_version="plan-v1",
+                thinking_enabled=False,
+                action_interface="tool_calling",
+                mode="execute",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

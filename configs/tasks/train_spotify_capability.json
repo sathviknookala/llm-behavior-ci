@@ -5,5 +5,6 @@
   "selection_seed": 17,
   "task_count": 20,
   "scenario_count": 8,
-  "task_set_hash": "a20fe52d28164e1d458266331c242277788d2ed0af29b054b7df926345db3a04"
+  "task_set_hash": "a20fe52d28164e1d458266331c242277788d2ed0af29b054b7df926345db3a04",
+  "appworld_setup_profile": "spotify_authenticated_v1"
 }

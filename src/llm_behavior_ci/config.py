@@ -62,6 +62,7 @@ task.selection_rule
 task.selection_seed
 task.task_count
 task.task_set_hash
+task.appworld_setup_profile
 run_seed
 git_commit
 protocol_hash
@@ -97,14 +98,17 @@ is where full is proven rather than merely claimed.
 
 model.lora.repository, model.lora.revision, agent.api_docs_version,
 agent.api_docs_app, agent.execute_max_model_turns, agent.tool_access_profile,
-agent.sampling.execute_max_tokens, and agent.sampling.plan_max_tokens are
+agent.sampling.execute_max_tokens, agent.sampling.plan_max_tokens, and
+task.appworld_setup_profile are
 optional hashed leaves: ``ModelConfiguration.lora``,
 ``AgentConfiguration.api_docs_version``/``api_docs_app``,
 ``AgentConfiguration.execute_max_model_turns``,
-``AgentConfiguration.tool_access_profile``, and the two mode-specific
-``SamplingSettings`` token caps default to unset, and an unset leaf is omitted from canonical JSON entirely rather
+``AgentConfiguration.tool_access_profile``, the two mode-specific
+``SamplingSettings`` token caps, and ``TaskConfiguration.appworld_setup_profile``
+default to unset, and an unset leaf is omitted from canonical JSON entirely rather
 than serialized as null, so a configuration that never names a LoRA
-adapter, a corrupted API-documentation source, or a tool-access profile
+adapter, a corrupted API-documentation source, a tool-access profile,
+or an AppWorld setup profile
 hashes identically to one built before these fields existed. Setting,
 clearing, or changing any of them still changes the digest, because
 canonical JSON then differs.
@@ -180,6 +184,7 @@ HASHED_FIELDS = frozenset(
         "task.selection_seed",
         "task.task_count",
         "task.task_set_hash",
+        "task.appworld_setup_profile",
         "run_seed",
         "git_commit",
         "protocol_hash",
@@ -834,12 +839,22 @@ class AgentConfiguration:
 
 @dataclass(frozen=True)
 class TaskConfiguration:
+    """One task-set configuration.
+
+    ``appworld_setup_profile`` names optional runtime setup applied to the
+    world before the agent starts. Unset is omitted from ``to_dict``.
+    Reference and candidate configurations share this field because it is
+    the initialized environment, not an agent policy. Setting or changing
+    it changes the run hash.
+    """
+
     appworld_version: str
     split: str
     selection_rule: str
     selection_seed: int
     task_count: int
     task_set_hash: str
+    appworld_setup_profile: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.appworld_version, "appworld_version")
@@ -848,9 +863,14 @@ class TaskConfiguration:
         _integer(self.selection_seed, "selection_seed")
         _positive(self.task_count, "task_count")
         _sha256(self.task_set_hash, "task_set_hash")
+        if self.appworld_setup_profile is not None:
+            _text(self.appworld_setup_profile, "appworld_setup_profile")
 
     def to_dict(self) -> dict[str, object]:
-        return _plain_dict(self, TaskConfiguration)
+        document = _plain_dict(self, TaskConfiguration)
+        if document.get("appworld_setup_profile") is None:
+            del document["appworld_setup_profile"]
+        return document
 
     @classmethod
     def from_dict(
@@ -859,7 +879,12 @@ class TaskConfiguration:
         name: str = "task configuration",
     ) -> TaskConfiguration:
         mapping = _object(payload, name)
-        _require_fields(mapping, cls, name)
+        _require_fields(
+            mapping,
+            cls,
+            name,
+            optional=frozenset({"appworld_setup_profile"}),
+        )
         return _construct(name, lambda: _load(cls, mapping))
 
 

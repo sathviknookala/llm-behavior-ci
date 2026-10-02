@@ -105,6 +105,17 @@ _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
             "current action.\n"
         ),
     ),
+    "prompt-runtime-auth-v1": PromptTemplate(
+        version="prompt-runtime-auth-v1",
+        system_body=(
+            "You are an AppWorld tool-using agent.\n"
+            "Follow the task instruction and the API documentation.\n"
+            "Mutate state only through AppWorld-executed actions.\n"
+            "Do not invent APIs that are absent from the documentation.\n"
+            "Authentication and session credentials are managed by the runtime.\n"
+            "Use tool results to progress toward the requested task.\n"
+        ),
+    ),
 }
 
 _PLAN_FORMAT_REGISTRY: dict[str, PlanFormatTemplate] = {
@@ -210,11 +221,16 @@ def render_system_text(
 
 def _execute_instruction(*, prompt_version: str, action_interface: str) -> str:
     if action_interface == "code":
-        if prompt_version in {"prompt-v2", "prompt-v3", "prompt-v4"}:
+        if prompt_version in {
+            "prompt-v2",
+            "prompt-v3",
+            "prompt-v4",
+            "prompt-runtime-auth-v1",
+        }:
             return _NATIVE_CODE_EXECUTE
         return _LEGACY_CODE_EXECUTE
     if action_interface == "tool_calling":
-        if prompt_version in {"prompt-v2", "prompt-v4"}:
+        if prompt_version in {"prompt-v2", "prompt-v4", "prompt-runtime-auth-v1"}:
             raise ValueError(
                 f"{prompt_version} does not support tool_calling action interface"
             )

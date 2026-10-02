@@ -8,7 +8,9 @@ HEAD and the tracked source and config tree must be clean.
 
 Prints one public JSON object after each episode. Writes one public
 aggregate to --output. Task ids, instructions, model text, API arguments,
-trajectories, and evaluator internals stay in the local store.
+trajectories, and evaluator internals stay in the local store. When the
+local manifest omits ``appworld_setup_profile``, the matching committed
+task metadata supplies it.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from llm_behavior_ci.config import (
@@ -53,6 +56,7 @@ _PUBLIC_TASK_FIELDS = (
     "task_count",
     "task_set_hash",
 )
+_OPTIONAL_PUBLIC_TASK_FIELDS = ("appworld_setup_profile",)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PILOT_PROFILE = "spotify_capability_v1"
 _PILOT_TASK_COUNT = 20
@@ -97,7 +101,49 @@ def _git_commit() -> str:
 
 
 def _public_task_fields(payload: dict[str, object]) -> dict[str, object]:
-    return {field: payload[field] for field in _PUBLIC_TASK_FIELDS}
+    fields = {field: payload[field] for field in _PUBLIC_TASK_FIELDS}
+    for field in _OPTIONAL_PUBLIC_TASK_FIELDS:
+        if field in payload and payload[field] is not None:
+            fields[field] = payload[field]
+    return fields
+
+
+def _task_identity(task: TaskConfiguration) -> dict[str, object]:
+    document = task.to_dict()
+    document.pop("appworld_setup_profile", None)
+    return document
+
+
+def _matching_committed_task(task: TaskConfiguration) -> TaskConfiguration | None:
+    identity = _task_identity(task)
+    tasks_dir = _REPO_ROOT / "configs" / "tasks"
+    if not tasks_dir.is_dir():
+        return None
+    for path in sorted(tasks_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            committed = TaskConfiguration.from_dict(_public_task_fields(payload))
+        except (KeyError, TypeError, ConfigError):
+            continue
+        if _task_identity(committed) == identity:
+            return committed
+    return None
+
+
+def _adopt_committed_setup_profile(task: TaskConfiguration) -> TaskConfiguration | None:
+    committed = _matching_committed_task(task)
+    if committed is None:
+        return None
+    if task.appworld_setup_profile is None:
+        return replace(task, appworld_setup_profile=committed.appworld_setup_profile)
+    if task.appworld_setup_profile != committed.appworld_setup_profile:
+        return None
+    return task
 
 
 def _load_task_set(payload: object) -> tuple[TaskConfiguration, TaskSet]:
@@ -133,27 +179,6 @@ def _difficulty_by_task(payload: object) -> dict[str, int]:
             continue
         parsed[key] = value
     return parsed
-
-
-def _matches_committed_public(task: TaskConfiguration) -> bool:
-    tasks_dir = _REPO_ROOT / "configs" / "tasks"
-    if not tasks_dir.is_dir():
-        return False
-    expected = task.to_dict()
-    for path in sorted(tasks_dir.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        try:
-            committed = TaskConfiguration.from_dict(_public_task_fields(payload))
-        except (KeyError, TypeError, ConfigError):
-            continue
-        if committed.to_dict() == expected:
-            return True
-    return False
 
 
 def _persistence_callbacks(
@@ -428,9 +453,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if task.task_count != _PILOT_TASK_COUNT or task_set.task_count != _PILOT_TASK_COUNT:
             print("capability pilot requires 20 tasks", file=sys.stderr)
             return 2
-        if not _matches_committed_public(task):
+        adopted = _adopt_committed_setup_profile(task)
+        if adopted is None:
             print("task set does not match committed public metadata", file=sys.stderr)
             return 2
+        task = adopted
         difficulties = _difficulty_by_task(task_payload)
         configuration = RunConfiguration(
             model=model,

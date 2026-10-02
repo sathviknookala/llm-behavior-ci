@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import ast
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Callable, NoReturn, Protocol
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,8 @@ class EvaluationResult:
 
 
 class AppWorldSession(Protocol):
+    def prepare(self) -> None: ...
+
     def context(self) -> TaskContext: ...
 
     def execute(self, action: str) -> ToolResult: ...
@@ -168,6 +171,19 @@ def _execute_output_is_error(value: str) -> bool:
 
 
 _SPOTIFY_CAPABILITY_PROFILE = "spotify_capability_v1"
+_SPOTIFY_AUTHENTICATED_PROFILE = "spotify_authenticated_v1"
+_HIDDEN_SPOTIFY_APIS = frozenset({"login", "signup"})
+_HIDDEN_SUPERVISOR_APIS = frozenset({"show_profile", "show_account_passwords"})
+_HIDDEN_RENDERED = frozenset(
+    {
+        "spotify.login",
+        "spotify.signup",
+        "supervisor.show_profile",
+        "supervisor.show_account_passwords",
+    }
+)
+_ACCESS_TOKEN = "access_token"
+_SETUP_FAILED = "spotify authentication setup failed"
 
 _SPOTIFY_SUPERVISOR_APIS = frozenset(
     {
@@ -275,6 +291,292 @@ def _spotify_capability_docs(documentation: object) -> object:
     return selected
 
 
+def _raise_setup(error: Exception | None = None) -> NoReturn:
+    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+    if error is None:
+        raise RuntimeUnavailable(_SETUP_FAILED)
+    raise RuntimeUnavailable(_SETUP_FAILED) from error
+
+
+def _is_access_token_parameter(item: object) -> bool:
+    if isinstance(item, str):
+        return item == _ACCESS_TOKEN
+    if isinstance(item, Mapping):
+        return item.get("name") == _ACCESS_TOKEN
+    return False
+
+
+def _without_access_token_parameters(parameters: object) -> object:
+    if isinstance(parameters, list):
+        return [item for item in parameters if not _is_access_token_parameter(item)]
+    if isinstance(parameters, Mapping):
+        cleaned: dict[str, object] = {}
+        for key, value in parameters.items():
+            if isinstance(value, list):
+                cleaned[str(key)] = [
+                    item for item in value if not _is_access_token_parameter(item)
+                ]
+            else:
+                cleaned[str(key)] = value
+        return cleaned
+    return parameters
+
+
+def _without_access_token_schema(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: item
+            for key, item in value.items()
+            if key != _ACCESS_TOKEN
+        }
+    if isinstance(value, list):
+        return [item for item in value if not _is_access_token_parameter(item)]
+    return value
+
+
+def _without_access_token_doc(doc: object) -> object:
+    if not isinstance(doc, Mapping):
+        return doc
+    updated = dict(doc)
+    if "parameters" in updated:
+        updated["parameters"] = _without_access_token_parameters(updated["parameters"])
+    schemas = updated.get("response_schemas")
+    if isinstance(schemas, Mapping):
+        updated["response_schemas"] = {
+            key: _without_access_token_schema(value) for key, value in schemas.items()
+        }
+    return updated
+
+
+def _doc_requires_access_token(doc: object) -> bool:
+    if not isinstance(doc, Mapping):
+        return False
+    parameters = doc.get("parameters")
+    if isinstance(parameters, list):
+        return any(_is_access_token_parameter(item) for item in parameters)
+    if isinstance(parameters, Mapping):
+        for value in parameters.values():
+            if isinstance(value, list) and any(
+                _is_access_token_parameter(item) for item in value
+            ):
+                return True
+    return False
+
+
+def _spotify_token_apis(documentation: object) -> frozenset[str]:
+    if not isinstance(documentation, Mapping):
+        return frozenset()
+    spotify = documentation.get("spotify")
+    if not isinstance(spotify, Mapping):
+        return frozenset()
+    return frozenset(
+        str(api_name)
+        for api_name, doc in spotify.items()
+        if _doc_requires_access_token(doc)
+    )
+
+
+def _strip_access_token_parameter_text(line: str) -> str:
+    if " | " not in line:
+        return line
+    head, parameters = line.split(" | ", 1)
+    kept: list[str] = []
+    for piece in parameters.split(","):
+        stripped = piece.strip()
+        name = stripped.split(":", 1)[0].strip().rstrip("?")
+        if name == _ACCESS_TOKEN:
+            continue
+        kept.append(stripped)
+    if not kept:
+        return head
+    return f"{head} | {', '.join(kept)}"
+
+
+def _sanitize_rendered_documentation(text: str) -> str:
+    kept: list[str] = []
+    for line in text.splitlines():
+        name = line.split(":", 1)[0].strip()
+        if name in _HIDDEN_RENDERED:
+            continue
+        if name.startswith("spotify."):
+            line = _strip_access_token_parameter_text(line)
+        kept.append(line)
+    if not kept:
+        return ""
+    rendered = "\n".join(kept)
+    if text.endswith("\n"):
+        rendered += "\n"
+    return rendered
+
+
+def _plain_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain_value(item) for item in value]
+    return value
+
+
+def _plain_documentation(documentation: Mapping[str, object]) -> dict[str, object]:
+    plain: dict[str, object] = {}
+    for app_name, apis in documentation.items():
+        if isinstance(apis, Mapping):
+            plain[str(app_name)] = {
+                str(api_name): _plain_value(doc) for api_name, doc in apis.items()
+            }
+        else:
+            plain[str(app_name)] = apis
+    return plain
+
+
+def _authenticated_surface(documentation: object) -> object:
+    """Drop credential APIs and Spotify access-token parameters."""
+
+    if isinstance(documentation, str):
+        return _sanitize_rendered_documentation(documentation)
+    if not isinstance(documentation, Mapping):
+        return documentation
+    selected = _plain_documentation(documentation)
+    spotify = selected.get("spotify")
+    if isinstance(spotify, Mapping):
+        selected["spotify"] = {
+            name: _without_access_token_doc(doc)
+            for name, doc in spotify.items()
+            if name not in _HIDDEN_SPOTIFY_APIS
+        }
+    supervisor = selected.get("supervisor")
+    if isinstance(supervisor, Mapping):
+        selected["supervisor"] = {
+            name: doc
+            for name, doc in supervisor.items()
+            if name not in _HIDDEN_SUPERVISOR_APIS
+        }
+    return selected
+
+
+def _authenticated_surface_allows(action: str) -> bool:
+    try:
+        app_name, api_name = _call_target(action)
+    except (SyntaxError, ValueError):
+        return True
+    if app_name == "spotify" and api_name in _HIDDEN_SPOTIFY_APIS:
+        return False
+    if app_name == "supervisor" and api_name in _HIDDEN_SUPERVISOR_APIS:
+        return False
+    if app_name != "api_docs":
+        return True
+    requested_app = _keyword_string(action, "app_name")
+    requested_api = _keyword_string(action, "api_name")
+    if requested_app == "spotify" and requested_api in _HIDDEN_SPOTIFY_APIS:
+        return False
+    if requested_app == "supervisor" and requested_api in _HIDDEN_SUPERVISOR_APIS:
+        return False
+    return True
+
+
+def _profile_email(profile: object) -> str:
+    if not isinstance(profile, Mapping):
+        _raise_setup()
+    email = profile.get("email")
+    if not isinstance(email, str) or email.strip() == "":
+        _raise_setup()
+    return email
+
+
+def _spotify_account_password(accounts: object) -> str:
+    if not isinstance(accounts, list):
+        _raise_setup()
+    matches: list[str] = []
+    for item in accounts:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("account_name")
+        password = item.get("password")
+        if not isinstance(name, str) or name.lower() != "spotify":
+            continue
+        if not isinstance(password, str) or password == "":
+            _raise_setup()
+        matches.append(password)
+    if len(matches) != 1:
+        _raise_setup()
+    return matches[0]
+
+
+def _spotify_access_token(payload: object) -> str:
+    if not isinstance(payload, Mapping):
+        _raise_setup()
+    token = payload.get(_ACCESS_TOKEN)
+    if not isinstance(token, str) or token == "":
+        _raise_setup()
+    return token
+
+
+def _rewrite_access_token(action: str, token: str | None) -> str:
+    try:
+        tree = ast.parse(action.strip(), mode="exec")
+        call = tree.body[0].value
+        if not isinstance(call, ast.Call):
+            raise ValueError("not a call")
+        keywords = [
+            keyword for keyword in call.keywords if keyword.arg != _ACCESS_TOKEN
+        ]
+        if token is not None:
+            keywords.append(
+                ast.keyword(arg=_ACCESS_TOKEN, value=ast.Constant(token))
+            )
+        call.keywords = keywords
+        return ast.unparse(call)
+    except (SyntaxError, ValueError, TypeError) as error:
+        _raise_setup(error)
+
+
+def _call_supplies_access_token(action: str) -> bool:
+    try:
+        tree = ast.parse(action.strip(), mode="exec")
+        call = tree.body[0].value
+    except (SyntaxError, ValueError, IndexError, AttributeError):
+        return False
+    if not isinstance(call, ast.Call):
+        return False
+    return any(keyword.arg == _ACCESS_TOKEN for keyword in call.keywords)
+
+
+def _filter_api_descriptions(payload: object, app_name: str | None) -> object:
+    hidden = {
+        "spotify": _HIDDEN_SPOTIFY_APIS,
+        "supervisor": _HIDDEN_SUPERVISOR_APIS,
+    }.get(app_name or "", frozenset())
+    if not isinstance(payload, list) or not hidden:
+        return payload
+    return [
+        item
+        for item in payload
+        if not (isinstance(item, Mapping) and item.get("name") in hidden)
+    ]
+
+
+def _json_text(payload: object, original: str) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False)
+    indent = 1 if len(encoded) >= 100 else None
+    text = json.dumps(payload, indent=indent, ensure_ascii=False)
+    if original.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def _sanitize_helper_output(action: str, api_name: str, text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if api_name == "show_api_descriptions":
+        payload = _filter_api_descriptions(payload, _keyword_string(action, "app_name"))
+    elif api_name == "show_api_doc":
+        payload = _without_access_token_doc(payload)
+    return _json_text(payload, text)
+
+
 class LiveAppWorldSession:
     """AppWorld session adapter that imports AppWorld only when a world is opened.
 
@@ -298,6 +600,15 @@ class LiveAppWorldSession:
     Spotify app plus the approved supervisor and api_docs helpers, and
     ``execute`` rejects every other API before AppWorld runs it. Any
     other value, including unset, leaves the existing surface unchanged.
+
+    ``appworld_setup_profile`` ``spotify_authenticated_v1`` makes
+    ``prepare`` log into the existing Spotify account and keep the access
+    token on the session. Later Spotify calls that require ``access_token``
+    receive that token inside AppWorld. The stored agent action is the
+    call the model submitted. Model-visible documentation, including
+    later api_docs helper responses, omits login, signup, supervisor
+    credential retrieval, and the access-token parameter. ``prepare`` is
+    idempotent: a second call does not log in again. No profile is a no-op.
     """
 
     _open_stack: list[LiveAppWorldSession] = []
@@ -308,11 +619,16 @@ class LiveAppWorldSession:
         *,
         opener: Callable[[str], object] | None = None,
         tool_access_profile: str | None = None,
+        appworld_setup_profile: str | None = None,
     ) -> None:
         self._closed = False
         self._task_id = task_id
         self._opener = opener or _open_appworld
         self._tool_access_profile = tool_access_profile
+        self._setup_profile = appworld_setup_profile
+        self._prepared = False
+        self._access_token: str | None = None
+        self._token_api_names: frozenset[str] | None = None
         self._world: object | None = None
         if any(
             session._world is not None and not session._closed
@@ -346,6 +662,147 @@ class LiveAppWorldSession:
         if result.error_message is not None:
             raise RuntimeUnavailable("do-nothing completion failed")
 
+    def prepare(self) -> None:
+        """Authenticate the world before the agent starts, when a profile says so.
+
+        ``spotify_authenticated_v1`` reads the supervisor profile and account
+        passwords, selects the existing Spotify account, and logs in with
+        those returned values. The access token stays on this session.
+        Credential APIs and login are not model turns. A second call after
+        success does not log in again. Any failed step raises
+        ``RuntimeUnavailable`` and leaves the token unset.
+        """
+
+        if self._prepared:
+            return
+        if self._setup_profile is None:
+            self._prepared = True
+            return
+        if self._setup_profile != _SPOTIFY_AUTHENTICATED_PROFILE:
+            _raise_setup()
+        if self._world is None:
+            self._open_world()
+        try:
+            documentation = getattr(self._world.task, "api_docs", "")
+            token_apis = _spotify_token_apis(documentation)
+            if not token_apis:
+                _raise_setup()
+            profile = self._call_setup_api("supervisor", "show_profile")
+            passwords = self._call_setup_api("supervisor", "show_account_passwords")
+            email = _profile_email(profile)
+            password = _spotify_account_password(passwords)
+            login = self._call_setup_api(
+                "spotify",
+                "login",
+                username=email,
+                password=password,
+            )
+            token = _spotify_access_token(login)
+        except Exception as error:
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            if isinstance(error, RuntimeUnavailable):
+                raise
+            _raise_setup(error)
+        self._token_api_names = token_apis
+        self._access_token = token
+        self._prepared = True
+
+    def _call_setup_api(self, app_name: str, api_name: str, **kwargs: object) -> object:
+        if self._world is None:
+            self._open_world()
+        requester = getattr(self._world, "requester", None)
+        request = getattr(requester, "request", None)
+        if not callable(request):
+            _raise_setup()
+        try:
+            return request(
+                _app_name=app_name,
+                _api_name=api_name,
+                track=False,
+                **kwargs,
+            )
+        except Exception as error:
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            if isinstance(error, RuntimeUnavailable):
+                raise
+            _raise_setup(error)
+
+    def _visible_documentation(self, raw_docs: object) -> object:
+        if self._tool_access_profile == _SPOTIFY_CAPABILITY_PROFILE:
+            raw_docs = _spotify_capability_docs(raw_docs)
+        if self._setup_profile == _SPOTIFY_AUTHENTICATED_PROFILE:
+            raw_docs = _authenticated_surface(raw_docs)
+        return raw_docs
+
+    def _allows(self, action: str) -> bool:
+        if self._tool_access_profile == _SPOTIFY_CAPABILITY_PROFILE:
+            if not _spotify_capability_allows(action):
+                return False
+        if self._setup_profile == _SPOTIFY_AUTHENTICATED_PROFILE:
+            if not _authenticated_surface_allows(action):
+                return False
+        return True
+
+    def _token_apis(self) -> frozenset[str]:
+        if self._token_api_names is not None:
+            return self._token_api_names
+        if self._world is None:
+            return frozenset()
+        return _spotify_token_apis(getattr(self._world.task, "api_docs", ""))
+
+    def _with_runtime_auth(self, action: str) -> str:
+        if self._setup_profile != _SPOTIFY_AUTHENTICATED_PROFILE:
+            return action
+        try:
+            app_name, api_name = _call_target(action)
+        except (SyntaxError, ValueError):
+            return action
+        if app_name != "spotify":
+            return action
+        requires_token = api_name in self._token_apis()
+        supplied = _call_supplies_access_token(action)
+        if not requires_token:
+            if supplied:
+                return _rewrite_access_token(action, None)
+            return action
+        if not self._access_token:
+            _raise_setup()
+        return _rewrite_access_token(action, self._access_token)
+
+    def _redact(self, text: str | None) -> str | None:
+        token = self._access_token
+        if text is None or token is None or token not in text:
+            return text
+        return text.replace(token, "")
+
+    def _visible_result(self, action: str, result: ToolResult) -> ToolResult:
+        output_text = result.output_text
+        error_message = result.error_message
+        if (
+            self._setup_profile == _SPOTIFY_AUTHENTICATED_PROFILE
+            and output_text is not None
+            and error_message is None
+        ):
+            try:
+                app_name, api_name = _call_target(action)
+            except (SyntaxError, ValueError):
+                app_name, api_name = None, None
+            if app_name == "api_docs" and api_name in _SPOTIFY_API_DOC_APIS:
+                output_text = _sanitize_helper_output(action, api_name, output_text)
+        output_text = self._redact(output_text)
+        error_message = self._redact(error_message)
+        if output_text == result.output_text and error_message == result.error_message:
+            return result
+        return ToolResult(
+            output_text=output_text,
+            error_message=error_message,
+            recoverable=result.recoverable,
+            app_name=result.app_name,
+            api_name=result.api_name,
+        )
+
     def context(self) -> TaskContext:
         if self._world is None:
             for session in reversed(type(self)._open_stack):
@@ -357,9 +814,7 @@ class LiveAppWorldSession:
                     return session.context()
             self._open_world()
         task = self._world.task
-        raw_docs = getattr(task, "api_docs", "")
-        if self._tool_access_profile == _SPOTIFY_CAPABILITY_PROFILE:
-            raw_docs = _spotify_capability_docs(raw_docs)
+        raw_docs = self._visible_documentation(getattr(task, "api_docs", ""))
         return TaskContext(
             task_id=self._task_id,
             instruction=task.instruction,
@@ -367,42 +822,51 @@ class LiveAppWorldSession:
         )
 
     def execute(self, action: str) -> ToolResult:
-        if self._tool_access_profile == _SPOTIFY_CAPABILITY_PROFILE:
-            if not _spotify_capability_allows(action):
-                return ToolResult(
-                    output_text=None,
-                    error_message="API is outside the configured capability profile",
-                    recoverable=True,
-                    app_name=None,
-                    api_name=None,
-                )
+        if not self._allows(action):
+            return ToolResult(
+                output_text=None,
+                error_message="API is outside the configured capability profile",
+                recoverable=True,
+                app_name=None,
+                api_name=None,
+            )
+        submitted = self._with_runtime_auth(action)
         if self._world is None:
             self._open_world()
         try:
-            value = self._world.execute(_code_for_execute(action))
+            value = self._world.execute(_code_for_execute(submitted))
         except Exception as error:
-            return ToolResult(
-                output_text=None,
-                error_message=str(error),
-                recoverable=True,
-                app_name=None,
-                api_name=None,
+            return self._visible_result(
+                action,
+                ToolResult(
+                    output_text=None,
+                    error_message=str(error),
+                    recoverable=True,
+                    app_name=None,
+                    api_name=None,
+                ),
             )
         text = value if isinstance(value, str) else str(value)
         if _execute_output_is_error(text):
-            return ToolResult(
-                output_text=None,
-                error_message=text,
-                recoverable=True,
+            return self._visible_result(
+                action,
+                ToolResult(
+                    output_text=None,
+                    error_message=text,
+                    recoverable=True,
+                    app_name=None,
+                    api_name=None,
+                ),
+            )
+        return self._visible_result(
+            action,
+            ToolResult(
+                output_text=text,
+                error_message=None,
+                recoverable=False,
                 app_name=None,
                 api_name=None,
-            )
-        return ToolResult(
-            output_text=text,
-            error_message=None,
-            recoverable=False,
-            app_name=None,
-            api_name=None,
+            ),
         )
 
     def evaluate(self) -> EvaluationResult:
