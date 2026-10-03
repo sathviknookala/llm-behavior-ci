@@ -94,7 +94,8 @@ none of their fields enter the run-configuration hash.
 Closed tokens: splits are train, dev, test_normal, and test_challenge;
 action interfaces are code and tool_calling; quantization methods are
 none, fp8, nvfp4, and awq; model dtypes are bfloat16, float16, and float32;
-KV-cache dtypes are bfloat16, float16, and fp8. Model revisions,
+KV-cache dtypes are bfloat16, float16, and fp8. Workflow policies are
+plan_progress_v1 and plan_progress_v2. Model revisions,
 tokenizer revisions, and git_commit are 40-character lowercase git ids.
 task_set_hash and a present protocol_hash are 64-character lowercase
 SHA-256 digests. top_k is -1 or a positive integer. The sampling seed
@@ -146,7 +147,7 @@ MODEL_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 KV_CACHE_DTYPES = frozenset({"bfloat16", "float16", "fp8"})
 SAMPLER_BACKENDS = frozenset({"flashinfer", "native"})
 KL_FIDELITY_MODES = frozenset({"full", "top_k"})
-WORKFLOW_POLICIES = frozenset({"plan_progress_v1"})
+WORKFLOW_POLICIES = frozenset({"plan_progress_v1", "plan_progress_v2"})
 HASHED_FIELDS = frozenset(
     {
         "model.model.repository",

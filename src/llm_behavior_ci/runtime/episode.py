@@ -216,7 +216,15 @@ def run_episode(
     no evaluator outcome. Plan
     mode takes one model turn and never executes or evaluates. Execute mode
     enforces ``config.agent.execute_turn_limit`` (``execute_max_model_turns``
-    when set, else ``step_limit``) and records tool results. It evaluates
+    when set, else ``step_limit``) and records tool results. A generation
+    spends one of those turns unless the agent marks
+    ``consumes_execute_turn`` false. ``plan_progress_v2`` does that for a
+    malformed workflow envelope while fewer than two consecutive format
+    rejections have already been waived for the current attempt; the next
+    consecutive malformed envelope spends one turn and still does not
+    execute. Policy blocks and executed actions spend a turn. The executed
+    tool count therefore cannot exceed the turn limit. ``plan_progress_v1``
+    spends a turn on every generation. Execute mode evaluates
     when the agent stops, when ``complete_task`` succeeds, and when the step
     limit is reached. A step-limit evaluation does not change the failed
     status. Unrecoverable runtime and tool failures are not evaluated.
@@ -369,9 +377,16 @@ def run_episode(
             step = _model_step(next_index, turn)
             model_steps.append(step)
             next_index += 1
-            model_turns += 1
             if on_step is not None:
                 on_step(step)
+            if not turn.consumes_execute_turn:
+                tool_output = turn.feedback or (
+                    "That output was not one apis.<app>.<api>(...) call. "
+                    "Emit exactly one call, with keyword arguments, "
+                    "and no other text."
+                )
+                continue
+            model_turns += 1
             if turn.rejection is not None:
                 tool_output = turn.feedback or (
                     "That output was not one apis.<app>.<api>(...) call. "

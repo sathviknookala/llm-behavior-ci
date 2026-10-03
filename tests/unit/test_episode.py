@@ -763,6 +763,18 @@ class EpisodeRunnerTests(unittest.TestCase):
         ))
 
 
+def _workflow_settings_v2() -> WorkflowSettings:
+    return WorkflowSettings.from_dict(
+        {
+            "policy": "plan_progress_v2",
+            "repeat_action_limit": 2,
+            "no_progress_turns": 3,
+            "completion_gate": True,
+            "max_plan_steps": 5,
+        }
+    )
+
+
 def _workflow_settings() -> WorkflowSettings:
     return WorkflowSettings.from_dict(
         {
@@ -772,6 +784,17 @@ def _workflow_settings() -> WorkflowSettings:
             "completion_gate": True,
             "max_plan_steps": 5,
         }
+    )
+
+
+def _with_v2(config: RunConfiguration, **agent_overrides: object) -> RunConfiguration:
+    return replace(
+        config,
+        agent=replace(
+            config.agent,
+            workflow=_workflow_settings_v2(),
+            **agent_overrides,
+        ),
     )
 
 
@@ -826,6 +849,26 @@ class _ScriptedBase:
             app_name=None,
             api_name=None,
         )
+
+
+def _envelope_v2(
+    action: str,
+    *,
+    plan: list[str] | None = None,
+    mark: list[int] | None = None,
+    active: int | None = 1,
+) -> str:
+    if plan is not None:
+        return json.dumps(
+            {"plan": plan, "active_step": active, "action": action}
+        )
+    return json.dumps(
+        {
+            "mark_completed": list(mark or []),
+            "active_step": active,
+            "action": action,
+        }
+    )
 
 
 def _envelope(
@@ -1203,6 +1246,120 @@ class WorkflowEpisodeTests(unittest.TestCase):
         self.assertEqual(loose_episode.termination_reason, "step_limit")
         self.assertEqual(pilot._parser_errors(workflow, loose_episode), 0)
         self.assertEqual(pilot._parser_errors(plain, loose_episode), 1)
+
+    def test_v2_execute_wraps_plan_mode_and_unconfigured_execute_do_not(self) -> None:
+        v2 = _with_v2(_config())
+        execute_runtime = build_runtime(v2, "http://127.0.0.1:9", mode="execute")
+        self.assertIsInstance(execute_runtime.agent, WorkflowControlledAgent)
+        self.assertEqual(execute_runtime.agent._settings.policy, "plan_progress_v2")
+        plan_runtime = build_runtime(v2, "http://127.0.0.1:9", mode="plan")
+        self.assertIsInstance(plan_runtime.agent, SmolagentsVLLMAgent)
+        self.assertNotIsInstance(plan_runtime.agent, WorkflowControlledAgent)
+        plain = build_runtime(_config(), "http://127.0.0.1:9", mode="execute")
+        self.assertIsInstance(plain.agent, SmolagentsVLLMAgent)
+        self.assertNotIsInstance(plain.agent, WorkflowControlledAgent)
+        v1 = build_runtime(_with_workflow(_config()), "http://127.0.0.1:9", mode="execute")
+        self.assertIsInstance(v1.agent, WorkflowControlledAgent)
+        self.assertEqual(v1.agent._settings.policy, "plan_progress_v1")
+
+    def test_v2_format_retries_do_not_buy_extra_executed_actions(self) -> None:
+        plan = ["Read the calendar", "Create the event"]
+        actions = [
+            f"apis.calendar.show_calendar(page={index})" for index in range(20)
+        ]
+        clock = _clock()
+        outputs = ["{", "{"]
+        outputs.append(_envelope_v2(actions[0], plan=plan, active=1))
+        outputs.extend(
+            _envelope_v2(action, mark=[], active=1) for action in actions[1:]
+        )
+        base = _ScriptedBase(outputs, clock)
+        config = _with_v2(_config(), execute_max_model_turns=20)
+        controller = WorkflowControlledAgent(base, config.agent.workflow)
+        session = FakeSession()
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(session, controller, clock),
+        )
+        self.assertEqual(result.termination_reason, "step_limit")
+        self.assertEqual(len(result.tool_steps), 20)
+        self.assertEqual(base.generations, 22)
+        self.assertEqual(session.execute_count, 20)
+        self.assertEqual(base._outputs, [])
+
+        clock = _clock()
+        malformed = _ScriptedBase(["{"] * 60, clock)
+        capped = _with_v2(_config(), execute_max_model_turns=20)
+        controller = WorkflowControlledAgent(malformed, capped.agent.workflow)
+        stopped = run_episode(
+            "task-1",
+            capped,
+            "execute",
+            run=new_run_identity(capped),
+            runtime=_runtime(FakeSession(), controller, clock),
+        )
+        self.assertEqual(stopped.termination_reason, "step_limit")
+        self.assertEqual(stopped.tool_steps, ())
+        self.assertEqual(malformed.generations, 60)
+        self.assertEqual(malformed._outputs, [])
+
+    def test_v2_aggregate_splits_interface_failures_from_actions(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/evaluation/run_capability_pilot.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "run_capability_pilot_v2_accounting",
+            path,
+        )
+        assert spec is not None and spec.loader is not None
+        pilot = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pilot)
+        plan = ["Read the calendar", "Create the event"]
+        read = "apis.calendar.show_calendar()"
+        done = "apis.supervisor.complete_task()"
+        clock = _clock()
+        base = _ScriptedBase(
+            [
+                "{",
+                "{",
+                _envelope_v2(read, plan=plan, active=1),
+                _envelope_v2(done, mark=[1], active=2),
+                _envelope_v2(read, mark=[], active=2),
+            ],
+            clock,
+        )
+        config = _with_v2(_config(), execute_max_model_turns=3)
+        controller = WorkflowControlledAgent(base, config.agent.workflow)
+        episode = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=_runtime(FakeSession(), controller, clock),
+        )
+        self.assertEqual(pilot._parser_errors(config, episode), 2)
+        self.assertEqual(
+            [step.action for step in episode.tool_steps],
+            [read, read],
+        )
+        aggregate = pilot._aggregate(
+            configuration=config,
+            episodes=(episode,),
+            manifest_difficulties=(None,),
+        )
+        self.assertEqual(aggregate["workflow_envelope_rejection_count"], 2)
+        self.assertEqual(aggregate["workflow_format_retry_count"], 2)
+        self.assertEqual(aggregate["completion_gate_block_count"], 1)
+        self.assertEqual(aggregate["repeat_gate_block_count"], 0)
+        self.assertEqual(aggregate["model_generation_count"], 5)
+        self.assertEqual(aggregate["executed_tool_action_count"], 2)
+        self.assertEqual(aggregate["productive_action_turn_cap_hits"], 1)
+        self.assertEqual(aggregate["parser_error_count"], 2)
+        self.assertEqual(aggregate["episodes_hitting_execute_turn_cap"], 1)
 
 
 if __name__ == "__main__":

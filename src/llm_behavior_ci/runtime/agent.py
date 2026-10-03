@@ -75,6 +75,7 @@ class AgentTurn:
     api_name: str | None
     rejection: str | None = None
     feedback: str | None = None
+    consumes_execute_turn: bool = True
 
 
 class AgentLoop(Protocol):

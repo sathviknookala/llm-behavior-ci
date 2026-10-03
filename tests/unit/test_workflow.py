@@ -8,10 +8,15 @@ from llm_behavior_ci.config import RunConfiguration, WorkflowSettings
 from llm_behavior_ci.runtime.agent import AgentTurn, SmolagentsVLLMAgent
 from llm_behavior_ci.runtime.appworld import TaskContext, ToolResult
 from llm_behavior_ci.runtime.workflow import (
+    FORMAT_RETRY_LIMIT,
     WorkflowControlledAgent,
     WorkflowEnvelopeError,
+    account_workflow_trace,
     canonical_action,
     parse_workflow_envelope,
+    parse_workflow_envelope_v2,
+    ready_to_complete,
+    unfinished_step_ids,
     workflow_instruction,
     workflow_output_has_parseable_action,
 )
@@ -89,6 +94,34 @@ def _payload() -> dict[str, object]:
         "run_seed": 7,
         "git_commit": "a" * 40,
     }
+
+
+def _settings_v2(**overrides: object) -> WorkflowSettings:
+    return _settings(policy="plan_progress_v2", **overrides)
+
+
+def _first_v2(action: str, plan: list[str] | None = None, active: int = 1) -> str:
+    return json.dumps(
+        {
+            "plan": list(plan or _PLAN),
+            "active_step": active,
+            "action": action,
+        }
+    )
+
+
+def _later_v2(
+    action: str,
+    mark: list[int] | None = None,
+    active: int | None = 1,
+) -> str:
+    return json.dumps(
+        {
+            "mark_completed": list(mark or []),
+            "active_step": active,
+            "action": action,
+        }
+    )
 
 
 def _settings(**overrides: object) -> WorkflowSettings:
@@ -725,8 +758,12 @@ class WorkflowControllerTests(unittest.TestCase):
 
     def test_controller_source_does_not_read_ground_truth(self) -> None:
         source = Path(workflow_module.__file__).read_text(encoding="utf-8")
+        lowered = source.lower()
         self.assertNotIn("ground_truth", source)
+        self.assertNotIn("ground truth", lowered)
         self.assertNotIn(".evaluate(", source)
+        self.assertNotIn("evaluator", lowered)
+        self.assertNotIn("requirement", lowered)
 
     def test_extra_instruction_is_request_local(self) -> None:
         agent = SmolagentsVLLMAgent("http://127.0.0.1:9")
@@ -772,6 +809,458 @@ class WorkflowControllerTests(unittest.TestCase):
         self.assertEqual(history, ["tool said ok", "not an action"])
         self.assertEqual(agent._state().history[0]["role"], "user")
         self.assertEqual(agent._state().history[1]["role"], "assistant")
+
+
+class WorkflowV2Tests(unittest.TestCase):
+    def test_first_turn_accepts_a_bounded_plan_and_one_action(self) -> None:
+        for count in (2, 5):
+            with self.subTest(steps=count):
+                plan = [f"Step {index}" for index in range(1, count + 1)]
+                controller, base = _boot(
+                    [_first_v2(_SHOW, plan=plan, active=count)],
+                    _settings_v2(),
+                )
+                turn = controller.next_turn(tool_output=None)
+                state = controller._state()
+                self.assertIsNone(turn.rejection)
+                self.assertEqual(turn.action, _SHOW)
+                self.assertEqual(state.plan, tuple(plan))
+                self.assertEqual(state.completed_steps, frozenset())
+                self.assertEqual(state.active_step, count)
+                self.assertEqual(unfinished_step_ids(state), tuple(range(1, count + 1)))
+                self.assertFalse(ready_to_complete(state))
+                self.assertEqual(base.generations, 1)
+                instruction = base.calls[0]["extra_instruction"]
+                assert isinstance(instruction, str)
+                self.assertIn("WORKFLOW CONTROLLER: plan_progress_v2", instruction)
+                self.assertIn("2 to 5", instruction)
+                self.assertNotIn("Authoritative plan:", instruction)
+                self.assertNotIn("evaluator", instruction.lower())
+                self.assertNotIn("ground truth", instruction.lower())
+
+    def test_first_turn_rejections_do_not_claim_progress(self) -> None:
+        long_step = "x" * 121
+        cases = {
+            "one step": _first_v2(_SHOW, plan=["Only this step"]),
+            "six steps": _first_v2(_SHOW, plan=[f"Step {index}" for index in range(6)]),
+            "duplicate steps": _first_v2(
+                _SHOW,
+                plan=["Read the calendar", "Read the calendar"],
+            ),
+            "multiline step": _first_v2(_SHOW, plan=["Read the calendar", "Create\nthe event"]),
+            "too long": _first_v2(_SHOW, plan=["Read the calendar", long_step]),
+            "blank step": _first_v2(_SHOW, plan=["Read the calendar", " "]),
+            "untrimmed step": _first_v2(_SHOW, plan=["Read the calendar", " Create the event"]),
+            "active step zero": _first_v2(_SHOW, active=0),
+            "active step past the plan": _first_v2(_SHOW, active=3),
+            "null active step": json.dumps(
+                {"plan": _PLAN, "active_step": None, "action": _SHOW}
+            ),
+            "boolean active step": json.dumps(
+                {"plan": _PLAN, "active_step": True, "action": _SHOW}
+            ),
+            "missing action": json.dumps({"plan": _PLAN, "active_step": 1}),
+            "missing plan": json.dumps({"active_step": 1, "action": _SHOW}),
+            "extra completed steps": json.dumps(
+                {
+                    "plan": _PLAN,
+                    "active_step": 1,
+                    "completed_steps": [],
+                    "action": _SHOW,
+                }
+            ),
+            "extra ledger fields": json.dumps(
+                {
+                    "plan": _PLAN,
+                    "active_step": 1,
+                    "ready_to_complete": False,
+                    "unfinished_steps": [1, 2],
+                    "action": _SHOW,
+                }
+            ),
+            "premature mark": json.dumps(
+                {
+                    "plan": _PLAN,
+                    "mark_completed": [1],
+                    "active_step": 2,
+                    "action": _SHOW,
+                }
+            ),
+            "malformed json": "{",
+            "markdown fence": "```json\n" + _first_v2(_SHOW) + "\n```",
+            "json array": "[]",
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                controller, _base = _boot([text], _settings_v2())
+                turn = controller.next_turn(tool_output=None)
+                self.assertEqual(turn.rejection, "workflow_envelope_invalid")
+                self.assertIsNone(turn.action)
+                self.assertFalse(turn.consumes_execute_turn)
+                self.assertIsNone(controller._state().plan)
+                self.assertEqual(controller._state().completed_steps, frozenset())
+        prose, _base = _boot(
+            [
+                json.dumps(
+                    {
+                        "plan": _PLAN,
+                        "active_step": 1,
+                        "action": "look up the calendar",
+                    }
+                )
+            ],
+            _settings_v2(),
+        )
+        prose_turn = prose.next_turn(tool_output=None)
+        self.assertIsNone(prose_turn.action)
+        self.assertNotEqual(prose_turn.rejection, "workflow_envelope_invalid")
+        self.assertTrue(prose_turn.consumes_execute_turn)
+        self.assertEqual(prose._state().plan, tuple(_PLAN))
+        self.assertEqual(prose._state().completed_steps, frozenset())
+        stopped, _base = _boot(
+            [
+                json.dumps(
+                    {"plan": _PLAN, "active_step": 1, "action": "STOP"}
+                )
+            ],
+            _settings_v2(),
+        )
+        stop_turn = stopped.next_turn(tool_output=None)
+        self.assertIn("STOP", stop_turn.rejection or "")
+        self.assertTrue(stop_turn.consumes_execute_turn)
+        self.assertEqual(stopped._state().completed_steps, frozenset())
+
+    def test_incremental_updates_are_monotonic_and_derived(self) -> None:
+        waiting, _base = _boot(
+            [_first_v2(_SHOW), _later_v2(_CREATE, mark=[])],
+            _settings_v2(),
+        )
+        waiting.next_turn(tool_output=None)
+        waiting.next_turn(tool_output=None)
+        self.assertEqual(waiting._state().executed_tool_actions, 0)
+        self.assertEqual(waiting._state().no_progress_turns, 0)
+        self.assertEqual(waiting._state().completed_steps, frozenset())
+        delete = "apis.calendar.delete_event(event_id=1)"
+        controller, base = _boot(
+            [
+                _first_v2(_SHOW, active=1),
+                _later_v2(_CREATE, mark=[], active=1),
+                _later_v2(_CREATE_OTHER, mark=[1], active=2),
+                _later_v2(delete, mark=[1], active=2),
+                _later_v2("apis.calendar.delete_event(event_id=2)", mark=[1, 2], active=None),
+            ],
+            _settings_v2(),
+        )
+        first = controller.next_turn(tool_output=None)
+        controller.observe_tool_result(first.action or "", _ok())
+        empty = controller.next_turn(tool_output="ok")
+        self.assertIsNone(empty.rejection)
+        self.assertEqual(controller._state().completed_steps, frozenset())
+        self.assertEqual(unfinished_step_ids(controller._state()), (1, 2))
+        self.assertFalse(ready_to_complete(controller._state()))
+        self.assertEqual(controller._state().no_progress_turns, 1)
+        controller.observe_tool_result(empty.action or "", _ok())
+        one = controller.next_turn(tool_output="ok")
+        self.assertIsNone(one.rejection)
+        self.assertEqual(controller._state().completed_steps, frozenset({1}))
+        self.assertEqual(unfinished_step_ids(controller._state()), (2,))
+        self.assertFalse(ready_to_complete(controller._state()))
+        self.assertEqual(controller._state().no_progress_turns, 0)
+        self.assertEqual(controller._state().active_step, 2)
+        later_instruction = base.calls[1]["extra_instruction"]
+        assert isinstance(later_instruction, str)
+        self.assertIn('"mark_completed"', later_instruction)
+        self.assertNotIn("evaluator", later_instruction.lower())
+        controller.observe_tool_result(one.action or "", _ok())
+        again = controller.next_turn(tool_output="ok")
+        self.assertIsNone(again.rejection)
+        self.assertEqual(controller._state().completed_steps, frozenset({1}))
+        self.assertEqual(controller._state().no_progress_turns, 1)
+        controller.observe_tool_result(again.action or "", _ok())
+        both = controller.next_turn(tool_output="ok")
+        self.assertIsNone(both.rejection)
+        self.assertEqual(controller._state().completed_steps, frozenset({1, 2}))
+        self.assertEqual(unfinished_step_ids(controller._state()), ())
+        self.assertTrue(ready_to_complete(controller._state()))
+        self.assertIsNone(controller._state().active_step)
+        finished = workflow_instruction(controller._state(), _settings_v2())
+        self.assertIn("ready_to_complete: true", finished)
+        self.assertIn("complete_task(...) is now permitted", finished)
+        controller.observe_tool_result(both.action or "", _err())
+        self.assertEqual(controller._state().completed_steps, frozenset({1, 2}))
+
+        invalid = {
+            "unknown step": _later_v2(_SHOW, mark=[9], active=1),
+            "duplicate mark": _later_v2(_SHOW, mark=[1, 1], active=2),
+            "boolean mark": json.dumps(
+                {"mark_completed": [True], "active_step": 1, "action": _SHOW}
+            ),
+            "completed step stays active": _later_v2(_SHOW, mark=[1], active=1),
+            "null while unfinished": _later_v2(_SHOW, mark=[], active=None),
+            "number while complete": _later_v2(_SHOW, mark=[1, 2], active=1),
+            "reintroduced plan": json.dumps(
+                {
+                    "plan": _PLAN,
+                    "mark_completed": [],
+                    "active_step": 1,
+                    "action": _SHOW,
+                }
+            ),
+            "echoed ledger": json.dumps(
+                {
+                    "mark_completed": [],
+                    "completed_steps": [1],
+                    "unfinished_steps": [2],
+                    "ready_to_complete": False,
+                    "active_step": 2,
+                    "action": _SHOW,
+                }
+            ),
+        }
+        for label, text in invalid.items():
+            with self.subTest(case=label):
+                fresh, _base = _boot(
+                    [_first_v2(_SHOW), text],
+                    _settings_v2(),
+                )
+                fresh.next_turn(tool_output=None)
+                fresh.observe_tool_result(_SHOW, _ok())
+                before = _snapshot(fresh)
+                turn = fresh.next_turn(tool_output="ok")
+                self.assertEqual(turn.rejection, "workflow_envelope_invalid")
+                self.assertIsNone(turn.action)
+                self.assertEqual(_snapshot(fresh), before)
+
+    def test_completion_uses_the_derived_ledger_only(self) -> None:
+        blocked, base = _boot(
+            [
+                _first_v2(_SHOW),
+                _later_v2(_DONE, mark=[1], active=2),
+            ],
+            _settings_v2(),
+        )
+        blocked.next_turn(tool_output=None)
+        blocked.observe_tool_result(_SHOW, _ok())
+        turn = blocked.next_turn(tool_output="ok")
+        self.assertEqual(turn.rejection, "workflow_completion_blocked")
+        self.assertIsNone(turn.action)
+        self.assertTrue(turn.consumes_execute_turn)
+        self.assertIn("unfinished declared", turn.feedback or "")
+        self.assertNotIn("evaluator", (turn.feedback or "").lower())
+        self.assertEqual(base.evaluate_calls, 0)
+        self.assertEqual(blocked._state().completed_steps, frozenset({1}))
+        allowed, allowed_base = _boot(
+            [
+                _first_v2(_SHOW),
+                _later_v2(_DONE, mark=[1, 2], active=None),
+            ],
+            _settings_v2(),
+        )
+        allowed.next_turn(tool_output=None)
+        done = allowed.next_turn(tool_output="ok")
+        self.assertIsNone(done.rejection)
+        self.assertEqual(done.action, _DONE)
+        self.assertEqual(done.api_name, "complete_task")
+        self.assertEqual(allowed_base.evaluate_calls, 0)
+        self.assertEqual(allowed_base.generations, 2)
+        instruction = workflow_instruction(allowed._state(), _settings_v2())
+        self.assertIn("apis.supervisor.complete_task(...) is now permitted", instruction)
+        self.assertNotIn("evaluator", instruction.lower())
+        self.assertNotIn("ready_to_complete", _later_v2(_DONE, mark=[1, 2], active=None))
+
+    def test_repeat_gate_blocks_the_third_canonical_action(self) -> None:
+        self.assertEqual(canonical_action(_CREATE), canonical_action(_SHOW_WIDE))
+        controller, _base = _boot(
+            [
+                _first_v2(_CREATE),
+                _later_v2(_CREATE, mark=[]),
+                _later_v2(_CREATE, mark=[]),
+            ],
+            _settings_v2(),
+        )
+        first = controller.next_turn(tool_output=None)
+        controller.observe_tool_result(first.action or "", _ok())
+        second = controller.next_turn(tool_output="ok")
+        self.assertIsNone(second.rejection)
+        self.assertEqual(second.action, _CREATE)
+        controller.observe_tool_result(second.action or "", _ok())
+        third = controller.next_turn(tool_output="ok")
+        self.assertEqual(third.rejection, "workflow_repeated_action_blocked")
+        self.assertIsNone(third.action)
+        self.assertTrue(third.consumes_execute_turn)
+        self.assertEqual(controller._state().executed_tool_actions, 2)
+        spaced, _base = _boot(
+            [
+                _first_v2(_CREATE),
+                _later_v2(_SHOW_WIDE, mark=[]),
+                _later_v2(_CREATE, mark=[]),
+            ],
+            _settings_v2(),
+        )
+        spaced.next_turn(tool_output=None)
+        spaced.observe_tool_result(_CREATE, _ok())
+        wide = spaced.next_turn(tool_output="ok")
+        self.assertIsNone(wide.rejection)
+        self.assertEqual(wide.action, _SHOW_WIDE.strip())
+        spaced.observe_tool_result(wide.action or "", _ok())
+        blocked = spaced.next_turn(tool_output="ok")
+        self.assertEqual(blocked.rejection, "workflow_repeated_action_blocked")
+        changed, _base = _boot(
+            [_first_v2(_CREATE), _later_v2(_CREATE_OTHER, mark=[])],
+            _settings_v2(),
+        )
+        changed.next_turn(tool_output=None)
+        changed.observe_tool_result(_CREATE, _ok())
+        other = changed.next_turn(tool_output="ok")
+        self.assertIsNone(other.rejection)
+        self.assertEqual(other.action, _CREATE_OTHER)
+        changed.observe_tool_result(other.action or "", _ok())
+        self.assertEqual(changed._state().consecutive_same_action_count, 1)
+
+    def test_stalls_follow_executed_actions_and_stay_distinct(self) -> None:
+        actions = [
+            _SHOW,
+            _CREATE,
+            _CREATE_OTHER,
+            "apis.calendar.delete_event(event_id=1)",
+        ]
+        outputs = [_first_v2(actions[0])]
+        outputs.extend(_later_v2(action, mark=[]) for action in actions[1:])
+        controller, base = _boot(outputs, _settings_v2())
+        controller.next_turn(tool_output=None)
+        controller.observe_tool_result(actions[0], _ok())
+        controller.next_turn(tool_output="ok")
+        controller.observe_tool_result(actions[1], _ok())
+        self.assertIsNone(controller._state().stall_reason)
+        self.assertEqual(controller._state().no_progress_turns, 1)
+        controller.next_turn(tool_output="ok")
+        controller.observe_tool_result(actions[2], _ok())
+        self.assertIsNone(controller._state().stall_reason)
+        self.assertEqual(controller._state().no_progress_turns, 2)
+        controller.next_turn(tool_output="ok")
+        state = controller._state()
+        self.assertEqual(state.no_progress_turns, 3)
+        self.assertEqual(state.stall_reason, "no declared plan progress for 3 action turns")
+        self.assertEqual(state.stall_event_count, 1)
+        preview = workflow_instruction(state, _settings_v2())
+        self.assertIn("STALL DETECTED: no declared plan progress for 3 action turns", preview)
+        self.assertIn("Reconsider how you are advancing the unfinished plan", preview)
+        self.assertNotIn("spotify", preview.lower())
+        self.assertNotIn("evaluator", preview.lower())
+        cleared, cleared_base = _boot(
+            [
+                _first_v2(_SHOW),
+                _later_v2(_CREATE, mark=[]),
+                _later_v2(_CREATE_OTHER, mark=[]),
+                _later_v2("apis.calendar.delete_event(event_id=1)", mark=[]),
+                _later_v2("apis.calendar.delete_event(event_id=2)", mark=[1], active=2),
+            ],
+            _settings_v2(),
+        )
+        cleared.next_turn(tool_output=None)
+        cleared.observe_tool_result(_SHOW, _ok())
+        for action in (_CREATE, _CREATE_OTHER):
+            cleared.next_turn(tool_output="ok")
+            cleared.observe_tool_result(action, _ok())
+        cleared.next_turn(tool_output="ok")
+        self.assertIsNotNone(cleared._state().stall_reason)
+        progressed = cleared.next_turn(tool_output="ok")
+        self.assertIsNone(progressed.rejection)
+        self.assertIsNone(cleared._state().stall_reason)
+        self.assertEqual(cleared._state().completed_steps, frozenset({1}))
+        follow = workflow_instruction(cleared._state(), _settings_v2())
+        self.assertNotIn("STALL DETECTED", follow)
+        self.assertEqual(cleared_base.evaluate_calls, 0)
+        repeated, _base = _boot(
+            [
+                _first_v2(_CREATE),
+                _later_v2(_CREATE, mark=[]),
+                _later_v2(_SHOW, mark=[1], active=2),
+            ],
+            _settings_v2(),
+        )
+        repeated.next_turn(tool_output=None)
+        repeated.observe_tool_result(_CREATE, _ok())
+        repeated.next_turn(tool_output="ok")
+        repeated.observe_tool_result(_CREATE, _ok())
+        self.assertEqual(
+            repeated._state().stall_reason,
+            "repeated successful action without declared workflow progress",
+        )
+        repeated.next_turn(tool_output="ok")
+        self.assertEqual(
+            repeated._state().stall_reason,
+            "repeated successful action without declared workflow progress",
+        )
+        self.assertEqual(repeated._state().completed_steps, frozenset({1}))
+        failed, _base = _boot(
+            [_first_v2(_CREATE), _later_v2(_CREATE, mark=[])],
+            _settings_v2(),
+        )
+        failed.next_turn(tool_output=None)
+        failed.observe_tool_result(_CREATE, _err())
+        failed.next_turn(tool_output="err")
+        failed.observe_tool_result(_CREATE, _err())
+        self.assertEqual(failed._state().stall_reason, "repeated failed action")
+        self.assertNotEqual(
+            failed._state().stall_reason,
+            repeated._state().stall_reason,
+        )
+
+    def test_format_retries_are_bounded_and_do_not_loop(self) -> None:
+        outputs = ["{", "{", "{", "{", _first_v2(_SHOW)]
+        controller, base = _boot(outputs, _settings_v2())
+        first = controller.next_turn(tool_output=None)
+        second = controller.next_turn(tool_output="retry")
+        third = controller.next_turn(tool_output="retry")
+        fourth = controller.next_turn(tool_output="retry")
+        self.assertFalse(first.consumes_execute_turn)
+        self.assertFalse(second.consumes_execute_turn)
+        self.assertTrue(third.consumes_execute_turn)
+        self.assertFalse(fourth.consumes_execute_turn)
+        self.assertEqual(controller._state().plan, None)
+        self.assertEqual(base.generations, 4)
+        accepted = controller.next_turn(tool_output="retry")
+        self.assertIsNone(accepted.rejection)
+        self.assertTrue(accepted.consumes_execute_turn)
+        self.assertEqual(base.generations, 5)
+        self.assertEqual(FORMAT_RETRY_LIMIT, 2)
+
+    def test_trace_accounting_separates_format_policy_and_execution(self) -> None:
+        show = _first_v2(_SHOW)
+        blocked = _later_v2(_DONE, mark=[1], active=2)
+        repeated = _later_v2(_SHOW, mark=[])
+        progressed = _later_v2(_CREATE, mark=[1], active=2)
+        generations = [
+            (0, "{"),
+            (1, "{"),
+            (2, "{"),
+            (3, show),
+            (5, repeated),
+            (7, repeated),
+            (8, blocked),
+            (9, progressed),
+        ]
+        tools = [(4, _SHOW, False), (6, _SHOW, False), (10, _CREATE, False)]
+        accounted = account_workflow_trace(generations, tools, _settings_v2())
+        self.assertEqual(accounted.model_generation_count, 8)
+        self.assertEqual(accounted.workflow_envelope_rejection_count, 3)
+        self.assertEqual(accounted.workflow_format_retry_count, 2)
+        self.assertEqual(accounted.completion_gate_block_count, 1)
+        self.assertEqual(accounted.repeat_gate_block_count, 1)
+        self.assertEqual(accounted.executed_tool_action_count, 3)
+        self.assertEqual(accounted.productive_model_turns, 6)
+        self.assertTrue(
+            workflow_output_has_parseable_action(blocked)
+        )
+        self.assertFalse(workflow_output_has_parseable_action("{"))
+        self.assertGreaterEqual(accounted.stall_event_count, 1)
+        with self.assertRaises(WorkflowEnvelopeError):
+            parse_workflow_envelope_v2(
+                "{",
+                state=workflow_module.WorkflowState(),
+                settings=_settings_v2(),
+            )
 
 
 if __name__ == "__main__":

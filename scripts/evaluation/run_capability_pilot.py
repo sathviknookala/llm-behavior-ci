@@ -11,6 +11,17 @@ aggregate to --output. Task ids, instructions, model text, API arguments,
 trajectories, and evaluator internals stay in the local store. When the
 local manifest omits ``appworld_setup_profile``, the matching committed
 task metadata supplies it.
+
+The aggregate keeps the existing capability metrics and adds controller
+counts: workflow-envelope rejections, repeat-gate blocks, completion-gate
+blocks, stall events, model generations, executed tool actions, productive
+action-turn-cap hits, and workflow-format retries. A workflow JSON object
+with a parseable action is not a parser error when a controller policy
+blocks it. ``episodes_hitting_execute_turn_cap`` still counts stored model
+steps. ``productive_action_turn_cap_hits`` counts episodes whose generations
+that spent an execute turn reached ``execute_max_model_turns``. For
+``plan_progress_v2``, the first two consecutive malformed envelopes in an
+attempt do not spend that budget.
 """
 
 from __future__ import annotations
@@ -38,7 +49,11 @@ from llm_behavior_ci.config import (
 )
 from llm_behavior_ci.records import EXECUTE_TERMINATIONS, EpisodeResult, ModelStep, ToolStep
 from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
-from llm_behavior_ci.runtime.workflow import workflow_output_has_parseable_action
+from llm_behavior_ci.runtime.workflow import (
+    WorkflowTraceAccounting,
+    account_workflow_trace,
+    workflow_output_has_parseable_action,
+)
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
     RuntimeUnavailable,
@@ -263,7 +278,7 @@ def _parser_errors(
     episode: EpisodeResult,
 ) -> int:
     workflow = configuration.agent.workflow
-    if workflow is not None and workflow.policy == "plan_progress_v1":
+    if workflow is not None and workflow.policy in {"plan_progress_v1", "plan_progress_v2"}:
         return sum(
             0
             if workflow_output_has_parseable_action(step.output_text)
@@ -301,6 +316,34 @@ def _success_difficulty(episode: EpisodeResult, manifest_difficulty: int | None)
     return manifest_difficulty
 
 
+def _workflow_accounting(
+    configuration: RunConfiguration,
+    episode: EpisodeResult,
+) -> WorkflowTraceAccounting:
+    generations = len(episode.model_steps)
+    executed = len(episode.tool_steps)
+    workflow = configuration.agent.workflow
+    if workflow is None:
+        return WorkflowTraceAccounting(
+            model_generation_count=generations,
+            workflow_envelope_rejection_count=0,
+            repeat_gate_block_count=0,
+            completion_gate_block_count=0,
+            stall_event_count=0,
+            executed_tool_action_count=executed,
+            productive_model_turns=generations,
+            workflow_format_retry_count=0,
+        )
+    return account_workflow_trace(
+        [(step.index, step.output_text) for step in episode.model_steps],
+        [
+            (step.index, step.action, step.error is not None)
+            for step in episode.tool_steps
+        ],
+        workflow,
+    )
+
+
 def _aggregate(
     *,
     configuration: RunConfiguration,
@@ -318,6 +361,14 @@ def _aggregate(
     repeated = 0
     token_cap_hits = 0
     turn_cap_hits = 0
+    productive_turn_cap_hits = 0
+    envelope_rejections = 0
+    repeat_blocks = 0
+    completion_blocks = 0
+    stall_events = 0
+    model_generations = 0
+    executed_actions = 0
+    format_retries = 0
     generated_tokens: list[int] = []
     termination_counts = {reason: 0 for reason in sorted(EXECUTE_TERMINATIONS)}
     for episode, manifest_difficulty in zip(episodes, manifest_difficulties, strict=True):
@@ -333,8 +384,18 @@ def _aggregate(
             other += 1
         parser_errors += _parser_errors(configuration, episode)
         repeated += _repeated_tool_calls(episode)
+        workflow_counts = _workflow_accounting(configuration, episode)
+        envelope_rejections += workflow_counts.workflow_envelope_rejection_count
+        repeat_blocks += workflow_counts.repeat_gate_block_count
+        completion_blocks += workflow_counts.completion_gate_block_count
+        stall_events += workflow_counts.stall_event_count
+        model_generations += workflow_counts.model_generation_count
+        executed_actions += workflow_counts.executed_tool_action_count
+        format_retries += workflow_counts.workflow_format_retry_count
         if len(episode.model_steps) >= turn_cap:
             turn_cap_hits += 1
+        if workflow_counts.productive_model_turns >= turn_cap:
+            productive_turn_cap_hits += 1
         for step in episode.model_steps:
             generated_tokens.append(step.generated_token_count)
             if step.generated_token_count >= token_cap:
@@ -369,6 +430,14 @@ def _aggregate(
         "execute_token_cap": token_cap,
         "episodes_hitting_execute_turn_cap": turn_cap_hits,
         "execute_turn_cap": turn_cap,
+        "productive_action_turn_cap_hits": productive_turn_cap_hits,
+        "workflow_envelope_rejection_count": envelope_rejections,
+        "repeat_gate_block_count": repeat_blocks,
+        "completion_gate_block_count": completion_blocks,
+        "stall_event_count": stall_events,
+        "model_generation_count": model_generations,
+        "executed_tool_action_count": executed_actions,
+        "workflow_format_retry_count": format_retries,
         "parser_error_count": parser_errors,
         "recoverable_tool_error_count": recoverable_errors,
         "repeated_tool_call_count": repeated,

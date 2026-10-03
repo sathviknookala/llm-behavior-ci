@@ -844,6 +844,38 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertEqual(pilot["model"]["serving"]["dtype"], "float16")
         self.assertEqual(pilot["model"]["serving"]["kv_cache_dtype"], "float16")
         self.assertNotIn("workflow", previous["agent"])
+        successor = json.loads(
+            (
+                root / "configs/models/qwen3_14b_awq_spotify_capability_v2.json"
+            ).read_text(encoding="utf-8")
+        )
+        v1_agent = dict(pilot["agent"])
+        v2_agent = dict(successor["agent"])
+        v1_workflow = dict(v1_agent.pop("workflow"))
+        v2_workflow = dict(v2_agent.pop("workflow"))
+        self.assertEqual(v1_workflow.pop("policy"), "plan_progress_v1")
+        self.assertEqual(v2_workflow.pop("policy"), "plan_progress_v2")
+        self.assertEqual(v1_workflow, v2_workflow)
+        self.assertEqual(v1_agent, v2_agent)
+        self.assertEqual(pilot["model"], successor["model"])
+
+    def test_plan_progress_v2_is_a_distinct_hashed_policy(self) -> None:
+        base = _configuration()
+        changed = RunConfiguration.from_dict(
+            _with("agent.workflow.policy", "plan_progress_v2")
+        )
+        self.assertNotEqual(
+            run_configuration_hash(base),
+            run_configuration_hash(changed),
+        )
+        self.assertEqual(
+            hashed_values(changed)["agent.workflow.policy"],
+            "plan_progress_v2",
+        )
+        for path in _WORKFLOW_LEAVES:
+            if path == "agent.workflow.policy":
+                continue
+            self.assertEqual(hashed_values(base)[path], hashed_values(changed)[path])
 
 
 if __name__ == "__main__":
