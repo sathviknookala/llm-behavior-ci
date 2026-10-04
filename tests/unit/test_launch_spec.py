@@ -56,7 +56,17 @@ class LaunchSpecTests(unittest.TestCase):
         self.assertNotIn("--quantization", spec.argv)
         self.assertNotIn("--enable-lora", spec.argv)
         self.assertNotIn("--enforce-eager", spec.argv)
+        self.assertNotIn("--cpu-offload-gb", spec.argv)
         self.assertEqual(spec.env, ((FLASHINFER_SAMPLER_ENV, "0"),))
+
+    def test_cpu_offload_reaches_the_launch_spec(self) -> None:
+        serving = replace(_model().serving, cpu_offload_gb=2.5)
+        spec = build_vllm_launch_spec(_model(serving=serving))
+        index = spec.argv.index("--cpu-offload-gb")
+        self.assertEqual(spec.argv[index + 1], "2.5")
+        healthy = build_vllm_launch_spec(_model())
+        self.assertNotIn("--cpu-offload-gb", healthy.argv)
+        self.assertNotEqual(spec.argv, healthy.argv)
 
     def test_quantization_method_reaches_the_launch_spec(self) -> None:
         quantized = _model(quantization=QuantizationSettings(method="fp8"))

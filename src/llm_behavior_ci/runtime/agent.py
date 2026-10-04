@@ -53,6 +53,7 @@ _UNCHECKED_IDENTITY_FIELDS = (
     "model.serving.enable_prefix_caching",
     "model.serving.enable_chunked_prefill",
     "model.serving.enforce_eager",
+    "model.serving.cpu_offload_gb",
     "model.serving.tensor_parallel_size",
     "model.serving.batch_invariant",
     "model.serving.sampler_backend",

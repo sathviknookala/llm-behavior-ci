@@ -45,10 +45,14 @@ def build_vllm_launch_spec(model: ModelConfiguration) -> VLLMLaunchSpec:
     present in ``env`` only when ``serving.batch_invariant`` is true.
     ``VLLM_USE_FLASHINFER_SAMPLER`` is always present, ``1`` for the
     ``flashinfer`` sampler backend and ``0`` for ``native``, so the top-k/top-p
-    sampler never falls back to vLLM's default. Every
-    other serving flag this function emits is unconditional, so the healthy
-    reference configuration (no quantization, no LoRA, batch invariance
-    off) always produces the same spec modulo those three optional pieces.
+    sampler never falls back to vLLM's default. ``--enforce-eager`` is present
+    only when ``serving.enforce_eager`` is true. ``--cpu-offload-gb`` is
+    present only when ``serving.cpu_offload_gb`` is greater than zero, which
+    is also the value omitted from canonical JSON. Every other serving flag
+    this function emits is unconditional, so the healthy reference
+    configuration (no quantization, no LoRA, batch invariance off, eager
+    execution off, no CPU offload) always produces the same spec modulo
+    those optional pieces.
     """
 
     if not isinstance(model, ModelConfiguration):
@@ -93,6 +97,8 @@ def build_vllm_launch_spec(model: ModelConfiguration) -> VLLMLaunchSpec:
     )
     if serving.enforce_eager:
         argv.append("--enforce-eager")
+    if serving.cpu_offload_gb > 0.0:
+        argv.extend(["--cpu-offload-gb", str(serving.cpu_offload_gb)])
     if model.quantization.method != "none":
         argv.extend(["--quantization", model.quantization.method])
     if model.lora is not None:
