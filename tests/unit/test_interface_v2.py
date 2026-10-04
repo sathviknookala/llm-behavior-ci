@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from llm_behavior_ci.config import (
+    MISSING_HASHED_LEAF,
     AgentConfiguration,
     ModelConfiguration,
     RunConfiguration,
@@ -436,6 +437,74 @@ class InterfaceV2Tests(unittest.TestCase):
                     "prompt-runtime-auth-v1",
                     PROMPT_RUNTIME_AUTH_V2,
                 )
+            },
+        )
+
+    def test_32b_config_changes_only_model_identity_and_memory_fit(self) -> None:
+        corrected = _configuration(
+            "qwen3_14b_awq_spotify_capability_v2_interface.json"
+        )
+        candidate = _configuration(
+            "qwen3_32b_awq_spotify_capability_v2_interface.json"
+        )
+        self.assertEqual(candidate.agent, corrected.agent)
+        self.assertEqual(candidate.agent.workflow.policy, "plan_progress_v2")
+        self.assertEqual(candidate.agent.prompt.prompt_version, PROMPT_RUNTIME_AUTH_V2)
+        self.assertEqual(candidate.model.model.repository, "Qwen/Qwen3-32B-AWQ")
+        self.assertEqual(
+            candidate.model.model.revision,
+            "0499c3ac83fdef8810b907a23894ba91e95eddd8",
+        )
+        self.assertEqual(candidate.model.tokenizer, candidate.model.model)
+        self.assertEqual(candidate.model.quantization.method, "awq")
+        self.assertEqual(candidate.model.serving.dtype, "float16")
+        self.assertEqual(candidate.model.serving.kv_cache_dtype, "float16")
+        self.assertEqual(candidate.model.serving.max_model_len, 22528)
+        self.assertEqual(candidate.model.serving.gpu_memory_utilization, 0.97)
+        self.assertEqual(candidate.model.serving.max_num_batched_tokens, 4096)
+        self.assertEqual(candidate.model.serving.cpu_offload_gb, 2.0)
+        self.assertTrue(candidate.model.serving.enforce_eager)
+        self.assertEqual(candidate.model.serving.max_num_seqs, 1)
+        self.assertFalse(candidate.model.serving.enable_prefix_caching)
+        digest = run_configuration_hash(candidate)
+        self.assertEqual(
+            digest,
+            run_configuration_hash(
+                _configuration("qwen3_32b_awq_spotify_capability_v2_interface.json")
+            ),
+        )
+        self.assertEqual(
+            digest,
+            "d7ddbb5db23642a1855c3e9921c789b8e700d32a0ef14273cd74d1c992f78fb0",
+        )
+        left = hashed_values(corrected)
+        right = hashed_values(candidate)
+        changed = {
+            path: (left[path], right[path])
+            for path in left
+            if left[path] != right[path]
+        }
+        self.assertEqual(
+            changed,
+            {
+                "model.model.repository": ("Qwen/Qwen3-14B-AWQ", "Qwen/Qwen3-32B-AWQ"),
+                "model.model.revision": (
+                    "31c69efc29464b6bb0aee1398b5a7b50a99340c3",
+                    "0499c3ac83fdef8810b907a23894ba91e95eddd8",
+                ),
+                "model.serving.cpu_offload_gb": (MISSING_HASHED_LEAF, 2.0),
+                "model.serving.enforce_eager": (False, True),
+                "model.serving.gpu_memory_utilization": (0.8, 0.97),
+                "model.serving.max_model_len": (32768, 22528),
+                "model.serving.max_num_batched_tokens": (8192, 4096),
+                "model.tokenizer.repository": (
+                    "Qwen/Qwen3-14B-AWQ",
+                    "Qwen/Qwen3-32B-AWQ",
+                ),
+                "model.tokenizer.revision": (
+                    "31c69efc29464b6bb0aee1398b5a7b50a99340c3",
+                    "0499c3ac83fdef8810b907a23894ba91e95eddd8",
+                ),
             },
         )
 
