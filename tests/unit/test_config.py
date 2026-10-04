@@ -58,6 +58,7 @@ _REPLACEMENTS = {
     "model.serving.enable_prefix_caching": True,
     "model.serving.enable_chunked_prefill": True,
     "model.serving.enforce_eager": True,
+    "model.serving.cpu_offload_gb": 2.0,
     "model.serving.tensor_parallel_size": 2,
     "model.serving.max_logprobs": 21,
     "model.serving.batch_invariant": True,
@@ -127,6 +128,7 @@ def _payload() -> dict[str, object]:
                 "enable_prefix_caching": False,
                 "enable_chunked_prefill": False,
                 "enforce_eager": False,
+                "cpu_offload_gb": 1.0,
                 "tensor_parallel_size": 1,
                 "max_logprobs": 20,
                 "batch_invariant": False,
@@ -693,6 +695,82 @@ class OptionalHashedLeafTests(unittest.TestCase):
                     "lora": {"repository": "org/adapter"},
                 }
             )
+
+    def test_default_cpu_offload_is_omitted_and_keeps_existing_hashes(self) -> None:
+        payload = _payload()
+        del payload["model"]["serving"]["cpu_offload_gb"]
+        omitted = RunConfiguration.from_dict(payload)
+        self.assertEqual(omitted.model.serving.cpu_offload_gb, 0.0)
+        self.assertNotIn("cpu_offload_gb", omitted.model.serving.to_dict())
+        self.assertIs(
+            hashed_values(omitted)["model.serving.cpu_offload_gb"],
+            MISSING_HASHED_LEAF,
+        )
+        explicit = RunConfiguration.from_dict(_with("model.serving.cpu_offload_gb", 0.0))
+        self.assertEqual(explicit.model.serving.cpu_offload_gb, 0.0)
+        self.assertEqual(
+            run_configuration_hash(explicit),
+            run_configuration_hash(omitted),
+        )
+        offloaded = RunConfiguration.from_dict(_with("model.serving.cpu_offload_gb", 2.5))
+        self.assertEqual(offloaded.model.serving.cpu_offload_gb, 2.5)
+        self.assertEqual(offloaded.model.serving.to_dict()["cpu_offload_gb"], 2.5)
+        self.assertNotEqual(
+            run_configuration_hash(offloaded),
+            run_configuration_hash(omitted),
+        )
+        self.assertEqual(
+            hashed_values(offloaded)["model.serving.cpu_offload_gb"],
+            2.5,
+        )
+        for bad in (-1.0, True, 1, float("nan"), "1.0"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ConfigError):
+                    RunConfiguration.from_dict(_with("model.serving.cpu_offload_gb", bad))
+
+        root = Path(configuration_module.__file__).parents[2]
+        task = TaskConfiguration.from_dict(
+            {
+                "appworld_version": "0.1.3.post1",
+                "split": "train",
+                "selection_rule": "fixed_spotify_capability",
+                "selection_seed": 17,
+                "task_count": 20,
+                "task_set_hash": "a20fe52d28164e1d458266331c242277788d2ed0af29b054b7df926345db3a04",
+                "appworld_setup_profile": "spotify_authenticated_v1",
+            }
+        )
+        expected = {
+            "qwen3_14b_awq_spotify_capability.json": (
+                "165c1a0fcbd3851d77068666562d0c749517a640927dec0393fe3fb055a3fa37"
+            ),
+            "qwen3_14b_awq_spotify_capability_v2.json": (
+                "a4b2b909503bbde2380983b3161a1e4d88ae26e51e0b398c46200210cef05d70"
+            ),
+            "qwen3_14b_awq_spotify_capability_v2_interface.json": (
+                "b58eae2cd1a5b01d21076dbf453c72e22296d7faee833f970b7c655a1a7bf43b"
+            ),
+            "qwen3_4b_production.json": (
+                "573c849928904174962bc6e22c0c18d2b8adbe1b81efbe6479956492ecc622f7"
+            ),
+            "qwen3_4b_spotify_capability.json": (
+                "a033866b6ef626cd60eb31fdf6a1f46675fedf47dad01eb5470b7ca2bee13d3f"
+            ),
+        }
+        for name, digest in expected.items():
+            with self.subTest(name=name):
+                document = json.loads((root / "configs" / "models" / name).read_text())
+                self.assertNotIn("cpu_offload_gb", document["model"]["serving"])
+                configuration = RunConfiguration(
+                    model=ModelConfiguration.from_dict(document["model"]),
+                    agent=AgentConfiguration.from_dict(document["agent"]),
+                    task=task,
+                    run_seed=17,
+                    git_commit="a" * 40,
+                    protocol_hash=None,
+                )
+                self.assertEqual(configuration.model.serving.cpu_offload_gb, 0.0)
+                self.assertEqual(run_configuration_hash(configuration), digest)
 
     def test_hashed_values_reads_unset_optional_leaves_as_missing(self) -> None:
         payload = _payload()

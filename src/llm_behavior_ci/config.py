@@ -32,6 +32,7 @@ model.serving.kv_cache_dtype
 model.serving.enable_prefix_caching
 model.serving.enable_chunked_prefill
 model.serving.enforce_eager
+model.serving.cpu_offload_gb
 model.serving.tensor_parallel_size
 model.serving.max_logprobs
 model.serving.batch_invariant
@@ -107,21 +108,24 @@ agent.api_docs_app, agent.execute_max_model_turns, agent.tool_access_profile,
 agent.sampling.execute_max_tokens, agent.sampling.plan_max_tokens,
 agent.workflow.policy, agent.workflow.repeat_action_limit,
 agent.workflow.no_progress_turns, agent.workflow.completion_gate,
-agent.workflow.max_plan_steps, and
+agent.workflow.max_plan_steps,
+model.serving.cpu_offload_gb, and
 task.appworld_setup_profile are
 optional hashed leaves: ``ModelConfiguration.lora``,
 ``AgentConfiguration.api_docs_version``/``api_docs_app``,
 ``AgentConfiguration.execute_max_model_turns``,
 ``AgentConfiguration.tool_access_profile``, the two mode-specific
-``SamplingSettings`` token caps, ``AgentConfiguration.workflow``, and
-``TaskConfiguration.appworld_setup_profile``
+``SamplingSettings`` token caps, ``AgentConfiguration.workflow``,
+``TaskConfiguration.appworld_setup_profile``, and
+``VLLMBehaviorSettings.cpu_offload_gb``
 default to unset, and an unset leaf is omitted from canonical JSON entirely rather
 than serialized as null, so a configuration that never names a LoRA
 adapter, a corrupted API-documentation source, a tool-access profile,
-a workflow controller, or an AppWorld setup profile
-hashes identically to one built before these fields existed. Setting,
-clearing, or changing any of them still changes the digest, because
-canonical JSON then differs.
+a workflow controller, an AppWorld setup profile, or CPU weight offload
+hashes identically to one built before these fields existed. ``cpu_offload_gb``
+defaults to ``0`` and is omitted at that default, which is the no-offload
+launch. Setting, clearing, or changing any of them still changes the digest,
+because canonical JSON then differs.
 ``leaf_value``/``hashed_values`` read these leaves through
 ``MISSING_HASHED_LEAF`` rather than raising, so a caller comparing two
 configurations' hashed fields sees "unset" as one comparable value
@@ -165,6 +169,7 @@ HASHED_FIELDS = frozenset(
         "model.serving.enable_prefix_caching",
         "model.serving.enable_chunked_prefill",
         "model.serving.enforce_eager",
+        "model.serving.cpu_offload_gb",
         "model.serving.tensor_parallel_size",
         "model.serving.max_logprobs",
         "model.serving.batch_invariant",
@@ -539,6 +544,7 @@ class VLLMBehaviorSettings:
     max_logprobs: int
     batch_invariant: bool
     sampler_backend: str
+    cpu_offload_gb: float = 0.0
 
     def __post_init__(self) -> None:
         _choice(self.dtype, MODEL_DTYPES, "dtype")
@@ -554,9 +560,13 @@ class VLLMBehaviorSettings:
         _positive(self.max_logprobs, "max_logprobs")
         _flag(self.batch_invariant, "batch_invariant")
         _choice(self.sampler_backend, SAMPLER_BACKENDS, "sampler_backend")
+        _nonnegative_float(self.cpu_offload_gb, "cpu_offload_gb")
 
     def to_dict(self) -> dict[str, object]:
-        return _plain_dict(self, VLLMBehaviorSettings)
+        document = _plain_dict(self, VLLMBehaviorSettings)
+        if document["cpu_offload_gb"] == 0.0:
+            del document["cpu_offload_gb"]
+        return document
 
     @classmethod
     def from_dict(
@@ -565,7 +575,7 @@ class VLLMBehaviorSettings:
         name: str = "serving",
     ) -> VLLMBehaviorSettings:
         mapping = _object(payload, name)
-        _require_fields(mapping, cls, name)
+        _require_fields(mapping, cls, name, optional=frozenset({"cpu_offload_gb"}))
         return _construct(name, lambda: _load(cls, mapping))
 
 
