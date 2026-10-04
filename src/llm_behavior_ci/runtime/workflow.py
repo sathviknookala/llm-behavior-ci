@@ -11,6 +11,7 @@ from llm_behavior_ci.config import RunConfiguration, WorkflowSettings
 from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
 from llm_behavior_ci.runtime.agent import AgentTurn, SmolagentsVLLMAgent
 from llm_behavior_ci.runtime.appworld import TaskContext, ToolResult
+from llm_behavior_ci.runtime.prompts import PROMPT_RUNTIME_AUTH_V2
 
 _MIN_PLAN_STEPS = 2
 _MAX_PLAN_STEP_CHARS = 120
@@ -70,6 +71,13 @@ _COMPLETION_FEEDBACK_V2 = (
     "advances an unfinished step. Do not call complete_task "
     "until every declared plan step is complete."
 )
+_API_ERROR_RECOVERY = (
+    "The previous API call was rejected.\n"
+    "\n"
+    "Read the returned error message and correct the offending API name "
+    "or argument.\n"
+    "Do not blindly repeat the same invalid call unchanged."
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +111,7 @@ class WorkflowState:
     stall_reason: str | None = None
     stall_event_count: int = 0
     consecutive_format_rejections: int = 0
+    recoverable_api_error_pending: bool = False
 
 
 class WorkflowEnvelopeError(ValueError):
@@ -593,6 +602,7 @@ class WorkflowControlledAgent:
         if config.agent.workflow != self._settings:
             raise ValueError("workflow settings do not match runtime controller")
         self._local.state = WorkflowState()
+        self._local.prompt_version = config.agent.prompt.prompt_version
         self._base_agent.begin(context, config)
 
     def teacher_force_plan(
@@ -609,6 +619,10 @@ class WorkflowControlledAgent:
     def next_turn(self, *, tool_output: str | None) -> AgentTurn:
         state = self._state()
         instruction = workflow_instruction(state, self._settings)
+        if state.recoverable_api_error_pending:
+            if getattr(self._local, "prompt_version", None) == PROMPT_RUNTIME_AUTH_V2:
+                instruction = f"{instruction}\n\n{_API_ERROR_RECOVERY}"
+            state.recoverable_api_error_pending = False
         raw = self._base_agent.generate_turn(
             tool_output=tool_output,
             extra_instruction=instruction,
@@ -788,6 +802,9 @@ class WorkflowControlledAgent:
             state.last_action_key = key
             state.consecutive_same_action_count = 1
         state.last_action_had_error = result.error_message is not None
+        state.recoverable_api_error_pending = (
+            result.error_message is not None and result.recoverable
+        )
         if state.consecutive_same_action_count >= self._settings.repeat_action_limit:
             if result.error_message is not None:
                 _assign_stall(state, "repeated failed action")

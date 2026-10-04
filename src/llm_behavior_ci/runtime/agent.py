@@ -16,8 +16,9 @@ from llm_behavior_ci.runtime.api_docs import (
     ApiDocsCorruptionError,
     resolve_api_documentation,
 )
-from llm_behavior_ci.runtime.appworld import TaskContext
+from llm_behavior_ci.runtime.appworld import TaskContext, render_api_documentation
 from llm_behavior_ci.runtime.prompts import (
+    PROMPT_RUNTIME_AUTH_V2,
     UnknownPromptVersion,
     render_system_text,
 )
@@ -481,9 +482,16 @@ class SmolagentsVLLMAgent(_SmolModel):
     def _api_documentation(self) -> str:
         state = self._state()
         agent = state.config.agent
+        text = state.context.api_documentation
+        source = getattr(state.context, "api_documentation_source", None)
+        if (
+            agent.prompt.prompt_version == PROMPT_RUNTIME_AUTH_V2
+            and source is not None
+        ):
+            text = render_api_documentation(source, include_constraints=True)
         try:
             return resolve_api_documentation(
-                state.context.api_documentation,
+                text,
                 api_docs_version=agent.api_docs_version,
                 api_docs_app=agent.api_docs_app,
             )

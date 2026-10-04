@@ -15,6 +15,8 @@ class PlanFormatTemplate:
     format_body: str
 
 
+PROMPT_RUNTIME_AUTH_V2 = "prompt-runtime-auth-v2"
+
 _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
     "prompt-v1": PromptTemplate(
         version="prompt-v1",
@@ -116,6 +118,17 @@ _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
             "Use tool results to progress toward the requested task.\n"
         ),
     ),
+    PROMPT_RUNTIME_AUTH_V2: PromptTemplate(
+        version=PROMPT_RUNTIME_AUTH_V2,
+        system_body=(
+            "You are an AppWorld tool-using agent.\n"
+            "Follow the task instruction and the API documentation.\n"
+            "Mutate state only through AppWorld-executed actions.\n"
+            "Do not invent APIs that are absent from the documentation.\n"
+            "Authentication and session credentials are managed by the runtime.\n"
+            "Use tool results to progress toward the requested task.\n"
+        ),
+    ),
 }
 
 _PLAN_FORMAT_REGISTRY: dict[str, PlanFormatTemplate] = {
@@ -153,6 +166,64 @@ _NATIVE_CODE_EXECUTE = (
     "Pass every argument by keyword.\n"
     "Do not repeat a call that just failed.\n"
     "When the task is done, call apis.supervisor.complete_task(...).\n"
+)
+
+_RUNTIME_AUTH_V2_EXECUTE = (
+    "Emit exactly one AppWorld-native Python API call per turn, "
+    "of the form apis.<app>.<api>(...).\n"
+    "The workflow JSON action field must contain exactly one "
+    "Python-style API call string.\n"
+    "Outer response: JSON\n"
+    '"action" value: Python-style API call string\n'
+    "\n"
+    "Use argument=value.\n"
+    "Do not use argument:value.\n"
+    "\n"
+    "Inside API calls use Python literals:\n"
+    "True\n"
+    "False\n"
+    "None\n"
+    "Do not use JSON literals:\n"
+    "true\n"
+    "false\n"
+    "null\n"
+    "\n"
+    "Correct:\n"
+    '{"action": "apis.spotify.show_playlist(playlist_id=37)"}\n'
+    '{"action": "apis.spotify.search_songs(page_index=0, page_limit=20)"}\n'
+    "\n"
+    "Object instead of call string is invalid:\n"
+    '{"action": {"apis.spotify.show_playlist": {"playlist_id": 37}}}\n'
+    '{"action": {"app_name": "spotify", "api_name": "show_playlist", '
+    '"params": {"playlist_id": 37}}}\n'
+    "\n"
+    "Colon syntax instead of assignment is invalid:\n"
+    "apis.spotify.search_songs(page_limit:20)\n"
+    "Correct:\n"
+    "apis.spotify.search_songs(page_limit=20)\n"
+    "\n"
+    "Pass every argument by keyword.\n"
+    "Do not emit prose, Markdown fences, or any wrapper syntax "
+    "around the call.\n"
+    "Do not repeat a call that just failed.\n"
+    "\n"
+    "If the task asks you to modify the environment rather than answer "
+    "a question:\n"
+    "- perform the requested changes;\n"
+    "- verify the required changes using available APIs when necessary;\n"
+    "- call complete_task only after the requested work is complete;\n"
+    "- leave the complete_task answer empty;\n"
+    "- do not put a prose status summary in the answer field.\n"
+    "The complete_task arguments are answer and status. "
+    "An empty answer is answer=None. "
+    "status defaults to \"success\" and is one of \"success\" or \"fail\".\n"
+    "For that empty answer, call "
+    "apis.supervisor.complete_task(answer=None).\n"
+    "\n"
+    "If the task asks a question rather than requesting a world mutation:\n"
+    "- put the requested answer in the complete_task answer field;\n"
+    "- provide the actual requested value/entity;\n"
+    "- do not substitute a progress message or generic success statement.\n"
 )
 
 
@@ -221,6 +292,8 @@ def render_system_text(
 
 def _execute_instruction(*, prompt_version: str, action_interface: str) -> str:
     if action_interface == "code":
+        if prompt_version == PROMPT_RUNTIME_AUTH_V2:
+            return _RUNTIME_AUTH_V2_EXECUTE
         if prompt_version in {
             "prompt-v2",
             "prompt-v3",
@@ -230,7 +303,12 @@ def _execute_instruction(*, prompt_version: str, action_interface: str) -> str:
             return _NATIVE_CODE_EXECUTE
         return _LEGACY_CODE_EXECUTE
     if action_interface == "tool_calling":
-        if prompt_version in {"prompt-v2", "prompt-v4", "prompt-runtime-auth-v1"}:
+        if prompt_version in {
+            "prompt-v2",
+            "prompt-v4",
+            "prompt-runtime-auth-v1",
+            PROMPT_RUNTIME_AUTH_V2,
+        }:
             raise ValueError(
                 f"{prompt_version} does not support tool_calling action interface"
             )

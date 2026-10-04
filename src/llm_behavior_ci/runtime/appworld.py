@@ -12,6 +12,7 @@ class TaskContext:
     task_id: str
     instruction: str
     api_documentation: str
+    api_documentation_source: object | None = None
 
 
 @dataclass(frozen=True)
@@ -57,7 +58,21 @@ def _is_sequence(value: object) -> bool:
     return isinstance(value, (list, tuple))
 
 
-def _parameter_text(parameters: object) -> str:
+def _constraint_suffix(item: Mapping[str, object]) -> str:
+    raw = item.get("constraints")
+    if not isinstance(raw, list):
+        return ""
+    phrases = [
+        " ".join(entry.split())
+        for entry in raw
+        if isinstance(entry, str) and entry.strip() != ""
+    ]
+    if not phrases:
+        return ""
+    return "  # " + "; ".join(phrases)
+
+
+def _parameter_text(parameters: object, *, include_constraints: bool = False) -> str:
     parts: list[str] = []
     if isinstance(parameters, Mapping):
         required = parameters.get("required", [])
@@ -87,11 +102,19 @@ def _parameter_text(parameters: object) -> str:
             piece = f"{name}:{type_name}"
         if not item.get("required"):
             piece += "?"
+        if include_constraints:
+            piece += _constraint_suffix(item)
         parts.append(piece)
     return ", ".join(parts)
 
 
-def _api_line(app_name: str, api_name: str, doc: object) -> str:
+def _api_line(
+    app_name: str,
+    api_name: str,
+    doc: object,
+    *,
+    include_constraints: bool = False,
+) -> str:
     description = ""
     parameters: object = []
     if isinstance(doc, Mapping):
@@ -99,13 +122,20 @@ def _api_line(app_name: str, api_name: str, doc: object) -> str:
         if isinstance(raw_description, str):
             description = " ".join(raw_description.split())
         parameters = doc.get("parameters", [])
-    parameter_text = _parameter_text(parameters)
+    parameter_text = _parameter_text(
+        parameters,
+        include_constraints=include_constraints,
+    )
     if parameter_text:
         return f"{app_name}.{api_name}: {description} | {parameter_text}"
     return f"{app_name}.{api_name}: {description}"
 
 
-def render_api_documentation(documentation: object) -> str:
+def render_api_documentation(
+    documentation: object,
+    *,
+    include_constraints: bool = False,
+) -> str:
     """Turn AppWorld's API-doc collection into line-oriented prompt text.
 
     A string is kept unchanged so fakes and already-rendered text stay
@@ -113,6 +143,11 @@ def render_api_documentation(documentation: object) -> str:
     API, apps and APIs sorted, with the description and parameter name and
     type. That is the form ``api-docs-corrupt-v1`` can redact, and it drops
     response schemas. Anything else falls back to ``str``.
+
+    ``include_constraints`` appends each parameter's stored ``constraints``
+    list as a comment. The default omits those comments, which is the
+    rendering ``prompt-runtime-auth-v1`` still shows. Constraints are copied
+    from the metadata; a parameter with none gets no comment.
     """
 
     if documentation is None:
@@ -129,7 +164,14 @@ def render_api_documentation(documentation: object) -> str:
         if not isinstance(apis, Mapping):
             return str(documentation)
         for api_name in sorted(apis, key=str):
-            lines.append(_api_line(str(app_name), str(api_name), apis[api_name]))
+            lines.append(
+                _api_line(
+                    str(app_name),
+                    str(api_name),
+                    apis[api_name],
+                    include_constraints=include_constraints,
+                )
+            )
     if not lines:
         return ""
     return "\n".join(lines) + "\n"
@@ -815,10 +857,12 @@ class LiveAppWorldSession:
             self._open_world()
         task = self._world.task
         raw_docs = self._visible_documentation(getattr(task, "api_docs", ""))
+        source = raw_docs if isinstance(raw_docs, Mapping) else None
         return TaskContext(
             task_id=self._task_id,
             instruction=task.instruction,
             api_documentation=render_api_documentation(raw_docs),
+            api_documentation_source=source,
         )
 
     def execute(self, action: str) -> ToolResult:

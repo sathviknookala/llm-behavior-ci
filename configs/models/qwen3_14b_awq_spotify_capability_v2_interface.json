@@ -1,0 +1,60 @@
+{
+  "model": {
+    "model": {
+      "repository": "Qwen/Qwen3-14B-AWQ",
+      "revision": "31c69efc29464b6bb0aee1398b5a7b50a99340c3"
+    },
+    "tokenizer": {
+      "repository": "Qwen/Qwen3-14B-AWQ",
+      "revision": "31c69efc29464b6bb0aee1398b5a7b50a99340c3"
+    },
+    "quantization": {
+      "method": "awq"
+    },
+    "vllm_version": "0.30.0",
+    "serving": {
+      "dtype": "float16",
+      "max_model_len": 32768,
+      "gpu_memory_utilization": 0.8,
+      "max_num_seqs": 1,
+      "max_num_batched_tokens": 8192,
+      "kv_cache_dtype": "float16",
+      "enable_prefix_caching": false,
+      "enable_chunked_prefill": true,
+      "enforce_eager": false,
+      "tensor_parallel_size": 1,
+      "max_logprobs": 20,
+      "batch_invariant": false,
+      "sampler_backend": "native"
+    }
+  },
+  "agent": {
+    "smolagents_version": "1.22.0",
+    "action_interface": "code",
+    "prompt": {
+      "prompt_version": "prompt-runtime-auth-v2",
+      "plan_format_version": "plan-v1",
+      "thinking_enabled": false
+    },
+    "step_limit": 40,
+    "execute_max_model_turns": 20,
+    "tool_access_profile": "spotify_capability_v1",
+    "sampling": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "min_p": 0.0,
+      "seed": 17,
+      "max_tokens": 1024,
+      "plan_max_tokens": 1024,
+      "execute_max_tokens": 192
+    },
+    "workflow": {
+      "policy": "plan_progress_v2",
+      "repeat_action_limit": 2,
+      "no_progress_turns": 3,
+      "completion_gate": true,
+      "max_plan_steps": 5
+    }
+  }
+}
