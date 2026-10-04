@@ -7,7 +7,9 @@ execute horizon 20, execute token cap 192, temperature 0, seed 17, and
 HEAD and the tracked source and config tree must be clean.
 
 Prints one public JSON object after each episode. Writes one public
-aggregate to --output. Task ids, instructions, model text, API arguments,
+aggregate to --output. An infrastructure failure after an episode has
+started writes that aggregate with ``pilot_status`` ``aborted`` and exits
+nonzero. Task ids, instructions, model text, API arguments,
 trajectories, and evaluator internals stay in the local store. When the
 local manifest omits ``appworld_setup_profile``, the matching committed
 task metadata supplies it.
@@ -47,20 +49,27 @@ from llm_behavior_ci.config import (
     new_run_identity,
     run_configuration_hash,
 )
-from llm_behavior_ci.records import EXECUTE_TERMINATIONS, EpisodeResult, ModelStep, ToolStep
+from llm_behavior_ci.records import (
+    EXECUTE_TERMINATIONS,
+    EpisodeResult,
+    LocalTaskRef,
+    ModelStep,
+    RecordedError,
+    ToolStep,
+)
 from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
 from llm_behavior_ci.runtime.workflow import (
     WorkflowTraceAccounting,
     account_workflow_trace,
     workflow_output_has_parseable_action,
 )
+from llm_behavior_ci.runtime.clock import wall_now
 from llm_behavior_ci.runtime.episode import (
-    EpisodeRejected,
-    RuntimeUnavailable,
     build_runtime,
     run_episode,
+    runtime_failure_message,
 )
-from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
+from llm_behavior_ci.runtime.provenance import enforce_committed_provenance
 from llm_behavior_ci.storage import EpisodeStore, StorageError
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 
@@ -200,11 +209,12 @@ def _difficulty_by_task(payload: object) -> dict[str, int]:
 def _persistence_callbacks(
     store: EpisodeStore,
     task_id: str,
+    holder: dict[str, str] | None = None,
 ) -> tuple[
     Callable[[EpisodeIdentity, RunIdentity], None],
     Callable[[ModelStep | ToolStep], None],
 ]:
-    current: dict[str, str] = {}
+    current: dict[str, str] = {} if holder is None else holder
 
     def on_start(identity: EpisodeIdentity, run: RunIdentity) -> None:
         store.start_episode(identity, run, task_id)
@@ -466,6 +476,127 @@ def _require_pilot_configuration(agent: AgentConfiguration) -> None:
         raise SystemExit(2)
 
 
+def _coerce_exit_code(error: BaseException) -> int:
+    if type(error) is not SystemExit:
+        return 1
+    code = getattr(error, "code", None)
+    if code is None:
+        return 2
+    if isinstance(code, bool):
+        return 1
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str):
+        stripped = code.strip()
+        negative = stripped.startswith("-")
+        digits = stripped[1:] if negative else stripped
+        if digits.isdigit():
+            value = int(digits)
+            return -value if negative else value
+        return 1
+    return 1
+
+
+def _announce_failure(error: BaseException | str) -> None:
+    text = error if isinstance(error, str) else runtime_failure_message(error)
+    try:
+        print("capability pilot failed", file=sys.stderr)
+        if text.strip() != "":
+            print(text, file=sys.stderr)
+    except Exception:
+        try:
+            print("capability pilot failed", file=sys.stderr)
+        except Exception:
+            return
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_aborted(
+    output_path: Path,
+    *,
+    configuration: RunConfiguration,
+    episodes: Sequence[EpisodeResult],
+    manifest_difficulties: Sequence[int | None],
+    failed_episode: int,
+    episodes_attempted: int,
+    episodes_completed: int,
+    failure_reason: str,
+) -> None:
+    payload = _aggregate(
+        configuration=configuration,
+        episodes=episodes,
+        manifest_difficulties=manifest_difficulties,
+    )
+    payload["pilot_status"] = "aborted"
+    payload["episodes_expected"] = _PILOT_TASK_COUNT
+    payload["episodes_attempted"] = episodes_attempted
+    payload["episodes_completed"] = episodes_completed
+    payload["failed_episode"] = failed_episode
+    payload["failure_type"] = "runtime_error"
+    payload["failure_reason"] = failure_reason
+    _write_json(output_path, payload)
+
+
+def _close_open_runtime_failure(
+    store: EpisodeStore,
+    episode_id: str,
+    *,
+    configuration: RunConfiguration,
+    scenario_id: str | None,
+    message: str,
+) -> EpisodeResult | None:
+    try:
+        opened = store.load_open_episode(episode_id)
+    except StorageError:
+        return None
+    model_steps = tuple(step for step in opened.steps if isinstance(step, ModelStep))
+    tool_steps = tuple(step for step in opened.steps if isinstance(step, ToolStep))
+    started_at = min((step.started_at for step in opened.steps), default=wall_now())
+    ended_at = wall_now()
+    if ended_at < started_at:
+        ended_at = started_at
+    episode = EpisodeResult(
+        episode=opened.identity,
+        run=opened.run,
+        task=LocalTaskRef(
+            task_id=opened.task_id,
+            scenario_id=scenario_id,
+            split=configuration.task.split,
+        ),
+        mode="execute",
+        execution_seed=configuration.agent.sampling.seed,
+        status="failed",
+        started_at=started_at,
+        ended_at=ended_at,
+        model_steps=model_steps,
+        tool_steps=tool_steps,
+        plan_text=None,
+        evaluator_outcome=None,
+        termination_reason="runtime_error",
+        episode_errors=(
+            RecordedError(
+                source="runtime",
+                recoverable=False,
+                message=message,
+                step_index=None,
+            ),
+        ),
+        role=None,
+    )
+    try:
+        store.finish_episode(episode)
+    except StorageError:
+        return None
+    return episode
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     if argv is None and len(sys.argv) <= 1:
         return 2
@@ -487,18 +618,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(args_list)
     except SystemExit as error:
-        code = error.code
-        if code is None:
-            return 2
-        return int(code)
+        return _coerce_exit_code(error)
 
     store_path = Path(args.store)
     output_path = Path(args.output)
     try:
         _refuse_results_store(store_path)
     except SystemExit as error:
-        code = error.code
-        return 2 if code is None else int(code)
+        return _coerce_exit_code(error)
     if not store_path.parent.is_dir():
         print("store parent directory does not exist", file=sys.stderr)
         return 2
@@ -517,6 +644,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not Path(appworld_root).is_dir():
         print("APPWORLD_ROOT must be set to an existing directory", file=sys.stderr)
         return 2
+
+    store: EpisodeStore | None = None
+    configuration: RunConfiguration | None = None
+    episodes: list[EpisodeResult] = []
+    manifest_difficulties: list[int | None] = []
+    attempted_index: int | None = None
+    open_holder: dict[str, str] = {}
+    open_task_id: str | None = None
+    open_scenario_id: str | None = None
+    difficulties: dict[str, int] = {}
+
+    def recover(error: BaseException, *, report: bool) -> None:
+        try:
+            completed = len(episodes)
+            episode_id = open_holder.get("episode_id")
+            if (
+                store is not None
+                and configuration is not None
+                and episode_id
+                and open_task_id is not None
+            ):
+                closed = _close_open_runtime_failure(
+                    store,
+                    episode_id,
+                    configuration=configuration,
+                    scenario_id=open_scenario_id,
+                    message=runtime_failure_message(error),
+                )
+                if closed is not None:
+                    episodes.append(closed)
+                    manifest_difficulties.append(difficulties.get(open_task_id))
+                    open_holder.clear()
+            if report and attempted_index is not None and configuration is not None:
+                _write_aborted(
+                    output_path,
+                    configuration=configuration,
+                    episodes=episodes,
+                    manifest_difficulties=manifest_difficulties,
+                    failed_episode=attempted_index,
+                    episodes_attempted=attempted_index + 1,
+                    episodes_completed=completed,
+                    failure_reason=runtime_failure_message(error),
+                )
+        except Exception:
+            return
 
     try:
         configuration_payload = _load_json(configuration_path)
@@ -555,13 +727,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode="execute",
         )
         store = EpisodeStore(store_path)
-        episodes: list[EpisodeResult] = []
-        manifest_difficulties: list[int | None] = []
         for task_index, (task_id, scenario_id) in enumerate(
             zip(task_set.task_ids, task_set.scenario_ids, strict=True)
         ):
+            attempted_index = task_index
+            open_task_id = task_id
+            open_scenario_id = scenario_id
+            open_holder.clear()
             run = new_run_identity(configuration)
-            on_start, on_step = _persistence_callbacks(store, task_id)
+            on_start, on_step = _persistence_callbacks(store, task_id, open_holder)
             episode = run_episode(
                 task_id,
                 configuration,
@@ -573,6 +747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scenario_id=scenario_id,
             )
             store.finish_episode(episode)
+            open_holder.clear()
             episodes.append(episode)
             manifest_difficulties.append(difficulties.get(task_id))
             summary = _public_summary(
@@ -581,36 +756,48 @@ def main(argv: Sequence[str] | None = None) -> int:
                 episode=episode,
             )
             print(json.dumps(summary, sort_keys=True), flush=True)
+            if episode.termination_reason == "runtime_error":
+                reason = (
+                    episode.episode_errors[0].message
+                    if episode.episode_errors
+                    else "runtime_error"
+                )
+                try:
+                    _write_aborted(
+                        output_path,
+                        configuration=configuration,
+                        episodes=episodes,
+                        manifest_difficulties=manifest_difficulties,
+                        failed_episode=task_index,
+                        episodes_attempted=task_index + 1,
+                        episodes_completed=task_index,
+                        failure_reason=reason,
+                    )
+                except Exception:
+                    pass
+                _announce_failure(reason)
+                return 1
         aggregate = _aggregate(
             configuration=configuration,
             episodes=episodes,
             manifest_difficulties=manifest_difficulties,
         )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(aggregate, indent=2, sort_keys=True, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
+        _write_json(output_path, aggregate)
         return 0
     except SystemExit as error:
-        code = error.code
-        return 2 if code is None else int(code)
-    except (ConfigError, SelectionError, ProvenanceError) as error:
-        print(str(error) or "capability pilot failed", file=sys.stderr)
-        return 1
-    except (
-        KeyError,
-        TypeError,
-        ValueError,
-        EpisodeRejected,
-        RuntimeUnavailable,
-        StorageError,
-        OSError,
-    ):
-        print("capability pilot failed", file=sys.stderr)
-        return 1
-    except Exception:
-        print("capability pilot failed", file=sys.stderr)
+        nested = getattr(error, "code", None) if type(error) is SystemExit else None
+        if type(error) is not SystemExit or (
+            isinstance(nested, BaseException) and not isinstance(nested, SystemExit)
+        ):
+            reported = nested if isinstance(nested, BaseException) else error
+            recover(reported, report=True)
+            _announce_failure(reported)
+            return 1
+        recover(error, report=False)
+        return _coerce_exit_code(error)
+    except Exception as error:
+        recover(error, report=True)
+        _announce_failure(error)
         return 1
 
 

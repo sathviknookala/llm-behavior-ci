@@ -48,7 +48,40 @@ class EpisodeRejected(ValueError):
 
 
 class RuntimeUnavailable(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str = "",
+        *args: object,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(message, *args)
+        self.reason = reason
+
+
+def runtime_failure_message(error: BaseException) -> str:
+    """A stored diagnostic that cannot raise and does not invent an outcome.
+
+    Control characters that ``RecordedError`` rejects are replaced. A
+    context-length failure keeps that reason on the first line so the
+    episode record shows an infrastructure limit rather than a tool parse.
+    """
+
+    try:
+        text = str(error)
+    except Exception:
+        text = type(error).__name__
+    cleaned = "".join(
+        character if character in "\n\r\t" or ord(character) >= 32 else " "
+        for character in text
+    ).strip()
+    if cleaned == "":
+        cleaned = type(error).__name__
+    reason = getattr(error, "reason", None)
+    if reason == "context_length_exceeded" and not cleaned.startswith(
+        "context_length_exceeded"
+    ):
+        cleaned = f"context_length_exceeded\n{cleaned}"
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -228,6 +261,9 @@ def run_episode(
     when the agent stops, when ``complete_task`` succeeds, and when the step
     limit is reached. A step-limit evaluation does not change the failed
     status. Unrecoverable runtime and tool failures are not evaluated.
+    ``RuntimeUnavailable`` from the model client, including a context-length
+    rejection, closes the episode as ``runtime_error`` with the steps already
+    recorded and no evaluator outcome. The prompt is not truncated.
     ``scenario_id`` is stored on the local task reference when the caller
     has one; it is not ground truth.
     """
@@ -236,8 +272,12 @@ def run_episode(
     identity = new_episode_identity(run, pair_id=pair_id)
     if on_start is not None:
         on_start(identity, run)
-    session = runtime.session_factory(task_id)
+    session = None
+    started_at: datetime | None = None
+    model_steps: list[ModelStep] = []
+    tool_steps: list[ToolStep] = []
     try:
+        session = runtime.session_factory(task_id)
         started_at = runtime.clock()
         prepare = getattr(session, "prepare", None)
         if callable(prepare):
@@ -269,8 +309,6 @@ def run_episode(
                 )
         context = session.context()
         runtime.agent.begin(context, config)
-        model_steps: list[ModelStep] = []
-        tool_steps: list[ToolStep] = []
         if mode == "plan":
             turn = runtime.agent.next_turn(tool_output=None)
             step = _model_step(0, turn)
@@ -504,8 +542,35 @@ def run_episode(
                     episode_errors=(),
                 )
             tool_output = _observation(result)
+    except RuntimeUnavailable as error:
+        if started_at is None:
+            started_at = runtime.clock()
+        return _finish(
+            identity=identity,
+            run=run,
+            task_id=task_id,
+            config=config,
+            scenario_id=scenario_id,
+            mode=mode,
+            started_at=started_at,
+            clock=runtime.clock,
+            model_steps=model_steps,
+            tool_steps=tool_steps,
+            plan_text=None,
+            evaluator_outcome=None,
+            termination_reason="runtime_error",
+            episode_errors=(
+                RecordedError(
+                    source="runtime",
+                    recoverable=False,
+                    message=runtime_failure_message(error),
+                    step_index=None,
+                ),
+            ),
+        )
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 def run_do_nothing_episode(

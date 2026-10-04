@@ -508,6 +508,44 @@ class InterfaceV2Tests(unittest.TestCase):
             },
         )
 
+    def test_32b_28672_config_widens_context_without_changing_the_agent(self) -> None:
+        previous = _configuration(
+            "qwen3_32b_awq_spotify_capability_v2_interface.json"
+        )
+        widened = _configuration(
+            "qwen3_32b_awq_spotify_capability_v2_interface_28672.json"
+        )
+        self.assertEqual(widened.agent, previous.agent)
+        self.assertEqual(widened.model.model, previous.model.model)
+        self.assertEqual(widened.model.tokenizer.revision, previous.model.tokenizer.revision)
+        self.assertEqual(widened.model.serving.kv_cache_dtype, "float16")
+        self.assertEqual(widened.model.serving.gpu_memory_utilization, 0.97)
+        self.assertEqual(widened.model.serving.max_num_batched_tokens, 4096)
+        self.assertTrue(widened.model.serving.enforce_eager)
+        self.assertEqual(widened.model.serving.max_num_seqs, 1)
+        self.assertFalse(widened.model.serving.enable_prefix_caching)
+        self.assertTrue(widened.model.serving.enable_chunked_prefill)
+        self.assertEqual(widened.model.serving.max_model_len, 28672)
+        self.assertEqual(widened.model.serving.cpu_offload_gb, 4.0)
+        left = hashed_values(previous)
+        right = hashed_values(widened)
+        changed = {
+            path: (left[path], right[path])
+            for path in left
+            if left[path] != right[path]
+        }
+        self.assertEqual(
+            changed,
+            {
+                "model.serving.cpu_offload_gb": (2.0, 4.0),
+                "model.serving.max_model_len": (22528, 28672),
+            },
+        )
+        self.assertEqual(
+            run_configuration_hash(widened),
+            "c1b7d7e0b4ffec6ebc2c0fe511e3abe184ef99a1d8a589afa0efa3838002b735",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

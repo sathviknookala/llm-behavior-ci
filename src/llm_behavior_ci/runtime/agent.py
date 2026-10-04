@@ -42,6 +42,58 @@ except ImportError:
 
 _TOKEN_ID_PREFIX = "token_id:"
 
+
+def _http_error_body(error: urllib.error.HTTPError) -> str:
+    try:
+        raw = error.read()
+    except Exception as read_error:
+        return f"<unreadable body: {type(read_error).__name__}>"
+    if raw is None:
+        return "<empty body>"
+    if isinstance(raw, str):
+        text = raw
+    else:
+        try:
+            text = bytes(raw).decode("utf-8")
+        except UnicodeDecodeError:
+            text = bytes(raw).decode("utf-8", errors="replace")
+    if text.strip() == "":
+        return "<empty body>"
+    return text
+
+
+def _context_length_exceeded(body: str) -> bool:
+    text = body.lower()
+    if "context_length_exceeded" in text:
+        return True
+    if "longer than the maximum model length" in text:
+        return True
+    if "maximum context length" in text:
+        return True
+    if "context length" in text and (
+        "exceed" in text or "maximum" in text or "too long" in text
+    ):
+        return True
+    return "max_model_len" in text and (
+        "longer than" in text or "exceed" in text
+    )
+
+
+def _http_runtime_error(
+    error: urllib.error.HTTPError,
+    endpoint: str,
+) -> RuntimeError:
+    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+    body = _http_error_body(error)
+    reason = "context_length_exceeded" if _context_length_exceeded(body) else None
+    message = (
+        f"vLLM request failed with HTTP {error.code} {error.reason}:\n"
+        f"{body}\n"
+        f"endpoint: {endpoint}"
+    )
+    return RuntimeUnavailable(message, reason=reason)
+
 _UNCHECKED_IDENTITY_FIELDS = (
     "weights_digest",
     "model.serving.dtype",
@@ -799,6 +851,8 @@ class SmolagentsVLLMAgent(_SmolModel):
         try:
             with urllib.request.urlopen(request) as response:
                 return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            raise _http_runtime_error(error, request.full_url) from error
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as error:
             raise RuntimeUnavailable(str(error)) from error
 
