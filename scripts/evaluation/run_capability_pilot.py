@@ -72,6 +72,7 @@ from llm_behavior_ci.runtime.episode import (
 from llm_behavior_ci.runtime.provenance import enforce_committed_provenance
 from llm_behavior_ci.storage import EpisodeStore, StorageError
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
+from llm_behavior_ci.tasks.short_horizon import DIAGNOSTIC_RULE, DIAGNOSTIC_TASK_COUNT
 
 _PUBLIC_TASK_FIELDS = (
     "appworld_version",
@@ -458,6 +459,100 @@ def _aggregate(
     }
 
 
+def _with_diagnostic_fields(
+    payload: dict[str, object],
+    *,
+    configuration: RunConfiguration,
+    episodes: Sequence[EpisodeResult],
+    manifest_difficulties: Sequence[int | None],
+) -> dict[str, object]:
+    if configuration.task.selection_rule != DIAGNOSTIC_RULE:
+        return payload
+    model_turns = [len(episode.model_steps) for episode in episodes]
+    tool_calls = [len(episode.tool_steps) for episode in episodes]
+    passed = 0
+    total = 0
+    rows: list[dict[str, object]] = []
+    for index, (episode, manifest_difficulty) in enumerate(
+        zip(episodes, manifest_difficulties, strict=True)
+    ):
+        outcome = episode.evaluator_outcome
+        episode_passed = None if outcome is None else outcome.passed_requirements
+        episode_total = None if outcome is None else outcome.total_requirements
+        if outcome is not None:
+            passed += outcome.passed_requirements
+            total += outcome.total_requirements
+        difficulty = manifest_difficulty
+        if outcome is not None and outcome.difficulty is not None:
+            difficulty = outcome.difficulty
+        rows.append(
+            {
+                "task_index": index,
+                "difficulty": difficulty,
+                "evaluator_success": None if outcome is None else outcome.success,
+                "passed_requirements": episode_passed,
+                "total_requirements": episode_total,
+                "requirement_fraction": (
+                    None
+                    if episode_passed is None or episode_total is None
+                    else _requirement_fraction(episode_passed, episode_total)
+                ),
+                "model_step_count": len(episode.model_steps),
+                "tool_step_count": len(episode.tool_steps),
+                "termination_reason": episode.termination_reason,
+                "parser_error_count": _parser_errors(configuration, episode),
+            }
+        )
+    payload["selection_rule"] = DIAGNOSTIC_RULE
+    payload["model_repository"] = configuration.model.model.repository
+    payload["model_revision"] = configuration.model.model.revision
+    payload["requirements_passed"] = passed
+    payload["requirements_total"] = total
+    payload["requirement_pass_fraction"] = _requirement_fraction(passed, total)
+    payload["model_turn_mean"] = _mean(model_turns)
+    payload["model_turn_median"] = _median(model_turns)
+    payload["tool_call_mean"] = _mean(tool_calls)
+    payload["tool_call_median"] = _median(tool_calls)
+    payload["episodes"] = rows
+    return payload
+
+
+def _required_task_count(task: TaskConfiguration) -> int:
+    if task.selection_rule == DIAGNOSTIC_RULE:
+        return DIAGNOSTIC_TASK_COUNT
+    return _PILOT_TASK_COUNT
+
+
+def _mean(values: Sequence[int]) -> int | float | None:
+    if not values:
+        return None
+    value = sum(values) / len(values)
+    rounded = round(value, 6)
+    if rounded == int(rounded):
+        return int(rounded)
+    return rounded
+
+
+def _median(values: Sequence[int]) -> int | float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[midpoint]
+    return _mean((ordered[midpoint - 1], ordered[midpoint]))
+
+
+def _requirement_fraction(passed: int, total: int) -> int | float | None:
+    if total == 0:
+        return None
+    value = passed / total
+    rounded = round(value, 6)
+    if rounded == int(rounded):
+        return int(rounded)
+    return rounded
+
+
 def _require_pilot_configuration(agent: AgentConfiguration) -> None:
     if agent.tool_access_profile != _PILOT_PROFILE:
         print("capability pilot requires the Spotify tool access profile", file=sys.stderr)
@@ -529,13 +624,18 @@ def _write_aborted(
     episodes_completed: int,
     failure_reason: str,
 ) -> None:
-    payload = _aggregate(
+    payload = _with_diagnostic_fields(
+        _aggregate(
+            configuration=configuration,
+            episodes=episodes,
+            manifest_difficulties=manifest_difficulties,
+        ),
         configuration=configuration,
         episodes=episodes,
         manifest_difficulties=manifest_difficulties,
     )
     payload["pilot_status"] = "aborted"
-    payload["episodes_expected"] = _PILOT_TASK_COUNT
+    payload["episodes_expected"] = _required_task_count(configuration.task)
     payload["episodes_attempted"] = episodes_attempted
     payload["episodes_completed"] = episodes_completed
     payload["failed_episode"] = failed_episode
@@ -703,8 +803,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _require_pilot_configuration(agent)
         task_payload = _load_json(task_set_path)
         task, task_set = _load_task_set(task_payload)
-        if task.task_count != _PILOT_TASK_COUNT or task_set.task_count != _PILOT_TASK_COUNT:
-            print("capability pilot requires 20 tasks", file=sys.stderr)
+        expected_tasks = _required_task_count(task)
+        if task.task_count != expected_tasks or task_set.task_count != expected_tasks:
+            print(f"capability pilot requires {expected_tasks} tasks", file=sys.stderr)
             return 2
         adopted = _adopt_committed_setup_profile(task)
         if adopted is None:
@@ -777,7 +878,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     pass
                 _announce_failure(reason)
                 return 1
-        aggregate = _aggregate(
+        aggregate = _with_diagnostic_fields(
+            _aggregate(
+                configuration=configuration,
+                episodes=episodes,
+                manifest_difficulties=manifest_difficulties,
+            ),
             configuration=configuration,
             episodes=episodes,
             manifest_difficulties=manifest_difficulties,

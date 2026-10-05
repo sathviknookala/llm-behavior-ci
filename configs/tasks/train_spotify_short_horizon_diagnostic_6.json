@@ -1,0 +1,10 @@
+{
+  "appworld_version": "0.1.3.post1",
+  "split": "train",
+  "selection_rule": "spotify_short_horizon_diagnostic_v1",
+  "selection_seed": 17,
+  "task_count": 6,
+  "scenario_count": 2,
+  "task_set_hash": "6798b4d4a7bbaa56db2116d669b86a517abe3b0064ed85cc08469c6ad3802b2c",
+  "appworld_setup_profile": "spotify_authenticated_v1"
+}
