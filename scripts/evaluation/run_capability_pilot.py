@@ -7,9 +7,19 @@ execute horizon 20, execute token cap 192, temperature 0, seed 17, and
 HEAD and the tracked source and config tree must be clean.
 
 Prints one public JSON object after each episode. Writes one public
-aggregate to --output. An infrastructure failure after an episode has
-started writes that aggregate with ``pilot_status`` ``aborted`` and exits
-nonzero. Task ids, instructions, model text, API arguments,
+aggregate to --output. An episode-local runtime failure, including a
+context-length rejection, is recorded for that task and the remaining
+tasks still run. The record keeps the steps and controller counts already
+collected. Execute mode attempts the native evaluator on a world that is
+already open; if that attempt is missing or fails, the evaluator outcome
+stays unavailable and is not treated as a success or a failure. An
+end-to-end success is an episode that finishes without a runtime failure
+and whose evaluator reports success. The denominator is the full task
+count. A pass over every task writes ``run_status`` ``completed`` even
+when some tasks are runtime failures. A task-set, provenance, manifest,
+configuration, store, or runtime-initialization failure still aborts,
+writes ``run_status`` ``aborted``, and leaves every unfinished task
+``not_attempted``. Task ids, instructions, model text, API arguments,
 trajectories, and evaluator internals stay in the local store. When the
 local manifest omits ``appworld_setup_profile``, the matching committed
 task metadata supplies it.
@@ -36,6 +46,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from llm_behavior_ci.config import (
@@ -46,6 +57,7 @@ from llm_behavior_ci.config import (
     RunConfiguration,
     RunIdentity,
     TaskConfiguration,
+    new_episode_identity,
     new_run_identity,
     run_configuration_hash,
 )
@@ -65,11 +77,12 @@ from llm_behavior_ci.runtime.workflow import (
 )
 from llm_behavior_ci.runtime.clock import wall_now
 from llm_behavior_ci.runtime.episode import (
+    EpisodeRejected,
     build_runtime,
     run_episode,
     runtime_failure_message,
 )
-from llm_behavior_ci.runtime.provenance import enforce_committed_provenance
+from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
 from llm_behavior_ci.storage import EpisodeStore, StorageError
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 from llm_behavior_ci.tasks.short_horizon import DIAGNOSTIC_RULE, DIAGNOSTIC_TASK_COUNT
@@ -91,6 +104,19 @@ _PILOT_TOKEN_CAP = 192
 _PILOT_SEED = 17
 _DIFFICULTY_EASY = 1
 _DIFFICULTY_MEDIUM = 2
+_TERMINAL_STATUSES = (
+    "evaluator_success",
+    "evaluator_failure",
+    "runtime_failure",
+    "not_attempted",
+)
+_EXPERIMENT_FAILURES = (
+    ProvenanceError,
+    SelectionError,
+    ConfigError,
+    EpisodeRejected,
+    StorageError,
+)
 
 
 def _refuse_results_store(path: Path) -> None:
@@ -237,6 +263,7 @@ def _public_summary(
     episode: EpisodeResult,
 ) -> dict[str, object]:
     outcome = episode.evaluator_outcome
+    error_type, error_message = _public_runtime_failure(episode)
     wall_seconds = (episode.ended_at - episode.started_at).total_seconds()
     model_latency_seconds = sum(step.latency_seconds for step in episode.model_steps)
     successful_tool_calls = sum(1 for step in episode.tool_steps if step.error is None)
@@ -245,7 +272,11 @@ def _public_summary(
         "configuration_hash": run_configuration_hash(configuration),
         "task_set_hash": configuration.task.task_set_hash,
         "task_index": task_index,
+        "terminal_status": _terminal_status(episode),
+        "evaluator_status": _evaluator_status(episode),
         "termination_reason": episode.termination_reason,
+        "runtime_error_type": error_type,
+        "runtime_error_message": error_message,
         "status": episode.status,
         "model_step_count": len(episode.model_steps),
         "tool_step_count": len(episode.tool_steps),
@@ -320,7 +351,7 @@ def _repeated_tool_calls(episode: EpisodeResult) -> int:
 
 def _success_difficulty(episode: EpisodeResult, manifest_difficulty: int | None) -> int | None:
     outcome = episode.evaluator_outcome
-    if outcome is None or not outcome.success:
+    if episode.termination_reason == "runtime_error" or outcome is None or not outcome.success:
         return None
     if outcome.difficulty is not None:
         return outcome.difficulty
@@ -384,7 +415,11 @@ def _aggregate(
     termination_counts = {reason: 0 for reason in sorted(EXECUTE_TERMINATIONS)}
     for episode, manifest_difficulty in zip(episodes, manifest_difficulties, strict=True):
         outcome = episode.evaluator_outcome
-        if outcome is not None and outcome.success:
+        if (
+            episode.termination_reason != "runtime_error"
+            and outcome is not None
+            and outcome.success
+        ):
             successes += 1
         label = _success_difficulty(episode, manifest_difficulty)
         if label == _DIFFICULTY_EASY:
@@ -459,50 +494,203 @@ def _aggregate(
     }
 
 
+def _terminal_status(episode: EpisodeResult | None) -> str:
+    if episode is None:
+        return "not_attempted"
+    if episode.termination_reason == "runtime_error":
+        return "runtime_failure"
+    outcome = episode.evaluator_outcome
+    if outcome is not None and outcome.success:
+        return "evaluator_success"
+    return "evaluator_failure"
+
+
+def _evaluator_status(episode: EpisodeResult | None) -> str:
+    if episode is None or episode.evaluator_outcome is None:
+        return "unavailable"
+    if episode.evaluator_outcome.success:
+        return "success"
+    return "failure"
+
+
+def _public_runtime_failure(episode: EpisodeResult | None) -> tuple[str | None, str | None]:
+    if episode is None or episode.termination_reason != "runtime_error":
+        return None, None
+    message = (
+        episode.episode_errors[0].message
+        if episode.episode_errors
+        else "runtime_error"
+    )
+    if message.startswith("context_length_exceeded"):
+        return "context_length_exceeded", message
+    if "HTTP 400" in message:
+        return "model_http_400", message
+    return "runtime_error", message
+
+
+def _ratio(numerator: int, denominator: int) -> float | None:
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def _result_slots(
+    episodes: Sequence[EpisodeResult],
+    manifest_difficulties: Sequence[int | None],
+    *,
+    expected: int,
+    task_ids: Sequence[str],
+    difficulties: dict[str, int],
+) -> tuple[list[EpisodeResult | None], list[int | None]]:
+    slots: list[EpisodeResult | None] = list(episodes)
+    labels: list[int | None] = list(manifest_difficulties)
+    while len(slots) < expected:
+        index = len(slots)
+        task_id = task_ids[index] if index < len(task_ids) else None
+        slots.append(None)
+        labels.append(None if task_id is None else difficulties.get(task_id))
+    return slots, labels
+
+
+def _annotate_terminal(
+    payload: dict[str, object],
+    *,
+    slots: Sequence[EpisodeResult | None],
+    run_status: str,
+    failure_reason: str | None,
+    failed_episode: int | None,
+) -> dict[str, object]:
+    counts = {status: 0 for status in _TERMINAL_STATUSES}
+    unavailable = 0
+    scored_success = 0
+    scored_failure = 0
+    for episode in slots:
+        counts[_terminal_status(episode)] += 1
+        if _evaluator_status(episode) == "unavailable":
+            unavailable += 1
+        if (
+            episode is not None
+            and episode.termination_reason != "runtime_error"
+            and episode.evaluator_outcome is not None
+        ):
+            if episode.evaluator_outcome.success:
+                scored_success += 1
+            else:
+                scored_failure += 1
+    expected = len(slots)
+    end_to_end = counts["evaluator_success"]
+    scored = scored_success + scored_failure
+    attempted = expected - counts["not_attempted"]
+    payload["run_status"] = run_status
+    payload["pilot_status"] = run_status
+    payload["task_count"] = expected
+    payload["episodes_expected"] = expected
+    payload["episodes_attempted"] = attempted
+    payload["episodes_completed"] = counts["evaluator_success"] + counts["evaluator_failure"]
+    payload["attempted_task_count"] = attempted
+    payload["not_attempted_count"] = counts["not_attempted"]
+    payload["runtime_failure_count"] = counts["runtime_failure"]
+    payload["evaluator_failure_count"] = counts["evaluator_failure"]
+    payload["evaluator_success_count"] = end_to_end
+    payload["evaluator_success_rate"] = _ratio(end_to_end, expected)
+    payload["end_to_end_success_count"] = end_to_end
+    payload["end_to_end_success_rate"] = _ratio(end_to_end, expected)
+    payload["evaluator_only_success_count"] = scored_success
+    payload["evaluator_only_success_rate"] = _ratio(scored_success, scored)
+    payload["evaluator_unavailable_count"] = unavailable
+    payload["terminal_status_counts"] = counts
+    if run_status == "aborted":
+        payload["failure_type"] = "experiment_error"
+        payload["failure_reason"] = failure_reason or "experiment_error"
+        payload["failed_episode"] = failed_episode
+    return payload
+
+
+def _episode_row(
+    configuration: RunConfiguration,
+    index: int,
+    episode: EpisodeResult | None,
+    difficulty: int | None,
+) -> dict[str, object]:
+    if episode is None:
+        return {
+            "task_index": index,
+            "difficulty": difficulty,
+            "terminal_status": "not_attempted",
+            "evaluator_status": "unavailable",
+            "evaluator_success": None,
+            "passed_requirements": None,
+            "total_requirements": None,
+            "requirement_fraction": None,
+            "model_step_count": 0,
+            "tool_step_count": 0,
+            "termination_reason": None,
+            "runtime_error_type": None,
+            "runtime_error_message": None,
+            "parser_error_count": 0,
+            "workflow_envelope_rejection_count": 0,
+            "repeat_gate_block_count": 0,
+            "completion_gate_block_count": 0,
+            "stall_event_count": 0,
+        }
+    outcome = episode.evaluator_outcome
+    episode_passed = None if outcome is None else outcome.passed_requirements
+    episode_total = None if outcome is None else outcome.total_requirements
+    if outcome is not None and outcome.difficulty is not None:
+        difficulty = outcome.difficulty
+    error_type, error_message = _public_runtime_failure(episode)
+    accounting = _workflow_accounting(configuration, episode)
+    return {
+        "task_index": index,
+        "difficulty": difficulty,
+        "terminal_status": _terminal_status(episode),
+        "evaluator_status": _evaluator_status(episode),
+        "evaluator_success": None if outcome is None else outcome.success,
+        "passed_requirements": episode_passed,
+        "total_requirements": episode_total,
+        "requirement_fraction": (
+            None
+            if episode_passed is None or episode_total is None
+            else _requirement_fraction(episode_passed, episode_total)
+        ),
+        "model_step_count": len(episode.model_steps),
+        "tool_step_count": len(episode.tool_steps),
+        "termination_reason": episode.termination_reason,
+        "runtime_error_type": error_type,
+        "runtime_error_message": error_message,
+        "parser_error_count": _parser_errors(configuration, episode),
+        "workflow_envelope_rejection_count": accounting.workflow_envelope_rejection_count,
+        "repeat_gate_block_count": accounting.repeat_gate_block_count,
+        "completion_gate_block_count": accounting.completion_gate_block_count,
+        "stall_event_count": accounting.stall_event_count,
+    }
+
+
 def _with_diagnostic_fields(
     payload: dict[str, object],
     *,
     configuration: RunConfiguration,
-    episodes: Sequence[EpisodeResult],
+    slots: Sequence[EpisodeResult | None],
     manifest_difficulties: Sequence[int | None],
 ) -> dict[str, object]:
     if configuration.task.selection_rule != DIAGNOSTIC_RULE:
         return payload
-    model_turns = [len(episode.model_steps) for episode in episodes]
-    tool_calls = [len(episode.tool_steps) for episode in episodes]
+    real = [episode for episode in slots if episode is not None]
+    model_turns = [len(episode.model_steps) for episode in real]
+    tool_calls = [len(episode.tool_steps) for episode in real]
     passed = 0
     total = 0
-    rows: list[dict[str, object]] = []
-    for index, (episode, manifest_difficulty) in enumerate(
-        zip(episodes, manifest_difficulties, strict=True)
-    ):
+    for episode in real:
         outcome = episode.evaluator_outcome
-        episode_passed = None if outcome is None else outcome.passed_requirements
-        episode_total = None if outcome is None else outcome.total_requirements
         if outcome is not None:
             passed += outcome.passed_requirements
             total += outcome.total_requirements
-        difficulty = manifest_difficulty
-        if outcome is not None and outcome.difficulty is not None:
-            difficulty = outcome.difficulty
-        rows.append(
-            {
-                "task_index": index,
-                "difficulty": difficulty,
-                "evaluator_success": None if outcome is None else outcome.success,
-                "passed_requirements": episode_passed,
-                "total_requirements": episode_total,
-                "requirement_fraction": (
-                    None
-                    if episode_passed is None or episode_total is None
-                    else _requirement_fraction(episode_passed, episode_total)
-                ),
-                "model_step_count": len(episode.model_steps),
-                "tool_step_count": len(episode.tool_steps),
-                "termination_reason": episode.termination_reason,
-                "parser_error_count": _parser_errors(configuration, episode),
-            }
+    rows = [
+        _episode_row(configuration, index, episode, difficulty)
+        for index, (episode, difficulty) in enumerate(
+            zip(slots, manifest_difficulties, strict=True)
         )
+    ]
     payload["selection_rule"] = DIAGNOSTIC_RULE
     payload["model_repository"] = configuration.model.model.repository
     payload["model_revision"] = configuration.model.model.revision
@@ -613,60 +801,24 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     )
 
 
-def _write_aborted(
-    output_path: Path,
+def _runtime_failure_result(
     *,
+    identity: EpisodeIdentity,
+    run: RunIdentity,
     configuration: RunConfiguration,
-    episodes: Sequence[EpisodeResult],
-    manifest_difficulties: Sequence[int | None],
-    failed_episode: int,
-    episodes_attempted: int,
-    episodes_completed: int,
-    failure_reason: str,
-) -> None:
-    payload = _with_diagnostic_fields(
-        _aggregate(
-            configuration=configuration,
-            episodes=episodes,
-            manifest_difficulties=manifest_difficulties,
-        ),
-        configuration=configuration,
-        episodes=episodes,
-        manifest_difficulties=manifest_difficulties,
-    )
-    payload["pilot_status"] = "aborted"
-    payload["episodes_expected"] = _required_task_count(configuration.task)
-    payload["episodes_attempted"] = episodes_attempted
-    payload["episodes_completed"] = episodes_completed
-    payload["failed_episode"] = failed_episode
-    payload["failure_type"] = "runtime_error"
-    payload["failure_reason"] = failure_reason
-    _write_json(output_path, payload)
-
-
-def _close_open_runtime_failure(
-    store: EpisodeStore,
-    episode_id: str,
-    *,
-    configuration: RunConfiguration,
+    task_id: str,
     scenario_id: str | None,
+    started_at: datetime,
+    ended_at: datetime,
+    model_steps: tuple[ModelStep, ...],
+    tool_steps: tuple[ToolStep, ...],
     message: str,
-) -> EpisodeResult | None:
-    try:
-        opened = store.load_open_episode(episode_id)
-    except StorageError:
-        return None
-    model_steps = tuple(step for step in opened.steps if isinstance(step, ModelStep))
-    tool_steps = tuple(step for step in opened.steps if isinstance(step, ToolStep))
-    started_at = min((step.started_at for step in opened.steps), default=wall_now())
-    ended_at = wall_now()
-    if ended_at < started_at:
-        ended_at = started_at
-    episode = EpisodeResult(
-        episode=opened.identity,
-        run=opened.run,
+) -> EpisodeResult:
+    return EpisodeResult(
+        episode=identity,
+        run=run,
         task=LocalTaskRef(
-            task_id=opened.task_id,
+            task_id=task_id,
             scenario_id=scenario_id,
             split=configuration.task.split,
         ),
@@ -689,6 +841,38 @@ def _close_open_runtime_failure(
             ),
         ),
         role=None,
+    )
+
+
+def _close_open_runtime_failure(
+    store: EpisodeStore,
+    episode_id: str,
+    *,
+    configuration: RunConfiguration,
+    scenario_id: str | None,
+    message: str,
+) -> EpisodeResult | None:
+    try:
+        opened = store.load_open_episode(episode_id)
+    except StorageError:
+        return None
+    model_steps = tuple(step for step in opened.steps if isinstance(step, ModelStep))
+    tool_steps = tuple(step for step in opened.steps if isinstance(step, ToolStep))
+    started_at = min((step.started_at for step in opened.steps), default=wall_now())
+    ended_at = wall_now()
+    if ended_at < started_at:
+        ended_at = started_at
+    episode = _runtime_failure_result(
+        identity=opened.identity,
+        run=opened.run,
+        configuration=configuration,
+        task_id=opened.task_id,
+        scenario_id=scenario_id,
+        started_at=started_at,
+        ended_at=ended_at,
+        model_steps=model_steps,
+        tool_steps=tool_steps,
+        message=message,
     )
     try:
         store.finish_episode(episode)
@@ -754,39 +938,114 @@ def main(argv: Sequence[str] | None = None) -> int:
     open_task_id: str | None = None
     open_scenario_id: str | None = None
     difficulties: dict[str, int] = {}
+    task_ids: tuple[str, ...] = ()
 
-    def recover(error: BaseException, *, report: bool) -> None:
+    def publish(
+        run_status: str,
+        *,
+        failure_reason: str | None = None,
+        failed_episode: int | None = None,
+    ) -> None:
+        if configuration is None:
+            return
+        expected = _required_task_count(configuration.task)
+        slots, labels = _result_slots(
+            episodes,
+            manifest_difficulties,
+            expected=expected,
+            task_ids=task_ids,
+            difficulties=difficulties,
+        )
+        payload = _annotate_terminal(
+            _aggregate(
+                configuration=configuration,
+                episodes=episodes,
+                manifest_difficulties=manifest_difficulties,
+            ),
+            slots=slots,
+            run_status=run_status,
+            failure_reason=failure_reason,
+            failed_episode=failed_episode,
+        )
+        _write_json(
+            output_path,
+            _with_diagnostic_fields(
+                payload,
+                configuration=configuration,
+                slots=slots,
+                manifest_difficulties=labels,
+            ),
+        )
+
+    def discard_open_episode(message: str) -> None:
+        episode_id = open_holder.get("episode_id")
+        if (
+            store is None
+            or configuration is None
+            or not episode_id
+            or open_task_id is None
+        ):
+            return
+        _close_open_runtime_failure(
+            store,
+            episode_id,
+            configuration=configuration,
+            scenario_id=open_scenario_id,
+            message=message,
+        )
+        open_holder.clear()
+
+    def capture_episode_local(
+        error: BaseException,
+        run: RunIdentity,
+        task_id: str,
+        scenario_id: str | None,
+    ) -> EpisodeResult:
+        message = runtime_failure_message(error)
+        episode_id = open_holder.get("episode_id")
+        if episode_id:
+            if store is None or configuration is None:
+                raise StorageError("failed episode could not be closed")
+            closed = _close_open_runtime_failure(
+                store,
+                episode_id,
+                configuration=configuration,
+                scenario_id=scenario_id,
+                message=message,
+            )
+            if closed is None:
+                raise StorageError("failed episode could not be closed")
+            open_holder.clear()
+            return closed
+        if store is None or configuration is None:
+            raise StorageError("failed episode could not be closed")
+        now = wall_now()
+        identity = new_episode_identity(run)
+        episode = _runtime_failure_result(
+            identity=identity,
+            run=run,
+            configuration=configuration,
+            task_id=task_id,
+            scenario_id=scenario_id,
+            started_at=now,
+            ended_at=now,
+            model_steps=(),
+            tool_steps=(),
+            message=message,
+        )
+        store.start_episode(identity, run, task_id)
+        store.finish_episode(episode)
+        return episode
+
+    def abort_experiment(error: BaseException) -> None:
         try:
-            completed = len(episodes)
-            episode_id = open_holder.get("episode_id")
-            if (
-                store is not None
-                and configuration is not None
-                and episode_id
-                and open_task_id is not None
-            ):
-                closed = _close_open_runtime_failure(
-                    store,
-                    episode_id,
-                    configuration=configuration,
-                    scenario_id=open_scenario_id,
-                    message=runtime_failure_message(error),
-                )
-                if closed is not None:
-                    episodes.append(closed)
-                    manifest_difficulties.append(difficulties.get(open_task_id))
-                    open_holder.clear()
-            if report and attempted_index is not None and configuration is not None:
-                _write_aborted(
-                    output_path,
-                    configuration=configuration,
-                    episodes=episodes,
-                    manifest_difficulties=manifest_difficulties,
-                    failed_episode=attempted_index,
-                    episodes_attempted=attempted_index + 1,
-                    episodes_completed=completed,
-                    failure_reason=runtime_failure_message(error),
-                )
+            reason = runtime_failure_message(error)
+            discard_open_episode(reason)
+            publish(
+                "aborted",
+                failure_reason=reason,
+                failed_episode=attempted_index,
+            )
         except Exception:
             return
 
@@ -813,6 +1072,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         task = adopted
         difficulties = _difficulty_by_task(task_payload)
+        task_ids = tuple(task_set.task_ids)
         configuration = RunConfiguration(
             model=model,
             agent=agent,
@@ -837,18 +1097,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             open_holder.clear()
             run = new_run_identity(configuration)
             on_start, on_step = _persistence_callbacks(store, task_id, open_holder)
-            episode = run_episode(
-                task_id,
-                configuration,
-                "execute",
-                run=run,
-                runtime=runtime,
-                on_start=on_start,
-                on_step=on_step,
-                scenario_id=scenario_id,
-            )
-            store.finish_episode(episode)
-            open_holder.clear()
+            try:
+                episode = run_episode(
+                    task_id,
+                    configuration,
+                    "execute",
+                    run=run,
+                    runtime=runtime,
+                    on_start=on_start,
+                    on_step=on_step,
+                    scenario_id=scenario_id,
+                    evaluate_after_runtime_failure=True,
+                )
+            except _EXPERIMENT_FAILURES:
+                raise
+            except Exception as error:
+                episode = capture_episode_local(error, run, task_id, scenario_id)
+            else:
+                store.finish_episode(episode)
+                open_holder.clear()
             episodes.append(episode)
             manifest_difficulties.append(difficulties.get(task_id))
             summary = _public_summary(
@@ -857,38 +1124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 episode=episode,
             )
             print(json.dumps(summary, sort_keys=True), flush=True)
-            if episode.termination_reason == "runtime_error":
-                reason = (
-                    episode.episode_errors[0].message
-                    if episode.episode_errors
-                    else "runtime_error"
-                )
-                try:
-                    _write_aborted(
-                        output_path,
-                        configuration=configuration,
-                        episodes=episodes,
-                        manifest_difficulties=manifest_difficulties,
-                        failed_episode=task_index,
-                        episodes_attempted=task_index + 1,
-                        episodes_completed=task_index,
-                        failure_reason=reason,
-                    )
-                except Exception:
-                    pass
-                _announce_failure(reason)
-                return 1
-        aggregate = _with_diagnostic_fields(
-            _aggregate(
-                configuration=configuration,
-                episodes=episodes,
-                manifest_difficulties=manifest_difficulties,
-            ),
-            configuration=configuration,
-            episodes=episodes,
-            manifest_difficulties=manifest_difficulties,
-        )
-        _write_json(output_path, aggregate)
+        publish("completed")
         return 0
     except SystemExit as error:
         nested = getattr(error, "code", None) if type(error) is SystemExit else None
@@ -896,13 +1132,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             isinstance(nested, BaseException) and not isinstance(nested, SystemExit)
         ):
             reported = nested if isinstance(nested, BaseException) else error
-            recover(reported, report=True)
+            abort_experiment(reported)
             _announce_failure(reported)
             return 1
-        recover(error, report=False)
+        try:
+            discard_open_episode(runtime_failure_message(error))
+        except Exception:
+            pass
         return _coerce_exit_code(error)
     except Exception as error:
-        recover(error, report=True)
+        abort_experiment(error)
         _announce_failure(error)
         return 1
 

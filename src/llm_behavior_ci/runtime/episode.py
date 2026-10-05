@@ -159,6 +159,33 @@ def _outcome(result: EvaluationResult) -> EvaluatorOutcome:
     )
 
 
+def _runtime_failure_outcome(
+    session: object | None,
+    *,
+    enabled: bool,
+    mode: str,
+) -> EvaluatorOutcome | None:
+    if not enabled or mode != "execute" or session is None:
+        return None
+    if getattr(session, "_closed", False):
+        return None
+    if hasattr(session, "_world") and getattr(session, "_world", None) is None:
+        return None
+    evaluate = getattr(session, "evaluate", None)
+    if not callable(evaluate):
+        return None
+    try:
+        result = evaluate()
+    except Exception:
+        return None
+    if not isinstance(result, EvaluationResult):
+        return None
+    try:
+        return _outcome(result)
+    except Exception:
+        return None
+
+
 def _observation(result: ToolResult) -> str | None:
     if result.error_message is None:
         return result.output_text
@@ -237,6 +264,7 @@ def run_episode(
     on_start: Callable[[EpisodeIdentity, RunIdentity], None] | None = None,
     on_step: Callable[[ModelStep | ToolStep], None] | None = None,
     scenario_id: str | None = None,
+    evaluate_after_runtime_failure: bool = False,
 ) -> EpisodeResult:
     """Run one plan or execute episode and return a local ``EpisodeResult``.
 
@@ -245,8 +273,7 @@ def run_episode(
     from ``runtime.session_factory``, and always closes that session. When
     the session defines ``prepare``, that runs after the session is opened
     and before ``context`` and ``agent.begin``. Preparation is not a model
-    turn and not a tool step. A preparation failure is a runtime error with
-    no evaluator outcome. Plan
+    turn and not a tool step. A preparation failure is a runtime error. Plan
     mode takes one model turn and never executes or evaluates. Execute mode
     enforces ``config.agent.execute_turn_limit`` (``execute_max_model_turns``
     when set, else ``step_limit``) and records tool results. A generation
@@ -260,12 +287,16 @@ def run_episode(
     spends a turn on every generation. Execute mode evaluates
     when the agent stops, when ``complete_task`` succeeds, and when the step
     limit is reached. A step-limit evaluation does not change the failed
-    status. Unrecoverable runtime and tool failures are not evaluated.
+    status. Unrecoverable tool failures are not evaluated.
     ``RuntimeUnavailable`` from the model client, including a context-length
-    rejection, closes the episode as ``runtime_error`` with the steps already
-    recorded and no evaluator outcome. The prompt is not truncated.
-    ``scenario_id`` is stored on the local task reference when the caller
-    has one; it is not ground truth.
+    rejection, and an exception from the executor close the episode as
+    ``runtime_error`` with the steps already recorded. The prompt is not
+    truncated. Unless ``evaluate_after_runtime_failure`` is set, that close
+    records no evaluator outcome. When it is set, execute mode attempts
+    ``session.evaluate`` on a world that is already open. A closed session,
+    a world that was never opened, or any failure of that attempt leaves
+    the outcome unset. ``scenario_id`` is stored on the local task reference
+    when the caller has one; it is not ground truth.
     """
 
     _reject(task_id, config, mode, run)
@@ -296,7 +327,11 @@ def run_episode(
                     model_steps=[],
                     tool_steps=[],
                     plan_text=None,
-                    evaluator_outcome=None,
+                    evaluator_outcome=_runtime_failure_outcome(
+                        session,
+                        enabled=evaluate_after_runtime_failure,
+                        mode=mode,
+                    ),
                     termination_reason="runtime_error",
                     episode_errors=(
                         RecordedError(
@@ -466,7 +501,11 @@ def run_episode(
                     model_steps=model_steps,
                     tool_steps=tool_steps,
                     plan_text=None,
-                    evaluator_outcome=None,
+                    evaluator_outcome=_runtime_failure_outcome(
+                        session,
+                        enabled=evaluate_after_runtime_failure,
+                        mode=mode,
+                    ),
                     termination_reason="runtime_error",
                     episode_errors=(
                         RecordedError(
@@ -557,7 +596,11 @@ def run_episode(
             model_steps=model_steps,
             tool_steps=tool_steps,
             plan_text=None,
-            evaluator_outcome=None,
+            evaluator_outcome=_runtime_failure_outcome(
+                session,
+                enabled=evaluate_after_runtime_failure,
+                mode=mode,
+            ),
             termination_reason="runtime_error",
             episode_errors=(
                 RecordedError(

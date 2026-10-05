@@ -13,6 +13,7 @@ from unittest.mock import patch
 from llm_behavior_ci.config import RunConfiguration, new_episode_identity, new_run_identity
 from llm_behavior_ci.records import (
     EpisodeResult,
+    EvaluatorOutcome,
     LocalTaskRef,
     ModelStep,
     RecordedError,
@@ -21,10 +22,13 @@ from llm_behavior_ci.records import (
 from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
 from llm_behavior_ci.runtime.episode import (
+    EpisodeRejected,
     RuntimeDependencies,
     RuntimeUnavailable,
     run_episode,
 )
+from llm_behavior_ci.runtime.provenance import ProvenanceError
+from llm_behavior_ci.tasks.short_horizon import DIAGNOSTIC_RULE
 from llm_behavior_ci.storage import EpisodeStore
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -307,6 +311,95 @@ class EpisodeRuntimeFailureTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 store.load_open_episode(result.episode.episode_id)
 
+    def test_requested_partial_evaluation_keeps_the_runtime_failure(self) -> None:
+        config = _config()
+        clock = _clock()
+        session = _Session()
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=RuntimeDependencies(
+                session_factory=lambda task_id: session,
+                agent=_Agent(clock),
+                clock=clock,
+            ),
+            evaluate_after_runtime_failure=True,
+        )
+        self.assertEqual(session.evaluate_count, 1)
+        self.assertEqual(session.close_count, 1)
+        self.assertEqual(result.termination_reason, "runtime_error")
+        self.assertEqual(result.status, "failed")
+        self.assertIsNotNone(result.evaluator_outcome)
+        assert result.evaluator_outcome is not None
+        self.assertTrue(result.evaluator_outcome.success)
+        self.assertEqual(result.evaluator_outcome.passed_requirements, 1)
+        self.assertEqual(len(result.model_steps), 1)
+        self.assertEqual(len(result.tool_steps), 1)
+
+    def test_failed_partial_evaluation_stays_unavailable(self) -> None:
+        config = _config()
+        clock = _clock()
+
+        class _Raising(_Session):
+            def evaluate(self) -> EvaluationResult:
+                self.evaluate_count += 1
+                raise RuntimeError("evaluation result is missing counts")
+
+        session = _Raising()
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=RuntimeDependencies(
+                session_factory=lambda task_id: session,
+                agent=_Agent(clock),
+                clock=clock,
+            ),
+            evaluate_after_runtime_failure=True,
+        )
+        self.assertEqual(session.evaluate_count, 1)
+        self.assertEqual(session.close_count, 1)
+        self.assertIsNone(result.evaluator_outcome)
+        self.assertEqual(result.termination_reason, "runtime_error")
+
+    def test_unopened_world_is_not_scored_after_a_runtime_failure(self) -> None:
+        config = _config()
+        clock = _clock()
+        session = _Session()
+        session._world = None
+
+        class _Immediate:
+            def begin(self, context: TaskContext, config: RunConfiguration) -> None:
+                del context, config
+
+            def next_turn(self, *, tool_output: str | None):
+                del tool_output
+                raise RuntimeUnavailable(
+                    "context length exceeds maximum",
+                    reason="context_length_exceeded",
+                )
+
+        result = run_episode(
+            "task-1",
+            config,
+            "execute",
+            run=new_run_identity(config),
+            runtime=RuntimeDependencies(
+                session_factory=lambda task_id: session,
+                agent=_Immediate(),
+                clock=clock,
+            ),
+            evaluate_after_runtime_failure=True,
+        )
+        self.assertEqual(session.evaluate_count, 0)
+        self.assertEqual(session.close_count, 1)
+        self.assertIsNone(result.evaluator_outcome)
+        self.assertEqual(result.termination_reason, "runtime_error")
+        self.assertIn("context_length_exceeded", result.episode_errors[0].message)
+
 
 def _pilot():
     path = _ROOT / "scripts/evaluation/run_capability_pilot.py"
@@ -369,13 +462,117 @@ def _pilot_argv(directory: Path) -> list[str]:
     ]
 
 
+def _diagnostic_task_load(payload: object):
+    del payload
+    from llm_behavior_ci.config import TaskConfiguration
+    from llm_behavior_ci.tasks.selection import TaskSet
+
+    task = TaskConfiguration(
+        appworld_version="0.1.3.post1",
+        split="train",
+        selection_rule=DIAGNOSTIC_RULE,
+        selection_seed=17,
+        task_count=6,
+        task_set_hash="a" * 64,
+        appworld_setup_profile="spotify_authenticated_v1",
+    )
+    task_ids = tuple(f"task-{index}" for index in range(6))
+    scenario_ids = tuple(f"scenario-{index}" for index in range(6))
+    task_set = TaskSet(
+        appworld_version=task.appworld_version,
+        split=task.split,
+        selection_rule=task.selection_rule,
+        selection_seed=task.selection_seed,
+        task_count=6,
+        scenario_count=6,
+        task_ids=task_ids,
+        scenario_ids=scenario_ids,
+        task_set_hash=task.task_set_hash,
+    )
+    return task, task_set
+
+
+def _recorded_episode(
+    task_id,
+    config,
+    *,
+    run,
+    scenario_id,
+    on_start,
+    on_step,
+    termination_reason: str,
+    success: bool | None,
+    message: str | None = None,
+    steps: tuple[ModelStep, ...] = (),
+) -> EpisodeResult:
+    identity = new_episode_identity(run)
+    on_start(identity, run)
+    for step in steps:
+        on_step(step)
+    outcome = None
+    if success is not None:
+        outcome = EvaluatorOutcome(
+            success=success,
+            passed_requirements=1 if success else 0,
+            total_requirements=1,
+            difficulty=1,
+        )
+    errors: tuple[RecordedError, ...] = ()
+    status = "completed"
+    if termination_reason == "runtime_error":
+        status = "failed"
+        errors = (
+            RecordedError(
+                source="runtime",
+                recoverable=False,
+                message=message or "runtime_error",
+                step_index=None,
+            ),
+        )
+    started = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+    return EpisodeResult(
+        episode=identity,
+        run=run,
+        task=LocalTaskRef(
+            task_id=task_id,
+            scenario_id=scenario_id,
+            split=config.task.split,
+        ),
+        mode="execute",
+        execution_seed=config.agent.sampling.seed,
+        status=status,
+        started_at=started,
+        ended_at=started,
+        model_steps=steps,
+        tool_steps=(),
+        plan_text=None,
+        evaluator_outcome=outcome,
+        termination_reason=termination_reason,
+        episode_errors=errors,
+        role=None,
+    )
+
+
+def _model_step(text: str, *, token_id: int) -> ModelStep:
+    return ModelStep(
+        index=0,
+        prompt_text="next action",
+        output_text=text,
+        top_k_logprobs=((TokenLogprob(token_id=token_id, logprob=-0.2, rank=0),),),
+        generated_token_count=1,
+        latency_seconds=0.1,
+        started_at=datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc),
+    )
+
+
 class PilotFailureTests(unittest.TestCase):
-    def _run(self, directory: Path, side_effect):
+    def _run(self, directory: Path, side_effect, *, loader=_fake_task_load, provenance=None):
         pilot = _pilot()
         stderr = io.StringIO()
+        check_provenance = provenance or (lambda config: None)
         with (
-            patch.object(pilot, "enforce_committed_provenance", lambda config: None),
-            patch.object(pilot, "_load_task_set", _fake_task_load),
+            patch.object(pilot, "enforce_committed_provenance", check_provenance),
+            patch.object(pilot, "_load_task_set", loader),
             patch.object(pilot, "_adopt_committed_setup_profile", lambda task: task),
             patch.object(pilot, "run_episode", side_effect=side_effect),
             patch.object(pilot.sys, "stderr", stderr),
@@ -404,130 +601,404 @@ class PilotFailureTests(unittest.TestCase):
             self.assertNotIn("invalid literal", text)
             self.assertFalse(output.exists())
 
-    def test_raised_runtime_failure_writes_an_aborted_aggregate(self) -> None:
+    def test_context_length_is_a_runtime_failure_and_the_next_task_runs(self) -> None:
         message = (
             "vLLM request failed with HTTP 400 Bad Request:\n"
             "context length exceeds maximum"
         )
+        calls: list[str] = []
 
-        def fail(*args, **kwargs):
-            del args, kwargs
-            raise RuntimeUnavailable(message, reason="context_length_exceeded")
+        def run(task_id, config, mode, **kwargs):
+            del mode
+            calls.append(task_id)
+            self.assertIs(kwargs["evaluate_after_runtime_failure"], True)
+            if len(calls) == 1:
+                raise RuntimeUnavailable(message, reason="context_length_exceeded")
+            return _recorded_episode(
+                task_id,
+                config,
+                run=kwargs["run"],
+                scenario_id=kwargs["scenario_id"],
+                on_start=kwargs["on_start"],
+                on_step=kwargs["on_step"],
+                termination_reason="appworld_completed",
+                success=False,
+            )
 
         with tempfile.TemporaryDirectory() as directory:
-            code, text, output = self._run(Path(directory), fail)
-            self.assertEqual(code, 1)
-            self.assertIn("capability pilot failed", text)
-            self.assertIn("context length exceeds maximum", text)
+            code, text, output = self._run(
+                Path(directory),
+                run,
+                loader=_diagnostic_task_load,
+            )
+            self.assertEqual(code, 0)
+            self.assertNotIn("capability pilot failed", text)
             self.assertNotIn("AttributeError", text)
+            self.assertEqual(len(calls), 6)
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["pilot_status"], "aborted")
-            self.assertEqual(payload["episodes_expected"], 20)
-            self.assertEqual(payload["episodes_attempted"], 1)
-            self.assertEqual(payload["episodes_completed"], 0)
-            self.assertEqual(payload["failed_episode"], 0)
-            self.assertEqual(payload["failure_type"], "runtime_error")
-            self.assertIn("context length exceeds maximum", payload["failure_reason"])
-            self.assertIn("context_length_exceeded", payload["failure_reason"])
-            self.assertNotEqual(payload["task_count"], 20)
+            self.assertEqual(payload["run_status"], "completed")
+            self.assertEqual(payload["task_count"], 6)
+            self.assertEqual(payload["episodes_attempted"], 6)
+            self.assertEqual(payload["not_attempted_count"], 0)
+            self.assertEqual(sum(payload["terminal_status_counts"].values()), 6)
+            self.assertEqual(payload["runtime_failure_count"], 1)
+            self.assertEqual(payload["end_to_end_success_count"], 0)
+            self.assertEqual(payload["end_to_end_success_rate"], 0.0)
+            self.assertNotIn("failure_type", payload)
+            rows = payload["episodes"]
+            self.assertEqual(rows[0]["terminal_status"], "runtime_failure")
+            self.assertEqual(rows[0]["runtime_error_type"], "context_length_exceeded")
+            self.assertIn("context length exceeds maximum", rows[0]["runtime_error_message"])
+            self.assertIn("context_length_exceeded", rows[0]["runtime_error_message"])
+            self.assertEqual(rows[1]["terminal_status"], "evaluator_failure")
+            self.assertNotEqual(rows[1]["terminal_status"], "not_attempted")
 
-    def test_generic_exception_is_not_replaced(self) -> None:
+    def test_runtime_failure_stays_in_the_end_to_end_denominator(self) -> None:
+        calls: list[str] = []
+
+        def run(task_id, config, mode, **kwargs):
+            del mode
+            calls.append(task_id)
+            success = len(calls) == 2
+            return _recorded_episode(
+                task_id,
+                config,
+                run=kwargs["run"],
+                scenario_id=kwargs["scenario_id"],
+                on_start=kwargs["on_start"],
+                on_step=kwargs["on_step"],
+                termination_reason=(
+                    "runtime_error" if len(calls) == 1 else "appworld_completed"
+                ),
+                success=None if len(calls) == 1 else success,
+                message="context_length_exceeded\ncontext length exceeds maximum",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, _text, output = self._run(
+                Path(directory),
+                run,
+                loader=_diagnostic_task_load,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(len(calls), 6)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["task_count"], 6)
+            self.assertEqual(payload["end_to_end_success_count"], 1)
+            self.assertAlmostEqual(payload["end_to_end_success_rate"], 1 / 6)
+            self.assertEqual(payload["evaluator_success_count"], 1)
+            self.assertAlmostEqual(payload["evaluator_success_rate"], 1 / 6)
+            self.assertEqual(payload["runtime_failure_count"], 1)
+            self.assertEqual(payload["not_attempted_count"], 0)
+            self.assertEqual(payload["episodes"][0]["terminal_status"], "runtime_failure")
+
+    def test_partial_evaluator_success_is_still_an_end_to_end_failure(self) -> None:
+        def run(task_id, config, mode, **kwargs):
+            del mode
+            return _recorded_episode(
+                task_id,
+                config,
+                run=kwargs["run"],
+                scenario_id=kwargs["scenario_id"],
+                on_start=kwargs["on_start"],
+                on_step=kwargs["on_step"],
+                termination_reason="runtime_error",
+                success=True,
+                message="context_length_exceeded\nprompt too long",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, _text, output = self._run(
+                Path(directory),
+                run,
+                loader=_diagnostic_task_load,
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            row = payload["episodes"][0]
+            self.assertEqual(row["terminal_status"], "runtime_failure")
+            self.assertEqual(row["evaluator_status"], "success")
+            self.assertIs(row["evaluator_success"], True)
+            self.assertEqual(row["requirement_fraction"], 1)
+            self.assertEqual(payload["end_to_end_success_count"], 0)
+            self.assertEqual(payload["end_to_end_success_rate"], 0.0)
+            self.assertEqual(payload["evaluator_success_count"], 0)
+            self.assertEqual(payload["runtime_failure_count"], 6)
+            self.assertEqual(payload["evaluator_failure_count"], 0)
+            self.assertIsNone(payload["evaluator_only_success_rate"])
+
+    def test_unavailable_evaluator_is_not_success_or_failure_data(self) -> None:
+        calls: list[str] = []
+
+        def run(task_id, config, mode, **kwargs):
+            del mode
+            calls.append(task_id)
+            if len(calls) == 1:
+                return _recorded_episode(
+                    task_id,
+                    config,
+                    run=kwargs["run"],
+                    scenario_id=kwargs["scenario_id"],
+                    on_start=kwargs["on_start"],
+                    on_step=kwargs["on_step"],
+                    termination_reason="runtime_error",
+                    success=None,
+                    message="context_length_exceeded\ncontext length exceeds maximum",
+                )
+            return _recorded_episode(
+                task_id,
+                config,
+                run=kwargs["run"],
+                scenario_id=kwargs["scenario_id"],
+                on_start=kwargs["on_start"],
+                on_step=kwargs["on_step"],
+                termination_reason="appworld_completed",
+                success=len(calls) == 2,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, _text, output = self._run(
+                Path(directory),
+                run,
+                loader=_diagnostic_task_load,
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            row = payload["episodes"][0]
+            self.assertEqual(row["terminal_status"], "runtime_failure")
+            self.assertEqual(row["evaluator_status"], "unavailable")
+            self.assertIsNone(row["evaluator_success"])
+            self.assertIsNone(row["passed_requirements"])
+            self.assertIsNone(row["total_requirements"])
+            self.assertIsNone(row["requirement_fraction"])
+            self.assertEqual(payload["evaluator_success_count"], 1)
+            self.assertEqual(payload["evaluator_failure_count"], 4)
+            self.assertEqual(payload["runtime_failure_count"], 1)
+            self.assertEqual(payload["evaluator_only_success_count"], 1)
+            self.assertAlmostEqual(payload["evaluator_only_success_rate"], 0.2)
+            self.assertAlmostEqual(payload["end_to_end_success_rate"], 1 / 6)
+
+    def test_provenance_failure_aborts_before_any_episode(self) -> None:
+        calls: list[str] = []
+
+        def run(*args, **kwargs):
+            del args, kwargs
+            calls.append("ran")
+            raise AssertionError("episode ran")
+
+        def provenance(config) -> None:
+            del config
+            raise ProvenanceError("configured git_commit does not match HEAD")
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, text, output = self._run(
+                Path(directory),
+                run,
+                provenance=provenance,
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(calls, [])
+            self.assertIn("capability pilot failed", text)
+            self.assertIn("does not match HEAD", text)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["run_status"], "aborted")
+            self.assertEqual(payload["pilot_status"], "aborted")
+            self.assertEqual(payload["failure_type"], "experiment_error")
+            self.assertEqual(payload["not_attempted_count"], 20)
+            self.assertEqual(payload["episodes_attempted"], 0)
+            self.assertEqual(payload["task_count"], 20)
+            self.assertEqual(payload["end_to_end_success_count"], 0)
+
+    def test_completed_status_includes_runtime_failures(self) -> None:
+        def run(task_id, config, mode, **kwargs):
+            del mode
+            return _recorded_episode(
+                task_id,
+                config,
+                run=kwargs["run"],
+                scenario_id=kwargs["scenario_id"],
+                on_start=kwargs["on_start"],
+                on_step=kwargs["on_step"],
+                termination_reason="runtime_error",
+                success=None,
+                message="context_length_exceeded\ncontext length exceeds maximum",
+                steps=(_model_step("partial", token_id=4),),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, text, output = self._run(
+                Path(directory),
+                run,
+                loader=_diagnostic_task_load,
+            )
+            self.assertEqual(code, 0)
+            self.assertNotIn("capability pilot failed", text)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["run_status"], "completed")
+            self.assertEqual(payload["pilot_status"], "completed")
+            self.assertEqual(payload["runtime_failure_count"], 6)
+            self.assertEqual(payload["not_attempted_count"], 0)
+            self.assertEqual(payload["episodes_attempted"], 6)
+            self.assertNotIn("failure_reason", payload)
+            row = payload["episodes"][0]
+            self.assertEqual(row["model_step_count"], 1)
+            self.assertEqual(row["termination_reason"], "runtime_error")
+            self.assertIsInstance(row["parser_error_count"], int)
+            self.assertIsInstance(row["workflow_envelope_rejection_count"], int)
+            self.assertIsInstance(row["completion_gate_block_count"], int)
+            self.assertIsInstance(row["stall_event_count"], int)
+            self.assertEqual(row["parser_error_count"], payload["parser_error_count"] // 6)
+
+    def test_experiment_failure_aborts_and_leaves_the_rest_unattempted(self) -> None:
+        calls: list[str] = []
+
+        def run(task_id, config, mode, **kwargs):
+            del mode
+            calls.append(task_id)
+            if len(calls) == 2:
+                raise EpisodeRejected("run identity does not match the configuration")
+            return _recorded_episode(
+                task_id,
+                config,
+                run=kwargs["run"],
+                scenario_id=kwargs["scenario_id"],
+                on_start=kwargs["on_start"],
+                on_step=kwargs["on_step"],
+                termination_reason="appworld_completed",
+                success=False,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            code, text, output = self._run(
+                Path(directory),
+                run,
+                loader=_diagnostic_task_load,
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("capability pilot failed", text)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["run_status"], "aborted")
+            self.assertEqual(payload["failure_type"], "experiment_error")
+            self.assertEqual(payload["failed_episode"], 1)
+            self.assertEqual(payload["episodes_attempted"], 1)
+            self.assertEqual(payload["not_attempted_count"], 5)
+            self.assertEqual(payload["task_count"], 6)
+            rows = payload["episodes"]
+            self.assertEqual(len(rows), 6)
+            self.assertEqual(rows[0]["terminal_status"], "evaluator_failure")
+            self.assertTrue(all(row["terminal_status"] == "not_attempted" for row in rows[1:]))
+            self.assertEqual(sum(payload["terminal_status_counts"].values()), 6)
+
+    def test_generic_exception_is_recorded_without_replacing_the_message(self) -> None:
         def fail(*args, **kwargs):
             del args, kwargs
             raise RuntimeError("sampler backend disconnected")
 
         with tempfile.TemporaryDirectory() as directory:
-            code, text, output = self._run(Path(directory), fail)
-            self.assertEqual(code, 1)
-            self.assertIn("capability pilot failed", text)
-            self.assertIn("sampler backend disconnected", text)
+            root = Path(directory)
+            code, text, output = self._run(root, fail)
+            self.assertEqual(code, 0)
+            self.assertNotIn("capability pilot failed", text)
+            self.assertNotIn("AttributeError", text)
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["pilot_status"], "aborted")
-            self.assertIn("sampler backend disconnected", payload["failure_reason"])
+            self.assertEqual(payload["run_status"], "completed")
+            self.assertEqual(payload["task_count"], 20)
+            self.assertEqual(payload["runtime_failure_count"], 20)
+            self.assertEqual(payload["not_attempted_count"], 0)
+            self.assertEqual(payload["end_to_end_success_count"], 0)
+            store = EpisodeStore(root / "episodes.sqlite")
+            episode_id = store._connection.execute(
+                "SELECT episode_id FROM episodes ORDER BY rowid"
+            ).fetchone()[0]
+            loaded = store.load_episode(episode_id)
+            self.assertEqual(loaded.termination_reason, "runtime_error")
+            self.assertIn("sampler backend disconnected", loaded.episode_errors[0].message)
+            self.assertIsNone(loaded.evaluator_outcome)
 
-    def test_returned_runtime_error_aborts_and_keeps_stored_steps(self) -> None:
-        def fail(task_id, config, mode, *, run, runtime, on_start, on_step, scenario_id):
-            del runtime, mode
-            identity = new_episode_identity(run)
-            on_start(identity, run)
-            started = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
-            step = ModelStep(
-                index=0,
-                prompt_text="next action",
-                output_text="calendar.lookup()",
-                top_k_logprobs=(
-                    (TokenLogprob(token_id=3, logprob=-0.2, rank=0),),
-                ),
-                generated_token_count=1,
-                latency_seconds=0.1,
-                started_at=started,
-            )
-            on_step(step)
-            message = (
-                "context_length_exceeded\n"
-                "vLLM request failed with HTTP 400 Bad Request:\n"
-                "context length exceeds maximum"
-            )
-            return EpisodeResult(
-                episode=identity,
-                run=run,
-                task=LocalTaskRef(
-                    task_id=task_id,
-                    scenario_id=scenario_id,
-                    split=config.task.split,
-                ),
-                mode="execute",
-                execution_seed=config.agent.sampling.seed,
-                status="failed",
-                started_at=started,
-                ended_at=started,
-                model_steps=(step,),
-                tool_steps=(),
-                plan_text=None,
-                evaluator_outcome=None,
+    def test_returned_runtime_error_keeps_steps_and_continues(self) -> None:
+        calls: list[str] = []
+
+        def fail(task_id, config, mode, **kwargs):
+            del mode
+            calls.append(task_id)
+            if len(calls) > 1:
+                return _recorded_episode(
+                    task_id,
+                    config,
+                    run=kwargs["run"],
+                    scenario_id=kwargs["scenario_id"],
+                    on_start=kwargs["on_start"],
+                    on_step=kwargs["on_step"],
+                    termination_reason="appworld_completed",
+                    success=False,
+                )
+            return _recorded_episode(
+                task_id,
+                config,
+                run=kwargs["run"],
+                scenario_id=kwargs["scenario_id"],
+                on_start=kwargs["on_start"],
+                on_step=kwargs["on_step"],
                 termination_reason="runtime_error",
-                episode_errors=(
-                    RecordedError(
-                        source="runtime",
-                        recoverable=False,
-                        message=message,
-                        step_index=None,
-                    ),
+                success=None,
+                message=(
+                    "context_length_exceeded\n"
+                    "vLLM request failed with HTTP 400 Bad Request:\n"
+                    "context length exceeds maximum"
                 ),
-                role=None,
+                steps=(_model_step("calendar.lookup()", token_id=3),),
             )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            code, text, output = self._run(root, fail)
-            self.assertEqual(code, 1)
-            self.assertIn("capability pilot failed", text)
-            self.assertIn("context length exceeds maximum", text)
+            code, text, output = self._run(
+                root,
+                fail,
+                loader=_diagnostic_task_load,
+            )
+            self.assertEqual(code, 0)
+            self.assertNotIn("capability pilot failed", text)
+            self.assertEqual(len(calls), 6)
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(payload["pilot_status"], "aborted")
-            self.assertEqual(payload["episodes_attempted"], 1)
-            self.assertEqual(payload["episodes_completed"], 0)
+            self.assertEqual(payload["run_status"], "completed")
+            self.assertEqual(payload["runtime_failure_count"], 1)
             self.assertEqual(payload["model_generation_count"], 1)
-            self.assertIn("context length exceeds maximum", payload["failure_reason"])
+            self.assertEqual(payload["episodes"][0]["model_step_count"], 1)
+            self.assertEqual(payload["episodes"][1]["terminal_status"], "evaluator_failure")
             store = EpisodeStore(root / "episodes.sqlite")
-            rows = store._connection.execute(
-                "SELECT state FROM episodes"
+            states = store._connection.execute(
+                "SELECT state FROM episodes ORDER BY rowid"
             ).fetchall()
-            self.assertEqual(rows, [("finished",)])
-            loaded_id = store._connection.execute(
-                "SELECT episode_id FROM episodes"
+            self.assertEqual(states, [("finished",)] * 6)
+            episode_id = store._connection.execute(
+                "SELECT episode_id FROM episodes ORDER BY rowid"
             ).fetchone()[0]
-            loaded = store.load_episode(loaded_id)
+            loaded = store.load_episode(episode_id)
             self.assertEqual(loaded.termination_reason, "runtime_error")
             self.assertIsNone(loaded.evaluator_outcome)
-            self.assertEqual(len(loaded.model_steps), 1)
+            self.assertEqual(loaded.model_steps[0].output_text, "calendar.lookup()")
 
-    def test_raised_after_a_stored_step_finalizes_the_open_episode(self) -> None:
-        def fail(task_id, config, mode, *, run, runtime, on_start, on_step, scenario_id):
-            del task_id, config, mode, runtime, scenario_id
-            identity = new_episode_identity(run)
-            on_start(identity, run)
-            on_step(
+    def test_raised_after_a_stored_step_finalizes_that_episode_only(self) -> None:
+        calls: list[str] = []
+
+        def fail(task_id, config, mode, **kwargs):
+            del mode
+            calls.append(task_id)
+            if len(calls) > 1:
+                return _recorded_episode(
+                    task_id,
+                    config,
+                    run=kwargs["run"],
+                    scenario_id=kwargs["scenario_id"],
+                    on_start=kwargs["on_start"],
+                    on_step=kwargs["on_step"],
+                    termination_reason="appworld_completed",
+                    success=False,
+                )
+            identity = new_episode_identity(kwargs["run"])
+            kwargs["on_start"](identity, kwargs["run"])
+            kwargs["on_step"](
                 ModelStep(
                     index=0,
                     prompt_text="next action",
@@ -548,17 +1019,26 @@ class PilotFailureTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            code, text, output = self._run(root, fail)
-            self.assertEqual(code, 1)
-            self.assertIn("capability pilot failed", text)
+            code, text, output = self._run(
+                root,
+                fail,
+                loader=_diagnostic_task_load,
+            )
+            self.assertEqual(code, 0)
+            self.assertNotIn("capability pilot failed", text)
             self.assertNotIn("AttributeError", text)
+            self.assertEqual(len(calls), 6)
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertIn("context length exceeds maximum", payload["failure_reason"])
+            self.assertEqual(payload["run_status"], "completed")
+            row = payload["episodes"][0]
+            self.assertEqual(row["terminal_status"], "runtime_failure")
+            self.assertEqual(row["runtime_error_type"], "context_length_exceeded")
+            self.assertIn("context length exceeds maximum", row["runtime_error_message"])
+            self.assertEqual(row["model_step_count"], 1)
+            self.assertEqual(row["evaluator_status"], "unavailable")
             store = EpisodeStore(root / "episodes.sqlite")
-            state = store._connection.execute("SELECT state FROM episodes").fetchone()[0]
-            self.assertEqual(state, "finished")
             episode_id = store._connection.execute(
-                "SELECT episode_id FROM episodes"
+                "SELECT episode_id FROM episodes ORDER BY rowid"
             ).fetchone()[0]
             loaded = store.load_episode(episode_id)
             self.assertEqual(loaded.status, "failed")
