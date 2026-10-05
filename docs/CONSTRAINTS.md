@@ -12,7 +12,7 @@ Check `nvidia-smi` before a launch. Project A, and Project B if it runs, share t
 
 Agent episodes are multi-turn with long prompts, so memory and GPU-hours are measured at the agent's real context length, not at a short-prompt benchmark. AppWorld itself runs on CPU.
 
-Time is not a constraint. Log GPU-hours per run anyway. They are part of the cost answer and of `RESUME_FACTS.md`.
+Time is not a constraint. Log GPU-hours per run anyway. They are part of the cost answer.
 
 ## Stack
 

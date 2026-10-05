@@ -170,5 +170,5 @@ Report with confidence intervals over replicates, clustered by scenario where ep
 
 - A README with the headline figure (detection delay against false alarms per method) and exact commands.
 - A workshop-style draft. Ask before submitting.
-- `RESUME_FACTS.md`, filled only from measured results.
+- Headline numbers, taken only from measured results under `results/`.
 - Upstream PRs are optional and require asking first. Candidates named in the handoff: an anytime-valid detector for River, or a sequential drift test for Evidently, if either lacks one. Its documentation, as checked 2026-09-26, shows none.

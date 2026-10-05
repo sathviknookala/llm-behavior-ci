@@ -147,7 +147,7 @@ What this project is for:
 - The Gao et al. anchor matched, or its gap is documented (`PRIOR_WORK.md`, `EVAL_PROTOCOL.md`).
 - `EVAL_PROTOCOL.md` was committed in pre-registered form, with all methodology frozen, before `test_normal` was first run.
 - The final benchmark ran on `test_normal` under that frozen protocol: the shared-stream method comparison, and the end-to-end flow of the Tier 1 gate on `train`, the Tier 2 canary on `test_normal`, and Tier 3 monitoring on `test_normal`.
-- Every headline number has confidence intervals, a baseline, and a commit in `RESUME_FACTS.md`.
+- Every headline number has confidence intervals, a baseline, and a commit under `results/`.
 - The README reproduces the headline figure from committed scripts, and `docker compose up` plus one command runs the service, one `train` or `dev` task through all three tiers, and a demo fault end to end.
 - The public repo holds only the artifacts `DATA.md` allows; everything else stays local.
 - A workshop-style draft exists. Submitting it requires asking first.
