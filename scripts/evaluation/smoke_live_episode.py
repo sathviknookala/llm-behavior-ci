@@ -1,11 +1,13 @@
-"""Run one execute-mode AppWorld episode against a live vLLM endpoint.
+"""Run one execute-mode AppWorld episode against a live model.
 
-Requires --configuration, --task-set, --task-index, --base-url, and --store.
-APPWORLD_ROOT must be set to an existing directory. Bare invocation exits 2.
-Store paths under a directory named results are refused. Prints one public-safe
-JSON object. Not a benchmark and not a gate. This development smoke stamps
-the current HEAD and does not refuse a dirty tree. A capture, live gate,
-harm measurement, or benchmark does.
+Requires --configuration, --task-set, --task-index, and --store. A vLLM
+configuration also requires --base-url. An Anthropic configuration reads
+``ANTHROPIC_API_KEY`` and does not use a local server. APPWORLD_ROOT must
+be set to an existing directory. Bare invocation exits 2. Store paths under
+a directory named results are refused. Prints one public-safe JSON object.
+Not a benchmark and not a gate. This development smoke stamps the current
+HEAD and does not refuse a dirty tree. A capture, live gate, harm
+measurement, or benchmark does.
 """
 
 from __future__ import annotations
@@ -20,12 +22,14 @@ from pathlib import Path
 
 from llm_behavior_ci.config import (
     AgentConfiguration,
+    AnthropicModelConfiguration,
     ConfigError,
     EpisodeIdentity,
     ModelConfiguration,
     RunConfiguration,
     RunIdentity,
     TaskConfiguration,
+    load_model_configuration,
     new_run_identity,
     run_configuration_hash,
 )
@@ -199,14 +203,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Run one execute-mode AppWorld episode against a live vLLM endpoint. "
+            "Run one execute-mode AppWorld episode against a live model. "
             "Prints one public-safe JSON object. Not a benchmark and not a gate."
         )
     )
     parser.add_argument("--configuration", required=True)
     parser.add_argument("--task-set", required=True)
     parser.add_argument("--task-index", required=True, type=int)
-    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--base-url", default=None)
     parser.add_argument("--store", required=True)
     try:
         args = parser.parse_args(args_list)
@@ -246,8 +250,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         if "model" not in configuration_payload or "agent" not in configuration_payload:
             print("configuration must contain model and agent", file=sys.stderr)
             return 2
-        model = ModelConfiguration.from_dict(configuration_payload["model"])
+        model = load_model_configuration(configuration_payload["model"])
         agent = AgentConfiguration.from_dict(configuration_payload["agent"])
+        if isinstance(model, ModelConfiguration):
+            if not isinstance(args.base_url, str) or args.base_url.strip() == "":
+                print("smoke episode requires --base-url", file=sys.stderr)
+                return 2
+            endpoint_url: str | None = args.base_url
+        elif isinstance(model, AnthropicModelConfiguration):
+            if args.base_url not in (None, ""):
+                print("Anthropic smoke does not use --base-url", file=sys.stderr)
+                return 2
+            endpoint_url = None
+        else:
+            print("smoke episode requires a supported model provider", file=sys.stderr)
+            return 2
         task, task_set = _load_task_set(_load_json(task_set_path))
         if not _matches_committed_public(task):
             print("task set does not match committed public metadata", file=sys.stderr)
@@ -264,7 +281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             protocol_hash=None,
         )
         run = new_run_identity(configuration)
-        runtime = build_runtime(configuration, args.base_url, mode="execute")
+        runtime = build_runtime(configuration, endpoint_url, mode="execute")
         store = EpisodeStore(store_path)
         task_id = task_set.task_ids[args.task_index]
         scenario_id = task_set.scenario_ids[args.task_index]

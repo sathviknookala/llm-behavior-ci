@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Mapping, Protocol
 
-from llm_behavior_ci.config import ACTION_INTERFACES, RunConfiguration
+from llm_behavior_ci.config import (
+    ACTION_INTERFACES,
+    AnthropicModelConfiguration,
+    AnthropicSamplingSettings,
+    RunConfiguration,
+)
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
 from llm_behavior_ci.runtime.clock import monotonic, wall_now
@@ -41,6 +47,13 @@ except ImportError:
     _SmolPythonExecutor = object
 
 _TOKEN_ID_PREFIX = "token_id:"
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+_ANTHROPIC_RETRYABLE = frozenset({429, 500, 502, 503, 504, 529})
+_ANTHROPIC_ATTEMPTS = 5
+
+
+class UnsupportedCapability(RuntimeError):
+    """The provider cannot perform this AgentLoop operation."""
 
 
 def _http_error_body(error: urllib.error.HTTPError) -> str:
@@ -150,6 +163,7 @@ class _EpisodeState:
     context: TaskContext
     config: RunConfiguration
     history: list[dict[str, str]] = field(default_factory=list)
+    assistant_blocks: list[list[object]] = field(default_factory=list)
 
 
 def _logprob_token_id(entry: object) -> int:
@@ -938,3 +952,433 @@ def _parse_prompt_logprobs(
             "endpoint did not return prompt or echo logprobs for the frozen plan"
         )
     return tuple(positions)
+
+
+def _redact_secret(text: str, secret: str) -> str:
+    if secret == "":
+        return text
+    return text.replace(secret, "[redacted]")
+
+
+def _anthropic_context_length(body: str) -> bool:
+    if _context_length_exceeded(body):
+        return True
+    text = body.lower()
+    if "model_context_window_exceeded" in text:
+        return True
+    if "prompt is too long" in text:
+        return True
+    return "context window" in text and ("exceed" in text or "too long" in text)
+
+
+def _retry_delay(attempt: int, error: urllib.error.HTTPError | None) -> float:
+    if error is not None and error.headers is not None:
+        header = error.headers.get("retry-after")
+        if isinstance(header, str) and header.isdigit():
+            seconds = int(header)
+            if 0 < seconds <= 20:
+                return float(seconds)
+    return min(8.0, 0.5 * (2**attempt))
+
+
+def _anthropic_http_error(
+    error: urllib.error.HTTPError,
+    secret: str,
+) -> RuntimeError:
+    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+    body = _redact_secret(_http_error_body(error), secret)
+    if len(body) > 4000:
+        body = body[:4000]
+    reason = (
+        "context_length_exceeded" if _anthropic_context_length(body) else None
+    )
+    message = _redact_secret(
+        (
+            f"Anthropic request failed with HTTP {error.code} {error.reason}:\n"
+            f"{body}\n"
+            f"endpoint: {ANTHROPIC_MESSAGES_URL}"
+        ),
+        secret,
+    )
+    return RuntimeUnavailable(message, reason=reason)
+
+
+def _replay_blocks(content: object) -> list[object]:
+    if not isinstance(content, list):
+        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+        raise RuntimeUnavailable("Anthropic response was malformed")
+    return json.loads(json.dumps(content))
+
+
+def _visible_response_text(content: object) -> str:
+    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+    if not isinstance(content, list):
+        raise RuntimeUnavailable("Anthropic response was malformed")
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            raise RuntimeUnavailable("Anthropic response was malformed")
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise RuntimeUnavailable("Anthropic response was malformed")
+            parts.append(text)
+            continue
+        if block_type in {"thinking", "redacted_thinking", "refusal"}:
+            continue
+        raise RuntimeUnavailable("Anthropic response was malformed")
+    return "".join(parts)
+
+
+def _output_token_count(payload: Mapping[object, object]) -> int:
+    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        raise RuntimeUnavailable("Anthropic response was malformed")
+    count = usage.get("output_tokens")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise RuntimeUnavailable("Anthropic response was malformed")
+    return count
+
+
+class SmolagentsAnthropicAgent:
+    """An ``AgentLoop`` whose generations come from the Anthropic Messages API.
+
+    Prompt rendering, history, action parsing, and the workflow controller
+    stay on the same path as ``SmolagentsVLLMAgent``. This class replaces
+    only the model request. The API key is an HTTP header and is omitted
+    from ``repr``, configuration JSON, and exception text.
+    """
+
+    def __init__(self, api_key: str) -> None:
+        if not isinstance(api_key, str) or api_key.strip() == "":
+            from llm_behavior_ci.runtime.episode import EpisodeRejected
+
+            raise EpisodeRejected("ANTHROPIC_API_KEY is required")
+        self._api_key = api_key.strip()
+        self._mode = "execute"
+        self._local = threading.local()
+
+    def __repr__(self) -> str:
+        return "SmolagentsAnthropicAgent(provider='anthropic')"
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in {"plan", "execute"}:
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable("mode must be plan or execute")
+        self._mode = mode
+
+    def begin(self, context: TaskContext, config: RunConfiguration) -> None:
+        validate_chat_request(config)
+        self._require_anthropic(config)
+        try:
+            render_system_text(
+                prompt_version=config.agent.prompt.prompt_version,
+                plan_format_version=config.agent.prompt.plan_format_version,
+                thinking_enabled=config.agent.prompt.thinking_enabled,
+                action_interface=config.agent.action_interface,
+                mode=self._mode,
+            )
+        except UnknownPromptVersion as error:
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable(str(error)) from error
+        self._local.state = _EpisodeState(context=context, config=config)
+
+    def _state(self) -> _EpisodeState:
+        state = getattr(self._local, "state", None)
+        if state is None:
+            raise RuntimeError("agent begin was not called")
+        return state
+
+    def _require_anthropic(self, config: RunConfiguration) -> AnthropicModelConfiguration:
+        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+        model = config.model
+        sampling = config.agent.sampling
+        if not isinstance(model, AnthropicModelConfiguration):
+            raise RuntimeUnavailable(
+                "Anthropic agent requires an Anthropic model configuration"
+            )
+        if not isinstance(sampling, AnthropicSamplingSettings):
+            raise RuntimeUnavailable(
+                "Anthropic agent requires unset vLLM sampling controls"
+            )
+        return model
+
+    def _system_text(self) -> str:
+        state = self._state()
+        prompt = state.config.agent.prompt
+        try:
+            return render_system_text(
+                prompt_version=prompt.prompt_version,
+                plan_format_version=prompt.plan_format_version,
+                thinking_enabled=prompt.thinking_enabled,
+                action_interface=state.config.agent.action_interface,
+                mode=self._mode,
+            )
+        except UnknownPromptVersion as error:
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable(str(error)) from error
+
+    def _api_documentation(self) -> str:
+        state = self._state()
+        agent = state.config.agent
+        text = state.context.api_documentation
+        source = getattr(state.context, "api_documentation_source", None)
+        if (
+            agent.prompt.prompt_version == PROMPT_RUNTIME_AUTH_V2
+            and source is not None
+        ):
+            text = render_api_documentation(source, include_constraints=True)
+        try:
+            return resolve_api_documentation(
+                text,
+                api_docs_version=agent.api_docs_version,
+                api_docs_app=agent.api_docs_app,
+            )
+        except ApiDocsCorruptionError as error:
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable(str(error)) from error
+
+    def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
+        state = self._state()
+        built = [
+            {"role": "system", "content": self._system_text()},
+            {
+                "role": "user",
+                "content": (
+                    f"{state.context.instruction}\n"
+                    f"{self._api_documentation()}"
+                ),
+            },
+        ]
+        built.extend(state.history)
+        if tool_output is not None:
+            built.append({"role": "user", "content": tool_output})
+        return built
+
+    def completion_payload(
+        self, messages: list[dict[str, str]]
+    ) -> dict[str, object]:
+        """The Anthropic Messages body for one agent turn.
+
+        The system prompt is the top-level ``system`` field. Conversation
+        messages keep the task, API documentation, and append-only history.
+        Sampling controls that Claude Sonnet 5.5 rejects are omitted.
+        ``max_tokens`` is the mode-specific generation cap.
+        """
+
+        state = self._state()
+        model = self._require_anthropic(state.config)
+        sampling = state.config.agent.sampling
+        if not isinstance(sampling, AnthropicSamplingSettings):
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable(
+                "Anthropic agent requires unset vLLM sampling controls"
+            )
+        if not messages or messages[0].get("role") != "system":
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable("system prompt is missing")
+        system = messages[0].get("content")
+        if not isinstance(system, str) or system == "":
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable("system prompt is missing")
+        conversation: list[dict[str, object]] = []
+        for message in messages[1:]:
+            role = message.get("role")
+            content = message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, str):
+                from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+                raise RuntimeUnavailable("Anthropic conversation was malformed")
+            conversation.append({"role": role, "content": content})
+        if not conversation or conversation[-1]["role"] != "user":
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable(
+                "Anthropic requests must end with a user message"
+            )
+        block_index = 0
+        for message in conversation:
+            if message["role"] != "assistant":
+                continue
+            if block_index >= len(state.assistant_blocks):
+                from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+                raise RuntimeUnavailable(
+                    "Anthropic assistant history is missing response blocks"
+                )
+            message["content"] = state.assistant_blocks[block_index]
+            block_index += 1
+        if block_index != len(state.assistant_blocks):
+            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+            raise RuntimeUnavailable(
+                "Anthropic assistant history is missing response blocks"
+            )
+        return {
+            "model": model.model_id,
+            "max_tokens": sampling.generation_max_tokens(self._mode),
+            "system": system,
+            "messages": conversation,
+            "thinking": {"type": model.thinking_mode},
+            "output_config": {"effort": model.effort},
+        }
+
+    def parse_model_output(
+        self, text: str
+    ) -> tuple[str | None, str | None, str | None]:
+        return parse_model_output(text)
+
+    def _headers(self) -> dict[str, str]:
+        model = self._require_anthropic(self._state().config)
+        return {
+            "content-type": "application/json",
+            "x-api-key": self._api_key,
+            "anthropic-version": model.api_version,
+        }
+
+    def _read_message(self, payload: Mapping[object, object]) -> tuple[str, int]:
+        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+        if payload.get("stop_reason") == "model_context_window_exceeded":
+            raise RuntimeUnavailable(
+                "context_length_exceeded\n"
+                "Anthropic stop_reason model_context_window_exceeded",
+                reason="context_length_exceeded",
+            )
+        return _visible_response_text(payload.get("content")), _output_token_count(
+            payload
+        )
+
+    def generate_turn(
+        self,
+        *,
+        tool_output: str | None,
+        extra_instruction: str | None = None,
+        parse_action: bool = True,
+    ) -> AgentTurn:
+        if self._mode == "plan":
+            raise UnsupportedCapability(
+                "Anthropic does not expose prompt-token logprobs; "
+                "plan-mode scoring is unsupported"
+            )
+        state = self._state()
+        started_at = wall_now()
+        if tool_output is not None:
+            state.history.append({"role": "user", "content": tool_output})
+        messages = self.messages()
+        if extra_instruction is not None:
+            messages.append({"role": "user", "content": extra_instruction})
+        payload = self.completion_payload(messages)
+        began = monotonic()
+        raw = self._post(payload)
+        latency_seconds = monotonic() - began
+        output_text, token_count = self._read_message(raw)
+        replay = _replay_blocks(raw.get("content"))
+        if parse_action:
+            rejection = None
+            try:
+                action, app_name, api_name = parse_model_output(output_text)
+            except ActionRejected as error:
+                action, app_name, api_name = None, None, None
+                rejection = str(error)
+        else:
+            action, app_name, api_name = None, None, None
+            rejection = None
+        state.history.append({"role": "assistant", "content": output_text})
+        state.assistant_blocks.append(replay)
+        return AgentTurn(
+            prompt_text=messages[-1]["content"],
+            output_text=output_text,
+            top_k_logprobs=(),
+            generated_token_count=token_count,
+            latency_seconds=latency_seconds,
+            started_at=started_at,
+            action=action,
+            app_name=app_name,
+            api_name=api_name,
+            rejection=rejection,
+        )
+
+    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+        return self.generate_turn(
+            tool_output=tool_output,
+            extra_instruction=None,
+            parse_action=True,
+        )
+
+    def teacher_force_plan(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        plan_text: str,
+    ) -> tuple[tuple[TokenLogprob, ...], ...]:
+        del messages, plan_text
+        raise UnsupportedCapability(
+            "Anthropic does not expose prompt-token logprobs; "
+            "teacher-forced plan KL is unsupported"
+        )
+
+    def _post(self, payload: dict[str, object]) -> dict[str, object]:
+        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+        body = json.dumps(payload).encode("utf-8")
+        if self._api_key.encode("utf-8") in body:
+            raise RuntimeUnavailable("Anthropic request was malformed")
+        headers = self._headers()
+        last_error: BaseException | None = None
+        for attempt in range(_ANTHROPIC_ATTEMPTS):
+            request = urllib.request.Request(
+                ANTHROPIC_MESSAGES_URL,
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=240) as response:
+                    raw = response.read()
+                break
+            except urllib.error.HTTPError as error:
+                last_error = error
+                if (
+                    error.code in _ANTHROPIC_RETRYABLE
+                    and attempt + 1 < _ANTHROPIC_ATTEMPTS
+                ):
+                    time.sleep(_retry_delay(attempt, error))
+                    continue
+                raise _anthropic_http_error(error, self._api_key) from error
+            except (urllib.error.URLError, TimeoutError, OSError) as error:
+                last_error = error
+                if attempt + 1 < _ANTHROPIC_ATTEMPTS:
+                    time.sleep(_retry_delay(attempt, None))
+                    continue
+                raise RuntimeUnavailable(
+                    _redact_secret(str(error), self._api_key)
+                ) from error
+        else:
+            raise RuntimeUnavailable(
+                _redact_secret(str(last_error), self._api_key)
+            )
+        try:
+            if isinstance(raw, str):
+                decoded = json.loads(raw)
+            else:
+                decoded = json.loads(bytes(raw).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeUnavailable("Anthropic response was malformed") from error
+        if not isinstance(decoded, dict):
+            raise RuntimeUnavailable("Anthropic response was malformed")
+        return decoded

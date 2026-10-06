@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 from dataclasses import dataclass, replace
 from functools import partial
@@ -13,6 +14,7 @@ from llm_behavior_ci.config import (
     RunIdentity,
     new_episode_identity,
     new_pair_id,
+    recorded_execution_seed,
     run_configuration_hash,
 )
 from llm_behavior_ci.records import (
@@ -99,20 +101,25 @@ def is_live_runtime(runtime: RuntimeDependencies) -> bool:
     around several agents (a switching agent used to run reference and
     candidate through one gate call) exposes them through
     ``underlying_agents()``; every one of them must be a real
-    ``SmolagentsVLLMAgent`` for the runtime to count as live.
+    ``SmolagentsVLLMAgent`` or ``SmolagentsAnthropicAgent`` for the runtime
+    to count as live.
     ``build_runtime`` binds ``tool_access_profile`` and
     ``appworld_setup_profile`` with ``functools.partial``; that partial is
     live when it wraps ``LiveAppWorldSession`` and names no other argument.
     """
 
-    from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
+    from llm_behavior_ci.runtime.agent import (
+        SmolagentsAnthropicAgent,
+        SmolagentsVLLMAgent,
+    )
 
     if not _is_live_session_factory(runtime.session_factory):
         return False
     underlying = getattr(runtime.agent, "underlying_agents", None)
     agents = underlying() if callable(underlying) else (runtime.agent,)
+    live_agents = (SmolagentsVLLMAgent, SmolagentsAnthropicAgent)
     return len(agents) > 0 and all(
-        isinstance(agent, SmolagentsVLLMAgent) for agent in agents
+        isinstance(agent, live_agents) for agent in agents
     )
 
 
@@ -239,7 +246,7 @@ def _finish(
             split=config.task.split,
         ),
         mode=mode,
-        execution_seed=config.agent.sampling.seed,
+        execution_seed=recorded_execution_seed(config),
         status=status,
         started_at=started_at,
         ended_at=ended_at,
@@ -690,8 +697,10 @@ class PairExecution:
     """Local facts about one paired run that ``PairedResult`` does not store.
 
     ``execution_order`` is the role order in which ``run_episode`` was called.
-    The seeds are the sampling seeds recorded on the episodes and the run
-    seeds of the two configurations. ``initial_state_identity`` is the shared
+    The seeds are the recorded execution seeds of the episodes and the run
+    seeds of the two configurations. A vLLM execution seed is its sampling
+    seed. An Anthropic execution seed is the run seed, which does not make
+    generation deterministic. ``initial_state_identity`` is the shared
     identity captured before either world was mutated.
     """
 
@@ -809,9 +818,8 @@ def _compatible_pair(
         or reference_config.task.split != candidate_config.task.split
     ):
         raise EpisodeRejected("task sets are not compatible")
-    if (
-        reference_config.agent.sampling.seed
-        != candidate_config.agent.sampling.seed
+    if recorded_execution_seed(reference_config) != recorded_execution_seed(
+        candidate_config
     ):
         raise EpisodeRejected("pair episodes must share an execution seed")
     if (
@@ -846,12 +854,17 @@ def _open_worlds(
 
 def build_runtime(
     configuration: RunConfiguration,
-    endpoint_url: str,
+    endpoint_url: str | None = None,
     *,
     mode: Literal["plan", "execute"] = "execute",
     clock: Callable[[], datetime] | None = None,
 ) -> RuntimeDependencies:
-    """Build runtime dependencies for one configuration and HTTP endpoint.
+    """Build runtime dependencies for one configuration.
+
+    A vLLM configuration requires ``endpoint_url``. An Anthropic
+    configuration does not use a local server; it reads
+    ``ANTHROPIC_API_KEY`` and fails before any episode when the key is
+    missing. The key is held only for the request header.
 
     Imports the live AppWorld session adapter only when called. Does not
     import vLLM or smolagents; vLLM stays a served HTTP endpoint, never an
@@ -874,12 +887,14 @@ def build_runtime(
 
     if not isinstance(configuration, RunConfiguration):
         raise EpisodeRejected("runtime requires a run configuration")
-    if not isinstance(endpoint_url, str) or endpoint_url.strip() == "":
-        raise EpisodeRejected("endpoint url is required")
     if mode not in {"plan", "execute"}:
         raise EpisodeRejected("mode must be plan or execute")
     validate_chat_request(configuration)
-    from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
+    from llm_behavior_ci.config import AnthropicModelConfiguration
+    from llm_behavior_ci.runtime.agent import (
+        SmolagentsAnthropicAgent,
+        SmolagentsVLLMAgent,
+    )
     from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
     from llm_behavior_ci.runtime.prompts import UnknownPromptVersion, render_system_text
 
@@ -896,7 +911,19 @@ def build_runtime(
     except ValueError as error:
         raise RuntimeUnavailable(str(error)) from error
 
-    base_agent = SmolagentsVLLMAgent(endpoint_url)
+    if isinstance(configuration.model, AnthropicModelConfiguration):
+        if endpoint_url not in (None, ""):
+            raise EpisodeRejected(
+                "Anthropic runtime does not use a local model endpoint"
+            )
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if api_key == "":
+            raise EpisodeRejected("ANTHROPIC_API_KEY is required")
+        base_agent = SmolagentsAnthropicAgent(api_key)
+    else:
+        if not isinstance(endpoint_url, str) or endpoint_url.strip() == "":
+            raise EpisodeRejected("endpoint url is required")
+        base_agent = SmolagentsVLLMAgent(endpoint_url)
     base_agent.set_mode(mode)
     if mode == "execute" and configuration.agent.workflow is not None:
         from llm_behavior_ci.runtime.workflow import WorkflowControlledAgent

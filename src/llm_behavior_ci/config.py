@@ -39,6 +39,11 @@ model.serving.batch_invariant
 model.serving.sampler_backend
 model.lora.repository
 model.lora.revision
+model.provider
+model.model_id
+model.api_version
+model.thinking_mode
+model.effort
 agent.smolagents_version
 agent.action_interface
 agent.prompt.prompt_version
@@ -130,6 +135,20 @@ because canonical JSON then differs.
 ``MISSING_HASHED_LEAF`` rather than raising, so a caller comparing two
 configurations' hashed fields sees "unset" as one comparable value
 instead of a lookup error.
+
+``model.provider``, ``model.model_id``, ``model.api_version``,
+``model.thinking_mode``, and ``model.effort`` are the Anthropic
+behavioral identity. A vLLM configuration omits them, so its canonical
+JSON is unchanged. An Anthropic configuration omits the vLLM model,
+tokenizer, quantization, serving, and LoRA leaves. The same omission
+applies to ``agent.sampling.temperature``, ``agent.sampling.top_p``,
+``agent.sampling.top_k``, ``agent.sampling.min_p``, and
+``agent.sampling.seed`` when those controls are unset. Anthropic
+requests do not send them, and the hash does not record a value the
+client ignores. A vLLM configuration still requires the controls and
+serializes them as before. ``recorded_execution_seed`` uses the vLLM
+sampling seed when it is set, and the run seed otherwise. The run seed
+orders the experiment; it does not make Claude generation deterministic.
 """
 
 from __future__ import annotations
@@ -152,6 +171,10 @@ KV_CACHE_DTYPES = frozenset({"bfloat16", "float16", "fp8"})
 SAMPLER_BACKENDS = frozenset({"flashinfer", "native"})
 KL_FIDELITY_MODES = frozenset({"full", "top_k"})
 WORKFLOW_POLICIES = frozenset({"plan_progress_v1", "plan_progress_v2"})
+ANTHROPIC_PROVIDERS = frozenset({"anthropic"})
+ANTHROPIC_THINKING_MODES = frozenset({"adaptive", "between_tools"})
+ANTHROPIC_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+ANTHROPIC_BETWEEN_TOOLS_EFFORTS = frozenset({"low", "medium", "high"})
 HASHED_FIELDS = frozenset(
     {
         "model.model.repository",
@@ -176,6 +199,11 @@ HASHED_FIELDS = frozenset(
         "model.serving.sampler_backend",
         "model.lora.repository",
         "model.lora.revision",
+        "model.provider",
+        "model.model_id",
+        "model.api_version",
+        "model.thinking_mode",
+        "model.effort",
         "agent.smolagents_version",
         "agent.action_interface",
         "agent.prompt.prompt_version",
@@ -219,6 +247,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUNTIME_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{64}\.[0-9a-f]{32}$")
 _RULE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_ANTHROPIC_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+_API_VERSION = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 MONITOR_SIGNALS = frozenset(
     {
         "task_success",
@@ -371,6 +401,18 @@ def _top_k(value: object) -> int:
     raise ConfigError("top_k must be -1 or a positive integer")
 
 
+def _anthropic_model_id(value: object) -> str:
+    if not isinstance(value, str) or _ANTHROPIC_MODEL_ID.fullmatch(value) is None:
+        raise ConfigError("model_id must be an Anthropic model id")
+    return value
+
+
+def _api_version(value: object) -> str:
+    if not isinstance(value, str) or _API_VERSION.fullmatch(value) is None:
+        raise ConfigError("api_version must be a YYYY-MM-DD Anthropic API version")
+    return value
+
+
 def _choice(value: object, allowed: frozenset[str], name: str) -> str:
     if not isinstance(value, str) or value not in allowed:
         choices = ", ".join(sorted(allowed))
@@ -473,6 +515,13 @@ def _plain_dict(value: object, cls: type) -> dict[str, object]:
             to_dict = getattr(child, "to_dict", None)
             payload[field.name] = (
                 to_dict() if callable(to_dict) else _plain_dict(child, nested)
+            )
+        elif is_dataclass(child) and not isinstance(child, type):
+            to_dict = getattr(child, "to_dict", None)
+            payload[field.name] = (
+                to_dict()
+                if callable(to_dict)
+                else _plain_dict(child, type(child))
             )
         else:
             payload[field.name] = child
@@ -673,6 +722,66 @@ class ModelConfiguration:
 
 
 @dataclass(frozen=True)
+class AnthropicModelConfiguration:
+    """Behavioral identity of one Anthropic Messages API model.
+
+    The fields are the request values that can change model behavior.
+    No Hugging Face repository, tokenizer revision, quantization, or vLLM
+    serving setting is invented. The API key is not a field.
+    """
+
+    provider: str
+    model_id: str
+    api_version: str
+    thinking_mode: str
+    effort: str
+
+    def __post_init__(self) -> None:
+        _choice(self.provider, ANTHROPIC_PROVIDERS, "provider")
+        _anthropic_model_id(self.model_id)
+        _api_version(self.api_version)
+        _choice(self.thinking_mode, ANTHROPIC_THINKING_MODES, "thinking_mode")
+        _choice(self.effort, ANTHROPIC_EFFORT_LEVELS, "effort")
+        if (
+            self.thinking_mode == "between_tools"
+            and self.effort not in ANTHROPIC_BETWEEN_TOOLS_EFFORTS
+        ):
+            raise ConfigError(
+                "between_tools thinking accepts only low, medium, or high effort"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, AnthropicModelConfiguration)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "model configuration",
+    ) -> AnthropicModelConfiguration:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+def load_model_configuration(
+    payload: object,
+    name: str = "model configuration",
+) -> ModelConfiguration | AnthropicModelConfiguration:
+    """Load a vLLM or Anthropic model configuration.
+
+    A document with no ``provider`` remains a vLLM ``ModelConfiguration``.
+    Existing vLLM JSON does not name a provider, and this loader does not
+    add one.
+    """
+
+    mapping = _object(payload, name)
+    if "provider" in mapping:
+        return AnthropicModelConfiguration.from_dict(payload, name)
+    return ModelConfiguration.from_dict(payload, name)
+
+
+@dataclass(frozen=True)
 class PromptSettings:
     prompt_version: str
     plan_format_version: str
@@ -758,6 +867,93 @@ class SamplingSettings:
         return _construct(name, lambda: _load(cls, mapping))
 
 
+_VLLM_SAMPLING_CONTROLS = frozenset(
+    {"temperature", "top_p", "top_k", "min_p", "seed"}
+)
+
+
+@dataclass(frozen=True)
+class AnthropicSamplingSettings:
+    """Generation length for an API provider that rejects vLLM sampling.
+
+    Temperature, top-p, top-k, min-p, and seed are absent rather than
+    filled with values the client would ignore. ``max_tokens`` is the
+    generation cap unless the mode override is set.
+    """
+
+    max_tokens: int
+    execute_max_tokens: int | None = None
+    plan_max_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        _positive(self.max_tokens, "max_tokens")
+        if self.execute_max_tokens is not None:
+            _positive(self.execute_max_tokens, "execute_max_tokens")
+        if self.plan_max_tokens is not None:
+            _positive(self.plan_max_tokens, "plan_max_tokens")
+
+    def generation_max_tokens(self, mode: str) -> int:
+        if mode == "execute" and self.execute_max_tokens is not None:
+            return self.execute_max_tokens
+        if mode == "plan" and self.plan_max_tokens is not None:
+            return self.plan_max_tokens
+        return self.max_tokens
+
+    def to_dict(self) -> dict[str, object]:
+        document = _plain_dict(self, AnthropicSamplingSettings)
+        for key in ("execute_max_tokens", "plan_max_tokens"):
+            if document[key] is None:
+                del document[key]
+        return document
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "sampling",
+    ) -> AnthropicSamplingSettings:
+        mapping = _object(payload, name)
+        _require_fields(
+            mapping,
+            cls,
+            name,
+            optional=frozenset({"execute_max_tokens", "plan_max_tokens"}),
+        )
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+def load_sampling_settings(
+    payload: object,
+    name: str = "sampling",
+) -> SamplingSettings | AnthropicSamplingSettings:
+    """Load vLLM sampling controls, or length caps when those controls are unset."""
+
+    mapping = _object(payload, name)
+    present = _VLLM_SAMPLING_CONTROLS & set(mapping)
+    if present == _VLLM_SAMPLING_CONTROLS:
+        return SamplingSettings.from_dict(payload, name)
+    if not present:
+        return AnthropicSamplingSettings.from_dict(payload, name)
+    raise ConfigError(
+        f"{name} must set temperature, top_p, top_k, min_p, and seed together "
+        "or omit them"
+    )
+
+
+def _validate_model_sampling(model: object, sampling: object) -> None:
+    if isinstance(model, ModelConfiguration):
+        if not isinstance(sampling, SamplingSettings):
+            raise ConfigError("vLLM configurations require vLLM sampling controls")
+        return
+    if isinstance(model, AnthropicModelConfiguration):
+        if not isinstance(sampling, AnthropicSamplingSettings):
+            raise ConfigError(
+                "Anthropic configurations must leave unsupported sampling controls unset"
+            )
+        return
+    raise ConfigError("model must be a vLLM or Anthropic configuration")
+
+
 @dataclass(frozen=True)
 class WorkflowSettings:
     policy: str
@@ -816,7 +1012,7 @@ class AgentConfiguration:
     action_interface: str
     prompt: PromptSettings
     step_limit: int
-    sampling: SamplingSettings
+    sampling: SamplingSettings | AnthropicSamplingSettings
     api_docs_version: str | None = None
     api_docs_app: str | None = None
     tool_access_profile: str | None = None
@@ -828,7 +1024,8 @@ class AgentConfiguration:
         _choice(self.action_interface, ACTION_INTERFACES, "action_interface")
         _kind(self.prompt, PromptSettings, "prompt")
         _positive(self.step_limit, "step_limit")
-        _kind(self.sampling, SamplingSettings, "sampling")
+        if not isinstance(self.sampling, (SamplingSettings, AnthropicSamplingSettings)):
+            raise ConfigError("sampling must be vLLM or Anthropic sampling settings")
         if (self.api_docs_version is None) != (self.api_docs_app is None):
             raise ConfigError(
                 "api_docs_version and api_docs_app must be set together"
@@ -890,7 +1087,7 @@ class AgentConfiguration:
             ),
         )
         prompt = PromptSettings.from_dict(mapping["prompt"])
-        sampling = SamplingSettings.from_dict(mapping["sampling"])
+        sampling = load_sampling_settings(mapping["sampling"])
         workflow = (
             None
             if "workflow" not in mapping
@@ -965,7 +1162,7 @@ class TaskConfiguration:
 
 @dataclass(frozen=True)
 class RunConfiguration:
-    model: ModelConfiguration
+    model: ModelConfiguration | AnthropicModelConfiguration
     agent: AgentConfiguration
     task: TaskConfiguration
     run_seed: int
@@ -973,7 +1170,7 @@ class RunConfiguration:
     protocol_hash: str | None = None
 
     def __post_init__(self) -> None:
-        _kind(self.model, ModelConfiguration, "model")
+        _validate_model_sampling(self.model, self.agent.sampling)
         _kind(self.agent, AgentConfiguration, "agent")
         _kind(self.task, TaskConfiguration, "task")
         _integer(self.run_seed, "run_seed")
@@ -996,7 +1193,7 @@ class RunConfiguration:
             name,
             optional=frozenset({"protocol_hash"}),
         )
-        model = ModelConfiguration.from_dict(mapping["model"])
+        model = load_model_configuration(mapping["model"])
         agent = AgentConfiguration.from_dict(mapping["agent"])
         task = TaskConfiguration.from_dict(mapping["task"])
         return _construct(
@@ -1023,6 +1220,24 @@ def canonical_configuration_json(configuration: RunConfiguration) -> str:
 def run_configuration_hash(configuration: RunConfiguration) -> str:
     document = canonical_configuration_json(configuration)
     return hashlib.sha256(document.encode("utf-8")).hexdigest()
+
+
+def recorded_execution_seed(configuration: RunConfiguration) -> int:
+    """The integer an episode records as its execution seed.
+
+    A vLLM sampling seed is sent to the server and is the execution seed.
+    An Anthropic configuration does not send a generation seed. The
+    recorded value is then ``run_seed``, which orders the experiment and
+    the task stream. It is not a claim that Claude generation is
+    deterministic.
+    """
+
+    if not isinstance(configuration, RunConfiguration):
+        raise ConfigError("execution seed requires a run configuration")
+    sampling = configuration.agent.sampling
+    if isinstance(sampling, SamplingSettings):
+        return sampling.seed
+    return configuration.run_seed
 
 
 class _MissingHashedLeaf:

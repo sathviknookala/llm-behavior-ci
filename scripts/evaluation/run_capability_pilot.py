@@ -1,9 +1,13 @@
 """Run the Spotify capability pilot: twenty execute episodes, one at a time.
 
-Requires --configuration, --task-set, --base-url, --store, and --output.
+Requires --configuration, --task-set, --store, and --output. A vLLM
+configuration also requires --base-url. An Anthropic configuration does
+not use a local server and reads ``ANTHROPIC_API_KEY`` before task 0.
 The configuration must be the committed Spotify capability profile:
-execute horizon 20, execute token cap 192, temperature 0, seed 17, and
-``tool_access_profile`` ``spotify_capability_v1``. ``git_commit`` must be
+execute horizon 20, execute token cap 192, and ``tool_access_profile``
+``spotify_capability_v1``. vLLM runs also require temperature 0 and
+sampling seed 17. Anthropic runs leave those sampling controls unset and
+use task selection seed 17 as the experiment seed. ``git_commit`` must be
 HEAD and the tracked source and config tree must be clean.
 
 Prints one public JSON object after each episode. Writes one public
@@ -51,14 +55,19 @@ from pathlib import Path
 
 from llm_behavior_ci.config import (
     AgentConfiguration,
+    AnthropicModelConfiguration,
+    AnthropicSamplingSettings,
     ConfigError,
     EpisodeIdentity,
     ModelConfiguration,
     RunConfiguration,
     RunIdentity,
+    SamplingSettings,
     TaskConfiguration,
+    load_model_configuration,
     new_episode_identity,
     new_run_identity,
+    recorded_execution_seed,
     run_configuration_hash,
 )
 from llm_behavior_ci.records import (
@@ -741,7 +750,10 @@ def _requirement_fraction(passed: int, total: int) -> int | float | None:
     return rounded
 
 
-def _require_pilot_configuration(agent: AgentConfiguration) -> None:
+def _require_pilot_configuration(
+    model: ModelConfiguration | AnthropicModelConfiguration,
+    agent: AgentConfiguration,
+) -> None:
     if agent.tool_access_profile != _PILOT_PROFILE:
         print("capability pilot requires the Spotify tool access profile", file=sys.stderr)
         raise SystemExit(2)
@@ -751,12 +763,27 @@ def _require_pilot_configuration(agent: AgentConfiguration) -> None:
     if agent.sampling.execute_max_tokens != _PILOT_TOKEN_CAP:
         print("capability pilot requires 192 execute tokens", file=sys.stderr)
         raise SystemExit(2)
-    if agent.sampling.temperature != 0.0:
-        print("capability pilot requires temperature 0", file=sys.stderr)
-        raise SystemExit(2)
-    if agent.sampling.seed != _PILOT_SEED:
-        print("capability pilot requires seed 17", file=sys.stderr)
-        raise SystemExit(2)
+    if isinstance(model, ModelConfiguration):
+        if not isinstance(agent.sampling, SamplingSettings):
+            print("capability pilot requires vLLM sampling controls", file=sys.stderr)
+            raise SystemExit(2)
+        if agent.sampling.temperature != 0.0:
+            print("capability pilot requires temperature 0", file=sys.stderr)
+            raise SystemExit(2)
+        if agent.sampling.seed != _PILOT_SEED:
+            print("capability pilot requires seed 17", file=sys.stderr)
+            raise SystemExit(2)
+        return
+    if isinstance(model, AnthropicModelConfiguration):
+        if not isinstance(agent.sampling, AnthropicSamplingSettings):
+            print(
+                "Anthropic capability pilot cannot claim vLLM sampling controls",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        return
+    print("capability pilot requires a supported model provider", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _coerce_exit_code(error: BaseException) -> int:
@@ -823,7 +850,7 @@ def _runtime_failure_result(
             split=configuration.task.split,
         ),
         mode="execute",
-        execution_seed=configuration.agent.sampling.seed,
+        execution_seed=recorded_execution_seed(configuration),
         status="failed",
         started_at=started_at,
         ended_at=ended_at,
@@ -896,7 +923,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--configuration", required=True)
     parser.add_argument("--task-set", required=True)
-    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--base-url", default=None)
     parser.add_argument("--store", required=True)
     parser.add_argument("--output", required=True)
     try:
@@ -1057,14 +1084,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         if "model" not in configuration_payload or "agent" not in configuration_payload:
             print("configuration must contain model and agent", file=sys.stderr)
             return 2
-        model = ModelConfiguration.from_dict(configuration_payload["model"])
+        model = load_model_configuration(configuration_payload["model"])
         agent = AgentConfiguration.from_dict(configuration_payload["agent"])
-        _require_pilot_configuration(agent)
+        _require_pilot_configuration(model, agent)
+        if isinstance(model, ModelConfiguration):
+            if not isinstance(args.base_url, str) or args.base_url.strip() == "":
+                print("capability pilot requires --base-url", file=sys.stderr)
+                return 2
+            endpoint_url: str | None = args.base_url
+        elif isinstance(model, AnthropicModelConfiguration):
+            if args.base_url not in (None, ""):
+                print(
+                    "Anthropic capability pilot does not use --base-url",
+                    file=sys.stderr,
+                )
+                return 2
+            endpoint_url = None
+        else:
+            print("capability pilot requires a supported model provider", file=sys.stderr)
+            return 2
         task_payload = _load_json(task_set_path)
         task, task_set = _load_task_set(task_payload)
         expected_tasks = _required_task_count(task)
         if task.task_count != expected_tasks or task_set.task_count != expected_tasks:
             print(f"capability pilot requires {expected_tasks} tasks", file=sys.stderr)
+            return 2
+        if (
+            isinstance(model, AnthropicModelConfiguration)
+            and task.selection_seed != _PILOT_SEED
+        ):
+            print("capability pilot requires task seed 17", file=sys.stderr)
             return 2
         adopted = _adopt_committed_setup_profile(task)
         if adopted is None:
@@ -1084,7 +1133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         enforce_committed_provenance(configuration)
         runtime = build_runtime(
             configuration,
-            args.base_url,
+            endpoint_url,
             mode="execute",
         )
         store = EpisodeStore(store_path)

@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 
 from llm_behavior_ci.config import RunConfiguration, WorkflowSettings
 from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
-from llm_behavior_ci.runtime.agent import AgentTurn, SmolagentsVLLMAgent
+from llm_behavior_ci.runtime.agent import (
+    AgentTurn,
+    SmolagentsAnthropicAgent,
+    SmolagentsVLLMAgent,
+)
 from llm_behavior_ci.runtime.appworld import TaskContext, ToolResult
 from llm_behavior_ci.runtime.prompts import PROMPT_RUNTIME_AUTH_V2
 
@@ -578,7 +582,7 @@ def _completion_allowed(state: WorkflowState, envelope: WorkflowEnvelope) -> boo
 class WorkflowControlledAgent:
     def __init__(
         self,
-        base_agent: SmolagentsVLLMAgent,
+        base_agent: SmolagentsVLLMAgent | SmolagentsAnthropicAgent,
         settings: WorkflowSettings,
     ) -> None:
         if settings.policy not in {_POLICY_V1, _POLICY_V2}:
@@ -589,7 +593,9 @@ class WorkflowControlledAgent:
         self._settings = settings
         self._local = threading.local()
 
-    def underlying_agents(self) -> tuple[SmolagentsVLLMAgent, ...]:
+    def underlying_agents(
+        self,
+    ) -> tuple[SmolagentsVLLMAgent | SmolagentsAnthropicAgent, ...]:
         return (self._base_agent,)
 
     def _state(self) -> WorkflowState:

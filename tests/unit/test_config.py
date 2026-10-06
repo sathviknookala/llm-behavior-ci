@@ -23,6 +23,7 @@ from llm_behavior_ci.config import (
     TaskConfiguration,
     canonical_configuration_json,
     hashed_values,
+    load_model_configuration,
     new_episode_identity,
     new_pair_id,
     new_run_identity,
@@ -41,6 +42,15 @@ _PROTOCOL_HASH = "e" * 64
 _OTHER_PROTOCOL_HASH = "f" * 64
 _LORA_REVISION = "3" * 40
 _OTHER_LORA_REVISION = "4" * 40
+_ANTHROPIC_HASHED_FIELDS = frozenset(
+    {
+        "model.provider",
+        "model.model_id",
+        "model.api_version",
+        "model.thinking_mode",
+        "model.effort",
+    }
+)
 
 _REPLACEMENTS = {
     "model.model.repository": "Qwen/Qwen3-1.7B",
@@ -444,7 +454,13 @@ class ConfigurationTests(unittest.TestCase):
         digest = hashlib.sha256(document.encode("utf-8")).hexdigest()
         self.assertEqual(run_configuration_hash(configuration), digest)
         self.assertEqual(len(digest), 64)
-        self.assertEqual(_leaves(configuration.to_dict()), set(HASHED_FIELDS))
+        self.assertEqual(
+            _leaves(configuration.to_dict()) | _ANTHROPIC_HASHED_FIELDS,
+            set(HASHED_FIELDS),
+        )
+        self.assertTrue(
+            _ANTHROPIC_HASHED_FIELDS.isdisjoint(_leaves(configuration.to_dict()))
+        )
         for path in HASHED_FIELDS:
             self.assertIn(path, configuration_module.__doc__)
         self.assertTrue(RUNTIME_IDS.isdisjoint(HASHED_FIELDS))
@@ -481,7 +497,7 @@ class ConfigurationTests(unittest.TestCase):
             canonical_configuration_json(configuration),
         )
         self.assertEqual(
-            set(HASHED_FIELDS) - set(_REPLACEMENTS),
+            set(HASHED_FIELDS) - set(_REPLACEMENTS) - _ANTHROPIC_HASHED_FIELDS,
             {"agent.workflow.policy"},
         )
         payload = _payload()
@@ -761,8 +777,12 @@ class OptionalHashedLeafTests(unittest.TestCase):
             with self.subTest(name=name):
                 document = json.loads((root / "configs" / "models" / name).read_text())
                 self.assertNotIn("cpu_offload_gb", document["model"]["serving"])
+                self.assertIsInstance(
+                    load_model_configuration(document["model"]),
+                    ModelConfiguration,
+                )
                 configuration = RunConfiguration(
-                    model=ModelConfiguration.from_dict(document["model"]),
+                    model=load_model_configuration(document["model"]),
                     agent=AgentConfiguration.from_dict(document["agent"]),
                     task=task,
                     run_seed=17,
@@ -771,6 +791,49 @@ class OptionalHashedLeafTests(unittest.TestCase):
                 )
                 self.assertEqual(configuration.model.serving.cpu_offload_gb, 0.0)
                 self.assertEqual(run_configuration_hash(configuration), digest)
+
+    def test_later_vllm_configurations_keep_their_hashes(self) -> None:
+        root = Path(configuration_module.__file__).parents[2]
+        task = TaskConfiguration.from_dict(
+            {
+                "appworld_version": "0.1.3.post1",
+                "split": "train",
+                "selection_rule": "fixed_spotify_capability",
+                "selection_seed": 17,
+                "task_count": 20,
+                "task_set_hash": "a20fe52d28164e1d458266331c242277788d2ed0af29b054b7df926345db3a04",
+                "appworld_setup_profile": "spotify_authenticated_v1",
+            }
+        )
+        expected = {
+            "qwen3_32b_awq_spotify_capability_v2_interface.json": (
+                "d7ddbb5db23642a1855c3e9921c789b8e700d32a0ef14273cd74d1c992f78fb0"
+            ),
+            "qwen3_32b_awq_spotify_capability_v2_interface_28672.json": (
+                "c1b7d7e0b4ffec6ebc2c0fe511e3abe184ef99a1d8a589afa0efa3838002b735"
+            ),
+            "qwen3_32b_awq_spotify_capability_v2_interface_32768.json": (
+                "8719f07ad06a65f9980c2baa549829bcd8588bb7c34fc7c4323fd725ae51cbfe"
+            ),
+            "qwen3_32b_awq_spotify_short_horizon_diagnostic.json": (
+                "8719f07ad06a65f9980c2baa549829bcd8588bb7c34fc7c4323fd725ae51cbfe"
+            ),
+        }
+        for name, digest in expected.items():
+            with self.subTest(name=name):
+                document = json.loads((root / "configs" / "models" / name).read_text())
+                model = load_model_configuration(document["model"])
+                self.assertIsInstance(model, ModelConfiguration)
+                configuration = RunConfiguration(
+                    model=model,
+                    agent=AgentConfiguration.from_dict(document["agent"]),
+                    task=task,
+                    run_seed=17,
+                    git_commit="a" * 40,
+                    protocol_hash=None,
+                )
+                self.assertEqual(run_configuration_hash(configuration), digest)
+                self.assertNotIn("provider", configuration.model.to_dict())
 
     def test_hashed_values_reads_unset_optional_leaves_as_missing(self) -> None:
         payload = _payload()

@@ -1,0 +1,33 @@
+{
+  "model": {
+    "provider": "anthropic",
+    "model_id": "claude-sonnet-5-5",
+    "api_version": "2023-06-01",
+    "thinking_mode": "between_tools",
+    "effort": "medium"
+  },
+  "agent": {
+    "smolagents_version": "1.22.0",
+    "action_interface": "code",
+    "prompt": {
+      "prompt_version": "prompt-runtime-auth-v2",
+      "plan_format_version": "plan-v1",
+      "thinking_enabled": false
+    },
+    "step_limit": 40,
+    "execute_max_model_turns": 20,
+    "tool_access_profile": "spotify_capability_v1",
+    "sampling": {
+      "max_tokens": 1024,
+      "plan_max_tokens": 1024,
+      "execute_max_tokens": 192
+    },
+    "workflow": {
+      "policy": "plan_progress_v2",
+      "repeat_action_limit": 2,
+      "no_progress_turns": 3,
+      "completion_gate": true,
+      "max_plan_steps": 5
+    }
+  }
+}
