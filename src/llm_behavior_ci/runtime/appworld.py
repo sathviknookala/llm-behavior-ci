@@ -688,13 +688,22 @@ class LiveAppWorldSession:
             raise RuntimeUnavailable("AppWorld is not installed") from error
         type(self)._open_stack.append(self)
 
-    def required_apps(self) -> tuple[str, ...]:
+    def required_apps(self) -> tuple[str, ...] | None:
+        """Ground-truth required apps, or ``None`` when the world does not expose them.
+
+        AppWorld's default minimal ground-truth mode leaves ``required_apps``
+        unset, so ``None`` means unknown. An explicitly empty list stays an
+        empty tuple.
+        """
+
         if self._world is None:
             self._open_world()
         ground_truth = getattr(self._world.task, "ground_truth", None)
         if ground_truth is None:
-            return ()
-        apps = getattr(ground_truth, "required_apps", ())
+            return None
+        apps = getattr(ground_truth, "required_apps", None)
+        if apps is None:
+            return None
         return tuple(str(app) for app in apps)
 
     def complete_without_work(self) -> None:

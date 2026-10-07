@@ -82,9 +82,10 @@ def collect_baseline_outcomes(
     roles and uses the task id as the local pair key; with ``repetition``
     the key is ``<task id>#r<repetition>``, so repeated passes over one
     task stay distinct pairs that share a task. The app label is read from
-    ``required_apps`` on the production session when that method exists,
-    otherwise from ``required_apps_for``. A missing evaluator outcome stays
-    ``None`` on its row.
+    ``required_apps`` on the production session when that method exists and
+    returns a value, otherwise from ``required_apps_for``. A session that
+    returns an empty sequence is known-empty and does not fall back. A
+    missing evaluator outcome stays ``None`` on its row.
     """
 
     if repetition is not None and (
@@ -179,10 +180,8 @@ def _labeling_factory(inner, labels: dict[str, tuple[str, ...] | None]):
     def factory(task_id: str):
         session = inner(task_id)
         reader = getattr(session, "required_apps", None)
-        if callable(reader):
-            labels[task_id] = tuple(str(app) for app in reader())
-        else:
-            labels[task_id] = None
+        apps = reader() if callable(reader) else None
+        labels[task_id] = None if apps is None else tuple(str(app) for app in apps)
         return session
 
     return factory

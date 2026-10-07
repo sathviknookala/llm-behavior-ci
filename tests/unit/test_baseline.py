@@ -7,7 +7,12 @@ from pathlib import Path
 from llm_behavior_ci.config import RunConfiguration
 from llm_behavior_ci.records import TokenLogprob
 from llm_behavior_ci.runtime.agent import AgentTurn
-from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
+from llm_behavior_ci.runtime.appworld import (
+    EvaluationResult,
+    LiveAppWorldSession,
+    TaskContext,
+    ToolResult,
+)
 from llm_behavior_ci.runtime.baseline import (
     app_label,
     collect_baseline_outcomes,
@@ -213,6 +218,119 @@ class BaselineRunnerTests(unittest.TestCase):
                 ),
                 repetition=-1,
             )
+
+    def _arrivals(self) -> tuple[TaskArrival, ...]:
+        return tuple(
+            TaskArrival(
+                index=index,
+                task_id=task_id,
+                scenario_id=f"scenario-{index}",
+                scheduled_offset_seconds=0.0,
+                stream_seed=17,
+            )
+            for index, task_id in enumerate(("task-a", "task-b"))
+        )
+
+    def _collect(self, factory, manifest_apps: dict[str, tuple[str, ...]]):
+        clock = _clock()
+        _clock_holder.clear()
+        _clock_holder.append(clock)
+        return collect_baseline_outcomes(
+            self._arrivals(),
+            _config(),
+            production_runtime=RuntimeDependencies(
+                session_factory=factory, agent=StopAgent(), clock=clock
+            ),
+            do_nothing_runtime=RuntimeDependencies(
+                session_factory=factory, agent=StopAgent(), clock=clock
+            ),
+            required_apps_for=manifest_apps.get,
+        )
+
+    def test_minimal_ground_truth_live_sessions_use_manifest_apps_on_both_arms(self) -> None:
+        LiveAppWorldSession._open_stack.clear()
+        opened: list[str] = []
+
+        class GroundTruth:
+            required_apps = None
+
+        class Task:
+            instruction = "instruction"
+            api_docs = ""
+            ground_truth = GroundTruth()
+
+        class Evaluation:
+            success = False
+            pass_count = 0
+            num_tests = 3
+            difficulty = 1
+
+        class World:
+            def __init__(self) -> None:
+                self.task = Task()
+
+            def execute(self, code: str) -> str:
+                del code
+                return '{"message": "ok"}'
+
+            def evaluate(self) -> Evaluation:
+                return Evaluation()
+
+            def close(self) -> None:
+                return None
+
+        def opener(task_id: str) -> World:
+            opened.append(task_id)
+            return World()
+
+        rows = self._collect(
+            lambda task_id: LiveAppWorldSession(task_id, opener=opener),
+            {"task-a": ("spotify", "supervisor"), "task-b": ("gmail", "venmo")},
+        )
+        self.assertEqual(opened, ["task-a", "task-a", "task-b", "task-b"])
+        self.assertEqual(
+            [(item.pair_key, item.role, item.app) for item in rows],
+            [
+                ("task-a", "production", "spotify"),
+                ("task-a", "do_nothing", "spotify"),
+                ("task-b", "production", "gmail+venmo"),
+                ("task-b", "do_nothing", "gmail+venmo"),
+            ],
+        )
+        self.assertEqual({item.difficulty for item in rows}, {1})
+
+    def test_session_reporting_unknown_apps_falls_back_to_manifest(self) -> None:
+        class Unknown(Session):
+            def required_apps(self) -> None:
+                return None
+
+        rows = self._collect(
+            Unknown,
+            {"task-a": ("spotify",), "task-b": ("venmo", "admin")},
+        )
+        self.assertEqual(
+            [item.app for item in rows], ["spotify", "spotify", "venmo", "venmo"]
+        )
+
+    def test_known_empty_session_apps_do_not_fall_back_to_manifest(self) -> None:
+        class Empty(Session):
+            def required_apps(self) -> tuple[str, ...]:
+                return ()
+
+        rows = self._collect(
+            Empty,
+            {"task-a": ("spotify",), "task-b": ("venmo",)},
+        )
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(item.app is None for item in rows))
+
+    def test_required_apps_reader_errors_propagate(self) -> None:
+        class Broken(Session):
+            def required_apps(self) -> tuple[str, ...]:
+                raise RuntimeError("world unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "world unavailable"):
+            self._collect(Broken, {"task-a": ("spotify",)})
 
     def test_closed_splits_and_results_paths_are_refused(self) -> None:
         config = _config("test_normal")

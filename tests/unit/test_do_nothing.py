@@ -349,6 +349,38 @@ class CompletionCallTests(unittest.TestCase):
         self.assertEqual(session.required_apps(), ("venmo", "supervisor", "admin"))
         session.close()
 
+    def test_live_session_required_apps_is_none_when_ground_truth_omits_them(self) -> None:
+        class MinimalGroundTruth:
+            required_apps = None
+
+        class EmptyGroundTruth:
+            required_apps: list[str] = []
+
+        class World:
+            def __init__(self, task: object) -> None:
+                self.task = task
+
+            def close(self) -> None:
+                return None
+
+        def task_with(ground_truth: object | None) -> object:
+            return type("Task", (), {"ground_truth": ground_truth})()
+
+        cases = (
+            (task_with(MinimalGroundTruth()), None),
+            (task_with(None), None),
+            (type("Task", (), {})(), None),
+            (task_with(type("Bare", (), {})()), None),
+            (task_with(EmptyGroundTruth()), ()),
+        )
+        for task, expected in cases:
+            LiveAppWorldSession._open_stack.clear()
+            session = LiveAppWorldSession(
+                "task-1", opener=lambda task_id, task=task: World(task)
+            )
+            self.assertEqual(session.required_apps(), expected)
+            session.close()
+
     def test_second_session_waits_until_the_first_world_closes(self) -> None:
         LiveAppWorldSession._open_stack.clear()
         opened: list[str] = []
