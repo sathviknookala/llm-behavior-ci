@@ -134,6 +134,7 @@ class BareCliExitTests(unittest.TestCase):
     def test_new_lifecycle_commands_exit_2(self) -> None:
         for script in (
             "scripts/evaluation/build_run_configuration.py",
+            "scripts/evaluation/build_task_selection_allowance.py",
             "scripts/evaluation/collect_baseline.py",
             "scripts/evaluation/rehearse_dev_stream.py",
             "scripts/evaluation/simulate_power.py",

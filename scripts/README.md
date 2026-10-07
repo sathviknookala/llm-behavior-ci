@@ -4,7 +4,8 @@
 
 The hosted lifecycle commands (runbook: `docs/HOSTED_LIFECYCLE.md`) each exit 2 when bare and print no task ids:
 
-- `evaluation/build_run_configuration.py` builds a run configuration from a committed template and a local manifest, binds HEAD, refuses a dirty tree or an output under `results/`, and runs the tool-access preflight.
+- `evaluation/build_run_configuration.py` builds a run configuration from a committed template and a local manifest, binds HEAD, refuses a dirty tree or an output under `results/`, and runs the tool-access preflight. `--fault` applies one versioned fault diff to the built configuration.
+- `evaluation/build_task_selection_allowance.py` writes the `task-selection-allowance-v1` document for `serve.py --task-selection-allowance` from the train reference configuration the gate ran; it refuses a non-train configuration.
 - `evaluation/collect_baseline.py` runs production and do-nothing episodes on fresh worlds with `--repetitions`; pair keys are `<task id>#r<n>` and missing outcomes stay null. The output is local.
 - `evaluation/simulate_power.py` simulates clustered paired power and the null rejection rate from a local baseline file. `evaluation/assess_harm_study.py --baselines` reads the same file; its normal approximation stays advisory.
 - `evaluation/rehearse_dev_stream.py` runs the scheduled monitor stream on a dev task set with the benchmark's code and a resumable local state file.
@@ -13,7 +14,7 @@ The hosted lifecycle commands (runbook: `docs/HOSTED_LIFECYCLE.md`) each exit 2 
 - `data/annotate_task_metadata.py` adds difficulty and required apps to a git-ignored `train` or `dev` manifest; `test_*` is refused.
 - `data/plan_specs.py skeleton|validate` authors and checks local task plan specs for the gate's semantic plan features.
 
-`evaluation/characterize_harm.py` and `benchmark/run_lifecycle_benchmark.py` take `--live-runtime` with role endpoints and build runtimes through the same factory; `LLM_BEHAVIOR_CI_RUNTIME` remains the CPU injection hook. The benchmark also takes `--schedule` (a `benchmark-schedule-v1` document) and `--task-metadata`. `service/serve.py` routes runtimes by configuration hash: a hosted configuration takes no `--*-base-url`, a vLLM configuration needs one, and `--task-metadata` supplies difficulty slices.
+`evaluation/characterize_harm.py` and `benchmark/run_lifecycle_benchmark.py` take `--live-runtime` with role endpoints and build runtimes through the same factory; `LLM_BEHAVIOR_CI_RUNTIME` remains the CPU injection hook. The benchmark also takes `--schedule` (a `benchmark-schedule-v1` document) and `--task-metadata`. `service/serve.py` routes runtimes by configuration hash: a hosted configuration takes no `--*-base-url`, a vLLM configuration needs one, and `--task-metadata` supplies difficulty slices. `--task-selection-allowance` lets a train gate PASS admit dev serving configurations that differ only in task-selection leaves; without it admission is strict (`docs/HOSTED_LIFECYCLE.md` step 8).
 
 `evaluation/profile_capture_limits.py` reads one local A/A capture and writes a public limit profile. It requires `--capture`, `--output`, `--label`, `--step-limit`, and `--max-tokens`. It does not run inference and does not change those limits. With no arguments it exits 2. Plan token lengths in the profile are not execute-limit evidence.
 

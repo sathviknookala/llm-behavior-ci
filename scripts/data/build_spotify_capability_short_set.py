@@ -57,10 +57,10 @@ _PUBLIC_KEYS = (
 )
 
 
-def _require_ignored(path: Path) -> None:
+def _require_ignored(path: Path, repository_root: Path) -> None:
     completed = subprocess.run(
         ["git", "check-ignore", "-q", str(path.resolve())],
-        cwd=_REPO_ROOT,
+        cwd=repository_root,
         capture_output=True,
         check=False,
     )
@@ -193,7 +193,15 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 def main(
     argv: Sequence[str] | None = None,
     loader: Callable[[], tuple[ShortHorizonCandidate, ...]] | None = None,
+    *,
+    repository_root: Path | None = None,
 ) -> int:
+    """Select the set and write the ignored manifest and the public document.
+
+    ``repository_root`` is the git work tree whose ignore rules the
+    manifest path must satisfy; it defaults to this repository.
+    """
+
     args_list = list(sys.argv[1:] if argv is None else argv)
     if not args_list:
         return 2
@@ -215,7 +223,10 @@ def main(
     manifest_path = Path(args.manifest)
     public_default = DIAGNOSTIC_PUBLIC_PATH if args.diagnostic else PUBLIC_PATH
     public_path = Path(args.public) if args.public is not None else public_default
-    _require_ignored(manifest_path)
+    _require_ignored(
+        manifest_path,
+        _REPO_ROOT if repository_root is None else Path(repository_root),
+    )
     if loader is None:
         _require_appworld_root()
         source = load_train_spotify_candidates

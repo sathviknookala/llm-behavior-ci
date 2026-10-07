@@ -492,6 +492,60 @@ class BuildConfigurationCliTests(unittest.TestCase):
             spotify[1] = str(_ROOT / "configs/models/glm_5_3_spotify_capability.json")
             self.assertEqual(module.main(spotify, repository_state=clean), 1)
 
+    def test_fault_flag_changes_only_the_fault_leaves(self) -> None:
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+
+        from llm_behavior_ci.experiments.faults import apply_fault, load_fault
+        from llm_behavior_ci.runtime.provenance import RepositoryState
+
+        module = _script("scripts/evaluation/build_run_configuration.py")
+        clean = RepositoryState(head="b" * 40, dirty_paths=())
+        fault_path = _ROOT / "configs/faults/hosted_zai/glm_reasoning_disabled.v1.json"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = _manifest(root, ["gmail", "spotify"])
+            empty = root / "tasks"
+            empty.mkdir()
+            base_path = root / "base.json"
+            faulted_path = root / "faulted.json"
+            common = [
+                "--template", str(_ROOT / "configs/models/glm_5_3_general_experimental.json"),
+                "--task-set", str(manifest),
+                "--run-seed", "17",
+                "--committed-tasks-dir", str(empty),
+            ]
+            with redirect_stdout(StringIO()):
+                self.assertEqual(
+                    module.main([*common, "--output", str(base_path)], repository_state=clean), 0
+                )
+                self.assertEqual(
+                    module.main(
+                        [*common, "--output", str(faulted_path), "--fault", str(fault_path)],
+                        repository_state=clean,
+                    ),
+                    0,
+                )
+            base = RunConfiguration.from_dict(json.loads(base_path.read_text(encoding="utf-8")))
+            faulted = RunConfiguration.from_dict(
+                json.loads(faulted_path.read_text(encoding="utf-8"))
+            )
+            self.assertEqual(
+                run_configuration_hash(faulted),
+                run_configuration_hash(apply_fault(base, load_fault(fault_path))),
+            )
+            self.assertNotEqual(run_configuration_hash(faulted), run_configuration_hash(base))
+            missing = root / "missing_fault.json"
+            with redirect_stderr(StringIO()):
+                self.assertEqual(
+                    module.main(
+                        [*common, "--output", str(root / "x.json"), "--fault", str(missing)],
+                        repository_state=clean,
+                    ),
+                    1,
+                )
+            self.assertFalse((root / "x.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,10 @@
 
 Requires --template (configs/models/*.json), --task-set (local manifest
 with task_ids and scenario_ids), --run-seed, and --output. --git-commit
-defaults to repository HEAD; --protocol-hash defaults to null. Refuses an
+defaults to repository HEAD; --protocol-hash defaults to null. --fault
+applies one versioned fault diff (configs/faults/...) to the built
+configuration, so a gate or canary candidate differs from its reference
+only in that fault's leaves. Refuses an
 output under results/ and a tree whose tracked source or config is dirty.
 Runs the tool-access preflight against the manifest. Prints the public
 configuration summary (hashes and bindings, no task ids). Bare invocation
@@ -17,6 +20,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from llm_behavior_ci.experiments.faults import FaultError, apply_fault, load_fault
 from llm_behavior_ci.experiments.run_config import (
     RunConfigError,
     build_run_configuration,
@@ -56,6 +60,7 @@ def main(
     parser.add_argument("--git-commit", default=None)
     parser.add_argument("--protocol-hash", default=None)
     parser.add_argument("--committed-tasks-dir", default=None)
+    parser.add_argument("--fault", default=None)
     try:
         args = parser.parse_args(args_list)
     except SystemExit as error:
@@ -84,9 +89,17 @@ def main(
             git_commit=commit,
             protocol_hash=args.protocol_hash,
         )
+        if args.fault is not None:
+            configuration = apply_fault(configuration, load_fault(Path(args.fault)))
         preflight_tool_access(configuration, manifest)
         require_committed_provenance(configuration, state)
-    except (RunConfigError, ProvenanceError, OSError, json.JSONDecodeError) as error:
+    except (
+        RunConfigError,
+        ProvenanceError,
+        FaultError,
+        OSError,
+        json.JSONDecodeError,
+    ) as error:
         print(str(error) or "run configuration build failed", file=sys.stderr)
         return 1
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -16,6 +16,12 @@ from llm_behavior_ci.config import (
     RunConfiguration,
     run_configuration_hash,
 )
+from llm_behavior_ci.experiments.protocol import (
+    ProtocolError,
+    TaskSelectionAllowance,
+    bind_train_task_selection,
+    task_selection_allowance_from_dict,
+)
 from llm_behavior_ci.experiments.run_config import (
     LocalTaskManifest,
     RunConfigError,
@@ -122,6 +128,54 @@ def _runtime_factory_for(
     return ConfigurationRoutedRuntimeFactory.for_configurations(entries)
 
 
+def _train_to_dev_allowance(
+    payload: object,
+    registry: ConfigurationRegistry,
+) -> TaskSelectionAllowance:
+    """Validate a ``task-selection-allowance-v1`` document for dev serving.
+
+    The allowance restores a train gate's task selection on dev serving
+    configurations, so admission can rebuild and check the gate's own
+    hashes. It must name ``task.split`` and ``task.task_set_hash`` with
+    train values, there must be a candidate, and production and candidate
+    must share one dev task binding. Every other hashed leaf is left to
+    ``authorize_gated_candidate``, which refuses any difference from the
+    gate.
+    """
+
+    try:
+        allowance = task_selection_allowance_from_dict(payload)
+    except ProtocolError as error:
+        raise ConfigError(str(error)) from error
+    required = {"task.split", "task.task_set_hash"}
+    if not required <= allowance.allowed_leaves:
+        raise ConfigError(
+            "task selection allowance must name task.split and task.task_set_hash"
+        )
+    if allowance.train_values["task.split"] != "train":
+        raise ConfigError("task selection allowance must restore the train split")
+    if registry.candidate is None:
+        raise ConfigError("task selection allowance requires --candidate-config")
+    for label, configuration in (
+        ("production", registry.production),
+        ("candidate", registry.candidate),
+    ):
+        if configuration.task.split != "dev":
+            raise ConfigError(
+                f"task selection allowance serves dev only; {label} split is "
+                f"{configuration.task.split}"
+            )
+        try:
+            bind_train_task_selection(configuration, allowance)
+        except ProtocolError as error:
+            raise ConfigError(f"{label}: {error}") from error
+    if registry.production.task != registry.candidate.task:
+        raise ConfigError(
+            "production and candidate must share one dev task binding"
+        )
+    return allowance
+
+
 def _metadata_for_factory(
     manifest: LocalTaskManifest | None = None,
 ) -> Callable[[EpisodeResult], TaskMetadata]:
@@ -183,6 +237,12 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
         production=production,
         candidate=candidate,
     )
+    allowance = None
+    allowance_path = getattr(args, "task_selection_allowance", None)
+    if allowance_path is not None:
+        allowance = _train_to_dev_allowance(
+            _load_json(Path(allowance_path)), registry
+        )
     try:
         runtime_factory = _runtime_factory_for(
             registry,
@@ -240,6 +300,7 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
         metadata_for=_metadata_for_factory(manifest),
         canary_settings=canary_settings,
         canary_assignment_seed=int(args.canary_assignment_seed),
+        task_selection_allowance=allowance,
         tool_selection_monitor=distributional_monitors.get("tool_selection"),
         task_mix_monitor=distributional_monitors.get("task_mix"),
     )
@@ -271,6 +332,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--task-metadata", default=None)
     parser.add_argument("--distributional-monitors", default=None)
     parser.add_argument("--slice-attribution", action="store_true")
+    parser.add_argument("--task-selection-allowance", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
     try:
@@ -293,6 +355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         required_paths.append(Path(args.distributional_monitors))
     if args.task_metadata is not None:
         required_paths.append(Path(args.task_metadata))
+    if args.task_selection_allowance is not None:
+        required_paths.append(Path(args.task_selection_allowance))
     for path in required_paths:
         if not path.is_file():
             print(f"missing file: {path}", file=sys.stderr)

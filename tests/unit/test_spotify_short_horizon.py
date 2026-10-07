@@ -4,6 +4,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -59,6 +61,27 @@ def _builder():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class _TemporaryRepository:
+    """A throwaway git work tree whose only ignore rule is ``data/processed/``."""
+
+    def __init__(self, test: unittest.TestCase) -> None:
+        directory = tempfile.TemporaryDirectory()
+        test.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        subprocess.run(
+            ["git", "init", "-q", str(self.root)],
+            check=True,
+            capture_output=True,
+        )
+        (self.root / ".gitignore").write_text("data/processed/\n", encoding="utf-8")
+
+    def ignored(self, name: str) -> Path:
+        return self.root / "data/processed" / name
+
+    def unignored(self, name: str) -> Path:
+        return self.root / "configs/tasks" / name
 
 
 def _candidate(
@@ -290,88 +313,113 @@ class ShortHorizonBuilderTest(unittest.TestCase):
                 )
         self.assertEqual(caught.exception.code, 2)
 
+    def test_refuses_an_unignored_manifest_path_in_a_fresh_repository(self) -> None:
+        repository = _TemporaryRepository(self)
+        manifest = repository.unignored("spotify_capability_short_unit_manifest.json")
+        public = repository.ignored("spotify_capability_short_unit_public.json")
+        stderr = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                _builder().main(
+                    ["--manifest", str(manifest), "--public", str(public)],
+                    loader=_fill_pool,
+                    repository_root=repository.root,
+                )
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("path must be ignored by git", stderr.getvalue())
+        self.assertFalse(manifest.exists())
+        self.assertFalse(public.exists())
+
+    def test_refuses_a_manifest_outside_the_repository(self) -> None:
+        repository = _TemporaryRepository(self)
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        manifest = Path(outside.name) / "manifest.json"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                _builder().main(
+                    ["--manifest", str(manifest), "--public", str(repository.ignored("p.json"))],
+                    loader=_fill_pool,
+                    repository_root=repository.root,
+                )
+        self.assertEqual(caught.exception.code, 2)
+        self.assertFalse(manifest.exists())
+
     def test_insufficient_pool_writes_nothing_and_prints_counts_only(self) -> None:
         builder = _builder()
-        manifest = _ROOT / "data/processed/spotify_capability_short_unit_manifest.json"
-        public = _ROOT / "data/processed/spotify_capability_short_unit_public.json"
+        repository = _TemporaryRepository(self)
+        manifest = repository.ignored("spotify_capability_short_unit_manifest.json")
+        public = repository.ignored("spotify_capability_short_unit_public.json")
         tracked = _ROOT / "configs/tasks/train_spotify_capability_short.json"
-        manifest.unlink(missing_ok=True)
-        public.unlink(missing_ok=True)
         stdout = io.StringIO()
         stderr = io.StringIO()
-        try:
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                code = builder.main(
-                    ["--manifest", str(manifest), "--public", str(public)],
-                    loader=lambda: tuple(
-                        _candidate(f"only-{index}", "scenario-only") for index in range(3)
-                    ),
-                )
-            self.assertEqual(code, 3)
-            self.assertFalse(manifest.exists())
-            self.assertFalse(public.exists())
-            self.assertFalse(tracked.exists())
-            audit = json.loads(stdout.getvalue())
-            self.assertEqual(audit["tiers"]["tier_1"]["task_count"], 3)
-            self.assertEqual(audit["selected_tier"], None)
-            self.assertIsNone(_APPWORLD_TASK_ID.search(stdout.getvalue()))
-            self.assertNotIn("requirement_count_by_task", audit)
-        finally:
-            manifest.unlink(missing_ok=True)
-            public.unlink(missing_ok=True)
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = builder.main(
+                ["--manifest", str(manifest), "--public", str(public)],
+                loader=lambda: tuple(
+                    _candidate(f"only-{index}", "scenario-only") for index in range(3)
+                ),
+                repository_root=repository.root,
+            )
+        self.assertEqual(code, 3)
+        self.assertFalse(manifest.exists())
+        self.assertFalse(public.exists())
+        self.assertFalse(tracked.exists())
+        audit = json.loads(stdout.getvalue())
+        self.assertEqual(audit["tiers"]["tier_1"]["task_count"], 3)
+        self.assertEqual(audit["selected_tier"], None)
+        self.assertIsNone(_APPWORLD_TASK_ID.search(stdout.getvalue()))
+        self.assertNotIn("requirement_count_by_task", audit)
 
     def test_rerunning_the_builder_rewrites_the_same_ids_and_hash(self) -> None:
         builder = _builder()
-        manifest = _ROOT / "data/processed/spotify_capability_short_unit_manifest.json"
-        public = _ROOT / "data/processed/spotify_capability_short_unit_public.json"
-        manifest.unlink(missing_ok=True)
-        public.unlink(missing_ok=True)
-        try:
-            first_out = io.StringIO()
-            second_out = io.StringIO()
-            with redirect_stdout(first_out):
-                first = builder.main(
-                    ["--manifest", str(manifest), "--public", str(public)],
-                    loader=_fill_pool,
-                )
-            first_manifest = manifest.read_text(encoding="utf-8")
-            first_public = public.read_text(encoding="utf-8")
-            with redirect_stdout(second_out):
-                second = builder.main(
-                    ["--manifest", str(manifest), "--public", str(public)],
-                    loader=_fill_pool,
-                )
-            self.assertEqual(first, 0)
-            self.assertEqual(second, 0)
-            self.assertEqual(manifest.read_text(encoding="utf-8"), first_manifest)
-            self.assertEqual(public.read_text(encoding="utf-8"), first_public)
-            public_payload = json.loads(first_public)
-            local_payload = json.loads(first_manifest)
-            self.assertEqual(
-                list(public_payload),
-                [
-                    "appworld_version",
-                    "split",
-                    "selection_rule",
-                    "selection_seed",
-                    "task_count",
-                    "scenario_count",
-                    "task_set_hash",
-                    "appworld_setup_profile",
-                ],
+        repository = _TemporaryRepository(self)
+        manifest = repository.ignored("spotify_capability_short_unit_manifest.json")
+        public = repository.ignored("spotify_capability_short_unit_public.json")
+        first_out = io.StringIO()
+        second_out = io.StringIO()
+        with redirect_stdout(first_out):
+            first = builder.main(
+                ["--manifest", str(manifest), "--public", str(public)],
+                loader=_fill_pool,
+                repository_root=repository.root,
             )
-            self.assertEqual(public_payload["selection_rule"], SELECTION_RULE)
-            self.assertEqual(public_payload["task_count"], 20)
-            self.assertEqual(public_payload["appworld_setup_profile"], "spotify_authenticated_v1")
-            self.assertNotIn("task_ids", public_payload)
-            self.assertEqual(local_payload["task_ids"], json.loads(manifest.read_text())["task_ids"])
-            self.assertEqual(len(local_payload["task_ids"]), 20)
-            self.assertEqual(local_payload["selection_tier"], "tier_1")
-            self.assertIsNone(_APPWORLD_TASK_ID.search(first_public))
-            self.assertNotIn('["requirement"]', first_manifest)
-        finally:
-            manifest.unlink(missing_ok=True)
-            public.unlink(missing_ok=True)
+        first_manifest = manifest.read_text(encoding="utf-8")
+        first_public = public.read_text(encoding="utf-8")
+        with redirect_stdout(second_out):
+            second = builder.main(
+                ["--manifest", str(manifest), "--public", str(public)],
+                loader=_fill_pool,
+                repository_root=repository.root,
+            )
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 0)
+        self.assertEqual(manifest.read_text(encoding="utf-8"), first_manifest)
+        self.assertEqual(public.read_text(encoding="utf-8"), first_public)
+        public_payload = json.loads(first_public)
+        local_payload = json.loads(first_manifest)
+        self.assertEqual(
+            list(public_payload),
+            [
+                "appworld_version",
+                "split",
+                "selection_rule",
+                "selection_seed",
+                "task_count",
+                "scenario_count",
+                "task_set_hash",
+                "appworld_setup_profile",
+            ],
+        )
+        self.assertEqual(public_payload["selection_rule"], SELECTION_RULE)
+        self.assertEqual(public_payload["task_count"], 20)
+        self.assertEqual(public_payload["appworld_setup_profile"], "spotify_authenticated_v1")
+        self.assertNotIn("task_ids", public_payload)
+        self.assertEqual(local_payload["task_ids"], json.loads(manifest.read_text())["task_ids"])
+        self.assertEqual(len(local_payload["task_ids"]), 20)
+        self.assertEqual(local_payload["selection_tier"], "tier_1")
+        self.assertIsNone(_APPWORLD_TASK_ID.search(first_public))
+        self.assertNotIn('["requirement"]', first_manifest)
 
     def test_sources_do_not_consult_prior_results_or_requirement_text(self) -> None:
         for path in (_SELECTOR, _BUILDER):
@@ -478,63 +526,60 @@ class ShortHorizonDiagnosticTest(unittest.TestCase):
 
     def test_diagnostic_builder_rewrites_the_same_manifest(self) -> None:
         builder = _builder()
-        manifest = _ROOT / "data/processed/spotify_short_horizon_diagnostic_unit.json"
-        public = _ROOT / "data/processed/spotify_short_horizon_diagnostic_unit_public.json"
-        manifest.unlink(missing_ok=True)
-        public.unlink(missing_ok=True)
-        try:
-            first_out = io.StringIO()
-            second_out = io.StringIO()
-            with redirect_stdout(first_out):
-                first = builder.main(
-                    [
-                        "--diagnostic",
-                        "--manifest",
-                        str(manifest),
-                        "--public",
-                        str(public),
-                    ],
-                    loader=_diagnostic_pool,
-                )
-            first_manifest = manifest.read_text(encoding="utf-8")
-            first_public = public.read_text(encoding="utf-8")
-            with redirect_stdout(second_out):
-                second = builder.main(
-                    [
-                        "--diagnostic",
-                        "--manifest",
-                        str(manifest),
-                        "--public",
-                        str(public),
-                    ],
-                    loader=_diagnostic_pool,
-                )
-            self.assertEqual(first, 0)
-            self.assertEqual(second, 0)
-            self.assertEqual(manifest.read_text(encoding="utf-8"), first_manifest)
-            self.assertEqual(public.read_text(encoding="utf-8"), first_public)
-            public_payload = json.loads(first_public)
-            local_payload = json.loads(first_manifest)
-            self.assertEqual(public_payload["task_count"], 6)
-            self.assertEqual(public_payload["selection_rule"], DIAGNOSTIC_RULE)
-            self.assertEqual(public_payload["scenario_count"], 2)
-            self.assertNotIn("task_ids", public_payload)
-            self.assertEqual(local_payload["selection_tier"], "structural_short")
-            self.assertEqual(local_payload["task_ids"], sorted(local_payload["task_ids"]))
-            self.assertEqual(len(local_payload["reference_paged_calls_by_task"]), 6)
-            self.assertTrue(
-                all(count <= 1 for count in local_payload["reference_paged_calls_by_task"].values())
+        repository = _TemporaryRepository(self)
+        manifest = repository.ignored("spotify_short_horizon_diagnostic_unit.json")
+        public = repository.ignored("spotify_short_horizon_diagnostic_unit_public.json")
+        first_out = io.StringIO()
+        second_out = io.StringIO()
+        with redirect_stdout(first_out):
+            first = builder.main(
+                [
+                    "--diagnostic",
+                    "--manifest",
+                    str(manifest),
+                    "--public",
+                    str(public),
+                ],
+                loader=_diagnostic_pool,
+                repository_root=repository.root,
             )
-            self.assertTrue(
-                all(
-                    count <= 10
-                    for count in local_payload["reference_agent_calls_by_task"].values()
-                )
+        first_manifest = manifest.read_text(encoding="utf-8")
+        first_public = public.read_text(encoding="utf-8")
+        with redirect_stdout(second_out):
+            second = builder.main(
+                [
+                    "--diagnostic",
+                    "--manifest",
+                    str(manifest),
+                    "--public",
+                    str(public),
+                ],
+                loader=_diagnostic_pool,
+                repository_root=repository.root,
             )
-            self.assertIsNone(_APPWORLD_TASK_ID.search(first_public))
-        finally:
-            manifest.unlink(missing_ok=True)
-            public.unlink(missing_ok=True)
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 0)
+        self.assertEqual(manifest.read_text(encoding="utf-8"), first_manifest)
+        self.assertEqual(public.read_text(encoding="utf-8"), first_public)
+        public_payload = json.loads(first_public)
+        local_payload = json.loads(first_manifest)
+        self.assertEqual(public_payload["task_count"], 6)
+        self.assertEqual(public_payload["selection_rule"], DIAGNOSTIC_RULE)
+        self.assertEqual(public_payload["scenario_count"], 2)
+        self.assertNotIn("task_ids", public_payload)
+        self.assertEqual(local_payload["selection_tier"], "structural_short")
+        self.assertEqual(local_payload["task_ids"], sorted(local_payload["task_ids"]))
+        self.assertEqual(len(local_payload["reference_paged_calls_by_task"]), 6)
+        self.assertTrue(
+            all(count <= 1 for count in local_payload["reference_paged_calls_by_task"].values())
+        )
+        self.assertTrue(
+            all(
+                count <= 10
+                for count in local_payload["reference_agent_calls_by_task"].values()
+            )
+        )
+        self.assertIsNone(_APPWORLD_TASK_ID.search(first_public))
 
     def test_pilot_keeps_twenty_tasks_for_the_stress_set(self) -> None:
         pilot = _capability_pilot()
@@ -677,21 +722,19 @@ class InstalledTrainShortHorizonTest(unittest.TestCase):
         self.assertEqual(public_payload["scenario_count"], 2)
         self.assertNotIn("task_ids", public_payload)
         self.assertIsNone(_APPWORLD_TASK_ID.search(public_path.read_text(encoding="utf-8")))
-        manifest = _ROOT / "data/processed/spotify_capability_short_unit_manifest.json"
-        public = _ROOT / "data/processed/spotify_capability_short_unit_public.json"
+        repository = _TemporaryRepository(self)
+        manifest = repository.ignored("spotify_capability_short_unit_manifest.json")
+        public = repository.ignored("spotify_capability_short_unit_public.json")
         tracked = _ROOT / "configs/tasks/train_spotify_capability_short.json"
-        manifest.unlink(missing_ok=True)
-        public.unlink(missing_ok=True)
-        try:
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                code = builder.main(["--manifest", str(manifest), "--public", str(public)])
-            self.assertEqual(code, 3)
-            self.assertFalse(manifest.exists())
-            self.assertFalse(public.exists())
-            self.assertFalse(tracked.exists())
-        finally:
-            manifest.unlink(missing_ok=True)
-            public.unlink(missing_ok=True)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = builder.main(
+                ["--manifest", str(manifest), "--public", str(public)],
+                repository_root=repository.root,
+            )
+        self.assertEqual(code, 3)
+        self.assertFalse(manifest.exists())
+        self.assertFalse(public.exists())
+        self.assertFalse(tracked.exists())
 
 
 if __name__ == "__main__":

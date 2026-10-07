@@ -126,6 +126,121 @@ class TaskSelectionAllowance:
                 )
 
 
+TASK_SELECTION_ALLOWANCE_VERSION = "task-selection-allowance-v1"
+_ALLOWANCE_KEYS = frozenset(
+    {"version", "allowed_leaves", "train_task_set_hash", "train_values"}
+)
+_TASK_SELECTION_STRING_LEAVES = frozenset(
+    {"task.split", "task.selection_rule", "task.task_set_hash"}
+)
+
+
+def task_selection_allowance_for(
+    train_configuration: RunConfiguration,
+    allowed_leaves: frozenset[str] = _TASK_SELECTION_LEAVES,
+) -> TaskSelectionAllowance:
+    """The allowance that restores ``train_configuration``'s task-selection leaves.
+
+    Values are read from the configuration the gate ran, never typed by
+    hand, so the reconstructed hashes are the gate's own.
+    """
+
+    if not isinstance(train_configuration, RunConfiguration):
+        raise ProtocolError("train_configuration must be a RunConfiguration")
+    task = train_configuration.task
+    every_value: dict[str, object] = {
+        "task.split": task.split,
+        "task.selection_rule": task.selection_rule,
+        "task.selection_seed": task.selection_seed,
+        "task.task_count": task.task_count,
+        "task.task_set_hash": task.task_set_hash,
+    }
+    leaves = frozenset(allowed_leaves)
+    return TaskSelectionAllowance(
+        allowed_leaves=leaves,
+        train_task_set_hash=task.task_set_hash,
+        train_values={leaf: every_value[leaf] for leaf in leaves if leaf in every_value},
+    )
+
+
+def task_selection_allowance_document(
+    allowance: TaskSelectionAllowance,
+) -> dict[str, object]:
+    """The versioned JSON form read by ``task_selection_allowance_from_dict``."""
+
+    if not isinstance(allowance, TaskSelectionAllowance):
+        raise ProtocolError("allowance must be a TaskSelectionAllowance")
+    return {
+        "version": TASK_SELECTION_ALLOWANCE_VERSION,
+        "allowed_leaves": sorted(allowance.allowed_leaves),
+        "train_task_set_hash": allowance.train_task_set_hash,
+        "train_values": {
+            leaf: allowance.train_values[leaf] for leaf in sorted(allowance.train_values)
+        },
+    }
+
+
+def task_selection_allowance_from_dict(payload: object) -> TaskSelectionAllowance:
+    """Strictly parse a ``task-selection-allowance-v1`` document.
+
+    Refuses unknown or missing keys, another version, duplicate or unknown
+    leaves, and leaf values of the wrong JSON type.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ProtocolError("task selection allowance must be an object")
+    keys = set(payload)
+    if keys != _ALLOWANCE_KEYS:
+        missing = sorted(_ALLOWANCE_KEYS - keys)
+        unknown = sorted(keys - _ALLOWANCE_KEYS)
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing))
+        if unknown:
+            detail.append("unknown " + ", ".join(unknown))
+        raise ProtocolError("task selection allowance keys: " + "; ".join(detail))
+    if payload["version"] != TASK_SELECTION_ALLOWANCE_VERSION:
+        raise ProtocolError(
+            f"task selection allowance version must be {TASK_SELECTION_ALLOWANCE_VERSION}"
+        )
+    raw_leaves = payload["allowed_leaves"]
+    if (
+        not isinstance(raw_leaves, list)
+        or not raw_leaves
+        or not all(isinstance(leaf, str) for leaf in raw_leaves)
+    ):
+        raise ProtocolError("allowed_leaves must be a non-empty list of strings")
+    if len(set(raw_leaves)) != len(raw_leaves):
+        raise ProtocolError("allowed_leaves must not repeat a leaf")
+    raw_values = payload["train_values"]
+    if not isinstance(raw_values, Mapping):
+        raise ProtocolError("train_values must be an object")
+    for leaf, value in raw_values.items():
+        if leaf in _TASK_SELECTION_STRING_LEAVES:
+            if not isinstance(value, str) or value == "":
+                raise ProtocolError(f"train_values {leaf} must be a non-empty string")
+        elif isinstance(value, bool) or not isinstance(value, int):
+            raise ProtocolError(f"train_values {leaf} must be an integer")
+    return TaskSelectionAllowance(
+        allowed_leaves=frozenset(raw_leaves),
+        train_task_set_hash=payload["train_task_set_hash"],
+        train_values=dict(raw_values),
+    )
+
+
+def bind_train_task_selection(
+    configuration: RunConfiguration,
+    allowance: TaskSelectionAllowance,
+) -> RunConfiguration:
+    """``configuration`` with the allowance's train task-selection values restored."""
+
+    if not isinstance(configuration, RunConfiguration):
+        raise ProtocolError("configuration must be a RunConfiguration")
+    if not isinstance(allowance, TaskSelectionAllowance):
+        raise ProtocolError("allowance must be a TaskSelectionAllowance")
+    return _with_train_task_selection(configuration, allowance)
+
+
 @dataclass(frozen=True)
 class GatedCandidateAdmission:
     """Frozen record that a real gate PASS may serve a candidate configuration.

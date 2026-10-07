@@ -61,7 +61,20 @@ py scripts/evaluation/build_run_configuration.py \
   --template configs/models/glm_5_3_general_experimental.json \
   --task-set data/processed/dev_calibration.json --run-seed 17 \
   --output data/processed/configs/glm_general_dev.json
+
+py scripts/evaluation/build_run_configuration.py \
+  --template configs/models/glm_5_3_general_experimental.json \
+  --task-set data/processed/train_gate.json --run-seed 17 \
+  --fault configs/faults/hosted_zai/glm_reasoning_disabled.v1.json \
+  --output data/processed/configs/glm_general_train_reasoning_disabled.json
+py scripts/evaluation/build_run_configuration.py \
+  --template configs/models/glm_5_3_general_experimental.json \
+  --task-set data/processed/dev_calibration.json --run-seed 17 \
+  --fault configs/faults/hosted_zai/glm_reasoning_disabled.v1.json \
+  --output data/processed/configs/glm_general_dev_reasoning_disabled.json
 ```
+
+Build all four at one clean HEAD with one `--run-seed`. The train and dev files then differ only in their task-selection leaves (split, selection rule, seed, count, task-set hash), which is what step 8's train-to-dev admission requires; a rebuild at another commit or seed changes the hash and admission refuses it.
 
 ### 2. Plan specs for the Tier 1 plan-quality features
 
@@ -141,12 +154,19 @@ py scripts/run_offline_gate.py --live-runtime \
 
 `plan_evidence_hosted.json` sets `required_statistics` to `["plan_quality", "mmd"]`. A provider failure is an execution error (exit 2), not a BLOCK.
 
-### 8. Hosted service and admission
+### 8. Hosted service and train-to-dev admission
+
+The gate ran on train configurations and the service serves dev ones, so the configuration hashes differ. `--task-selection-allowance` lets admission restore the train task-selection leaves on the dev configurations, rebuild both gate hashes, and compare them with the stored artifact. Write the allowance from the train reference the gate ran, never by hand:
 
 ```bash
+py scripts/evaluation/build_task_selection_allowance.py \
+  --train-config data/processed/configs/glm_general_train.json \
+  --output data/processed/task_selection_allowance.json
+
 py scripts/service/serve.py \
   --production-config data/processed/configs/glm_general_dev.json \
   --candidate-config data/processed/configs/glm_general_dev_reasoning_disabled.json \
+  --task-selection-allowance data/processed/task_selection_allowance.json \
   --store data/processed/gate.sqlite --max-in-flight 2 --shutdown-timeout-seconds 30 \
   --canary-settings data/processed/canary_settings.json \
   --monitor-settings data/processed/monitor_settings.json \
@@ -157,6 +177,20 @@ py scripts/service/serve.py \
 curl -s -X POST localhost:8000/candidates -H 'content-type: application/json' \
   -d '{"artifact_id": "<artifact_id printed by step 7>"}'
 ```
+
+Required inputs:
+
+| Input | Requirement |
+|---|---|
+| `--store` | The same SQLite file step 7 wrote with `--episode-store`; admission looks the artifact up there. |
+| `--production-config`, `--candidate-config` | The dev builds from step 1. Both must have split `dev` and the same task binding. |
+| `--task-selection-allowance` | A `task-selection-allowance-v1` document: exactly `version`, `allowed_leaves`, `train_task_set_hash`, `train_values`. It must name `task.split` (value `train`) and `task.task_set_hash`, and may name only `task.split`, `task.selection_rule`, `task.selection_seed`, `task.task_count`, and `task.task_set_hash`. Startup refuses unknown keys, repeated or unknown leaves, wrong value types, a missing candidate, and a non-dev serving split (exit 2). |
+| `--frozen-reference`, `--monitor-settings` | `configuration_hash` and `reference_configuration_hash` equal the dev production hash printed by step 1. |
+| `--canary-settings`, `--distributional-monitors` | Local DRAFT settings; not protocol values. |
+| `--task-metadata` | The dev manifest from step 1, annotated; it supplies difficulty slices. |
+| `ZAI_API_KEY` | In the server's environment. Hosted roles take no `--*-base-url`. |
+
+Admission (`POST /candidates`, HTTP 409 on refusal) accepts only a stored `gate_run` PASS; `serve.py` admits in release mode, so `synthetic_fixture` evidence is refused with or without an allowance. After the train leaves are restored, every other hashed leaf must match the gate: model, agent, prompt, sampling, `run_seed`, `git_commit`, and `protocol_hash`. An allowance whose train values differ from the gate's task set fails the same hash check. Without `--task-selection-allowance` admission is strict, and a train gate cannot admit dev configurations. The service never builds a PASS.
 
 Hosted roles take no `--*-base-url`. Endpoints route by configuration hash, so a promoted candidate keeps serving from its own route while the monitor compares it with the previous production reference.
 

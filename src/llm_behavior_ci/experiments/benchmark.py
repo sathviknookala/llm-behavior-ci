@@ -42,6 +42,7 @@ from llm_behavior_ci.experiments.protocol import (
     authorize_gated_candidate,
     authorize_test_gated_candidate,
     bind_protocol,
+    task_selection_allowance_for,
 )
 from llm_behavior_ci.export import AggregateResults, ExportError, export_public_results
 from llm_behavior_ci.lifecycle.canary import CanaryController, CanaryDecision, CanaryRejected
@@ -95,16 +96,6 @@ from llm_behavior_ci.runtime.episode import (
 from llm_behavior_ci.runtime.factory import RuntimeFactory, StaticRuntimeFactory
 from llm_behavior_ci.tasks.selection import TaskSet
 from llm_behavior_ci.tasks.streams import generate_stream
-
-_TASK_SELECTION_LEAVES = frozenset(
-    {
-        "task.split",
-        "task.selection_rule",
-        "task.selection_seed",
-        "task.task_count",
-        "task.task_set_hash",
-    }
-)
 
 
 class BenchmarkError(ValueError):
@@ -1147,19 +1138,8 @@ def _export_aggregates(
 def _task_selection_allowance(
     train_template: RunConfiguration,
 ) -> TaskSelectionAllowance:
-    train_values = {
-        "task.split": train_template.task.split,
-        "task.selection_rule": train_template.task.selection_rule,
-        "task.selection_seed": train_template.task.selection_seed,
-        "task.task_count": train_template.task.task_count,
-        "task.task_set_hash": train_template.task.task_set_hash,
-    }
     try:
-        return TaskSelectionAllowance(
-            allowed_leaves=_TASK_SELECTION_LEAVES,
-            train_task_set_hash=train_template.task.task_set_hash,
-            train_values=train_values,
-        )
+        return task_selection_allowance_for(train_template)
     except ProtocolError as error:
         raise BenchmarkError(str(error)) from error
 
