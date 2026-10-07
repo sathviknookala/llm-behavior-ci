@@ -989,8 +989,11 @@ def _retry_delay(attempt: int, error: urllib.error.HTTPError | None) -> float:
     return min(8.0, 0.5 * (2**attempt))
 
 
-def _anthropic_http_error(
+def _hosted_http_error(
     error: urllib.error.HTTPError,
+    *,
+    label: str,
+    endpoint: str,
     secret: str,
 ) -> RuntimeError:
     from llm_behavior_ci.runtime.episode import RuntimeUnavailable
@@ -998,14 +1001,12 @@ def _anthropic_http_error(
     body = _redact_secret(_http_error_body(error), secret)
     if len(body) > 4000:
         body = body[:4000]
-    reason = (
-        "context_length_exceeded" if _hosted_context_length(body) else None
-    )
+    reason = "context_length_exceeded" if _hosted_context_length(body) else None
     message = _redact_secret(
         (
-            f"Anthropic request failed with HTTP {error.code} {error.reason}:\n"
+            f"{label} request failed with HTTP {error.code} {error.reason}:\n"
             f"{body}\n"
-            f"endpoint: {ANTHROPIC_MESSAGES_URL}"
+            f"endpoint: {endpoint}"
         ),
         secret,
     )
@@ -1054,26 +1055,84 @@ def _output_token_count(payload: Mapping[object, object]) -> int:
     return count
 
 
-class SmolagentsAnthropicAgent:
-    """An ``AgentLoop`` whose generations come from the Anthropic Messages API.
+def _read_chat_completion(
+    payload: Mapping[object, object],
+    label: str,
+) -> tuple[str, int]:
+    """Visible content and completion-token count of one chat completion.
 
-    Prompt rendering, history, action parsing, and the workflow controller
-    stay on the same path as ``SmolagentsVLLMAgent``. This class replaces
-    only the model request. The API key is an HTTP header and is omitted
-    from ``repr``, configuration JSON, and exception text.
+    Only ``choices[0].message.content`` is read as model output;
+    ``reasoning_content`` and any other message field are ignored. A
+    ``length`` finish keeps whatever visible content was returned, and an
+    absent content under ``length`` is the empty string. A context-window
+    finish is a context-length runtime failure; ``network_error`` and
+    ``sensitive`` are provider failures. Any other shape fails closed.
     """
 
-    def __init__(self, api_key: str) -> None:
+    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+    malformed = f"{label} response was malformed"
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeUnavailable(malformed)
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        raise RuntimeUnavailable(malformed)
+    finish = choice.get("finish_reason")
+    if finish == "model_context_window_exceeded":
+        raise RuntimeUnavailable(
+            "context_length_exceeded\n"
+            f"{label} finish_reason model_context_window_exceeded",
+            reason="context_length_exceeded",
+        )
+    if finish in _OPENAI_COMPATIBLE_PROVIDER_FAILURES:
+        raise RuntimeUnavailable(f"{label} provider failure: finish_reason {finish}")
+    if finish not in _OPENAI_COMPATIBLE_FINISHES:
+        raise RuntimeUnavailable(f"{label} response had an unsupported finish_reason")
+    message = choice.get("message")
+    if not isinstance(message, Mapping):
+        raise RuntimeUnavailable(malformed)
+    content = message.get("content")
+    if content is None and finish == "length":
+        content = ""
+    if not isinstance(content, str):
+        raise RuntimeUnavailable(malformed)
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        raise RuntimeUnavailable(malformed)
+    count = usage.get("completion_tokens")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise RuntimeUnavailable(malformed)
+    return content, count
+
+
+class _HostedChatAgent:
+    """The provider-independent half of a hosted-API ``AgentLoop``.
+
+    Prompt rendering, task instruction, API documentation, append-only
+    visible history, action parsing, and the bounded retrying HTTP post
+    are shared with every hosted provider and follow the same path as
+    ``SmolagentsVLLMAgent``. A subclass supplies the configuration check,
+    the request body, headers and endpoint, and how a response becomes
+    visible text, a token count, and an optional replay record kept in
+    process memory. The API key is an HTTP header and is omitted from
+    ``repr``, configuration JSON, request bodies, and exception text.
+    Plan mode and teacher-forced plan KL are unsupported because hosted
+    APIs do not expose prompt-token logprobs.
+    """
+
+    _label: str
+    _retryable: frozenset[int]
+    _attempts: int
+
+    def __init__(self, api_key: str, *, key_variable: str) -> None:
         if not isinstance(api_key, str) or api_key.strip() == "":
             from llm_behavior_ci.runtime.episode import EpisodeRejected
 
-            raise EpisodeRejected("ANTHROPIC_API_KEY is required")
+            raise EpisodeRejected(f"{key_variable} is required")
         self._api_key = api_key.strip()
         self._mode = "execute"
         self._local = threading.local()
-
-    def __repr__(self) -> str:
-        return "SmolagentsAnthropicAgent(provider='anthropic')"
 
     def set_mode(self, mode: str) -> None:
         if mode not in {"plan", "execute"}:
@@ -1084,7 +1143,7 @@ class SmolagentsAnthropicAgent:
 
     def begin(self, context: TaskContext, config: RunConfiguration) -> None:
         validate_chat_request(config)
-        self._require_anthropic(config)
+        self._require_configuration(config)
         try:
             render_system_text(
                 prompt_version=config.agent.prompt.prompt_version,
@@ -1105,20 +1164,8 @@ class SmolagentsAnthropicAgent:
             raise RuntimeError("agent begin was not called")
         return state
 
-    def _require_anthropic(self, config: RunConfiguration) -> AnthropicModelConfiguration:
-        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-        model = config.model
-        sampling = config.agent.sampling
-        if not isinstance(model, AnthropicModelConfiguration):
-            raise RuntimeUnavailable(
-                "Anthropic agent requires an Anthropic model configuration"
-            )
-        if not isinstance(sampling, AnthropicSamplingSettings):
-            raise RuntimeUnavailable(
-                "Anthropic agent requires unset vLLM sampling controls"
-            )
-        return model
+    def _require_configuration(self, config: RunConfiguration) -> object:
+        raise NotImplementedError
 
     def _system_text(self) -> str:
         state = self._state()
@@ -1177,6 +1224,188 @@ class SmolagentsAnthropicAgent:
     def completion_payload(
         self, messages: list[dict[str, str]]
     ) -> dict[str, object]:
+        raise NotImplementedError
+
+    def parse_model_output(
+        self, text: str
+    ) -> tuple[str | None, str | None, str | None]:
+        return parse_model_output(text)
+
+    def _endpoint(self) -> str:
+        raise NotImplementedError
+
+    def _headers(self) -> dict[str, str]:
+        raise NotImplementedError
+
+    def _read_response(
+        self, payload: Mapping[object, object]
+    ) -> tuple[str, int, object]:
+        raise NotImplementedError
+
+    def _record_response(self, state: _EpisodeState, record: object) -> None:
+        del state, record
+
+    def generate_turn(
+        self,
+        *,
+        tool_output: str | None,
+        extra_instruction: str | None = None,
+        parse_action: bool = True,
+    ) -> AgentTurn:
+        if self._mode == "plan":
+            raise UnsupportedCapability(
+                f"{self._label} does not expose prompt-token logprobs; "
+                "plan-mode scoring is unsupported"
+            )
+        state = self._state()
+        started_at = wall_now()
+        if tool_output is not None:
+            state.history.append({"role": "user", "content": tool_output})
+        messages = self.messages()
+        if extra_instruction is not None:
+            messages.append({"role": "user", "content": extra_instruction})
+        payload = self.completion_payload(messages)
+        began = monotonic()
+        raw = self._post(payload)
+        latency_seconds = monotonic() - began
+        output_text, token_count, record = self._read_response(raw)
+        if parse_action:
+            rejection = None
+            try:
+                action, app_name, api_name = parse_model_output(output_text)
+            except ActionRejected as error:
+                action, app_name, api_name = None, None, None
+                rejection = str(error)
+        else:
+            action, app_name, api_name = None, None, None
+            rejection = None
+        state.history.append({"role": "assistant", "content": output_text})
+        self._record_response(state, record)
+        return AgentTurn(
+            prompt_text=messages[-1]["content"],
+            output_text=output_text,
+            top_k_logprobs=(),
+            generated_token_count=token_count,
+            latency_seconds=latency_seconds,
+            started_at=started_at,
+            action=action,
+            app_name=app_name,
+            api_name=api_name,
+            rejection=rejection,
+        )
+
+    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+        return self.generate_turn(
+            tool_output=tool_output,
+            extra_instruction=None,
+            parse_action=True,
+        )
+
+    def teacher_force_plan(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        plan_text: str,
+    ) -> tuple[tuple[TokenLogprob, ...], ...]:
+        del messages, plan_text
+        raise UnsupportedCapability(
+            f"{self._label} does not expose prompt-token logprobs; "
+            "teacher-forced plan KL is unsupported"
+        )
+
+    def _post(self, payload: dict[str, object]) -> dict[str, object]:
+        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+        malformed = f"{self._label} response was malformed"
+        body = json.dumps(payload).encode("utf-8")
+        if self._api_key.encode("utf-8") in body:
+            raise RuntimeUnavailable(f"{self._label} request was malformed")
+        endpoint = self._endpoint()
+        headers = self._headers()
+        last_error: BaseException | None = None
+        for attempt in range(self._attempts):
+            request = urllib.request.Request(
+                endpoint,
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=240) as response:
+                    raw = response.read()
+                break
+            except urllib.error.HTTPError as error:
+                last_error = error
+                if error.code in self._retryable and attempt + 1 < self._attempts:
+                    time.sleep(_retry_delay(attempt, error))
+                    continue
+                raise _hosted_http_error(
+                    error,
+                    label=self._label,
+                    endpoint=endpoint,
+                    secret=self._api_key,
+                ) from error
+            except (urllib.error.URLError, TimeoutError, OSError) as error:
+                last_error = error
+                if attempt + 1 < self._attempts:
+                    time.sleep(_retry_delay(attempt, None))
+                    continue
+                raise RuntimeUnavailable(
+                    _redact_secret(str(error), self._api_key)
+                ) from error
+        else:
+            raise RuntimeUnavailable(
+                _redact_secret(str(last_error), self._api_key)
+            )
+        try:
+            if isinstance(raw, str):
+                decoded = json.loads(raw)
+            else:
+                decoded = json.loads(bytes(raw).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeUnavailable(malformed) from error
+        if not isinstance(decoded, dict):
+            raise RuntimeUnavailable(malformed)
+        return decoded
+
+
+class SmolagentsAnthropicAgent(_HostedChatAgent):
+    """An ``AgentLoop`` whose generations come from the Anthropic Messages API.
+
+    Only the request differs from the shared hosted path: the system
+    prompt is the top-level ``system`` field, and each assistant turn is
+    replayed with its full response blocks, including thinking, which stay
+    in process memory and never enter visible history.
+    """
+
+    _label = "Anthropic"
+    _retryable = _ANTHROPIC_RETRYABLE
+    _attempts = _ANTHROPIC_ATTEMPTS
+
+    def __init__(self, api_key: str) -> None:
+        super().__init__(api_key, key_variable="ANTHROPIC_API_KEY")
+
+    def __repr__(self) -> str:
+        return "SmolagentsAnthropicAgent(provider='anthropic')"
+
+    def _require_configuration(self, config: RunConfiguration) -> AnthropicModelConfiguration:
+        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
+        model = config.model
+        sampling = config.agent.sampling
+        if not isinstance(model, AnthropicModelConfiguration):
+            raise RuntimeUnavailable(
+                "Anthropic agent requires an Anthropic model configuration"
+            )
+        if not isinstance(sampling, AnthropicSamplingSettings):
+            raise RuntimeUnavailable(
+                "Anthropic agent requires unset vLLM sampling controls"
+            )
+        return model
+
+    def completion_payload(
+        self, messages: list[dict[str, str]]
+    ) -> dict[str, object]:
         """The Anthropic Messages body for one agent turn.
 
         The system prompt is the top-level ``system`` field. Conversation
@@ -1186,7 +1415,7 @@ class SmolagentsAnthropicAgent:
         """
 
         state = self._state()
-        model = self._require_anthropic(state.config)
+        model = self._require_configuration(state.config)
         sampling = state.config.agent.sampling
         if not isinstance(sampling, AnthropicSamplingSettings):
             from llm_behavior_ci.runtime.episode import RuntimeUnavailable
@@ -1245,20 +1474,20 @@ class SmolagentsAnthropicAgent:
             "output_config": {"effort": model.effort},
         }
 
-    def parse_model_output(
-        self, text: str
-    ) -> tuple[str | None, str | None, str | None]:
-        return parse_model_output(text)
+    def _endpoint(self) -> str:
+        return ANTHROPIC_MESSAGES_URL
 
     def _headers(self) -> dict[str, str]:
-        model = self._require_anthropic(self._state().config)
+        model = self._require_configuration(self._state().config)
         return {
             "content-type": "application/json",
             "x-api-key": self._api_key,
             "anthropic-version": model.api_version,
         }
 
-    def _read_message(self, payload: Mapping[object, object]) -> tuple[str, int]:
+    def _read_response(
+        self, payload: Mapping[object, object]
+    ) -> tuple[str, int, object]:
         from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 
         if payload.get("stop_reason") == "model_context_window_exceeded":
@@ -1267,219 +1496,27 @@ class SmolagentsAnthropicAgent:
                 "Anthropic stop_reason model_context_window_exceeded",
                 reason="context_length_exceeded",
             )
-        return _visible_response_text(payload.get("content")), _output_token_count(
-            payload
-        )
+        text = _visible_response_text(payload.get("content"))
+        count = _output_token_count(payload)
+        return text, count, _replay_blocks(payload.get("content"))
 
-    def generate_turn(
-        self,
-        *,
-        tool_output: str | None,
-        extra_instruction: str | None = None,
-        parse_action: bool = True,
-    ) -> AgentTurn:
-        if self._mode == "plan":
-            raise UnsupportedCapability(
-                "Anthropic does not expose prompt-token logprobs; "
-                "plan-mode scoring is unsupported"
-            )
-        state = self._state()
-        started_at = wall_now()
-        if tool_output is not None:
-            state.history.append({"role": "user", "content": tool_output})
-        messages = self.messages()
-        if extra_instruction is not None:
-            messages.append({"role": "user", "content": extra_instruction})
-        payload = self.completion_payload(messages)
-        began = monotonic()
-        raw = self._post(payload)
-        latency_seconds = monotonic() - began
-        output_text, token_count = self._read_message(raw)
-        replay = _replay_blocks(raw.get("content"))
-        if parse_action:
-            rejection = None
-            try:
-                action, app_name, api_name = parse_model_output(output_text)
-            except ActionRejected as error:
-                action, app_name, api_name = None, None, None
-                rejection = str(error)
-        else:
-            action, app_name, api_name = None, None, None
-            rejection = None
-        state.history.append({"role": "assistant", "content": output_text})
-        state.assistant_blocks.append(replay)
-        return AgentTurn(
-            prompt_text=messages[-1]["content"],
-            output_text=output_text,
-            top_k_logprobs=(),
-            generated_token_count=token_count,
-            latency_seconds=latency_seconds,
-            started_at=started_at,
-            action=action,
-            app_name=app_name,
-            api_name=api_name,
-            rejection=rejection,
-        )
-
-    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
-        return self.generate_turn(
-            tool_output=tool_output,
-            extra_instruction=None,
-            parse_action=True,
-        )
-
-    def teacher_force_plan(
-        self,
-        *,
-        messages: list[dict[str, str]],
-        plan_text: str,
-    ) -> tuple[tuple[TokenLogprob, ...], ...]:
-        del messages, plan_text
-        raise UnsupportedCapability(
-            "Anthropic does not expose prompt-token logprobs; "
-            "teacher-forced plan KL is unsupported"
-        )
-
-    def _post(self, payload: dict[str, object]) -> dict[str, object]:
-        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-        body = json.dumps(payload).encode("utf-8")
-        if self._api_key.encode("utf-8") in body:
-            raise RuntimeUnavailable("Anthropic request was malformed")
-        headers = self._headers()
-        last_error: BaseException | None = None
-        for attempt in range(_ANTHROPIC_ATTEMPTS):
-            request = urllib.request.Request(
-                ANTHROPIC_MESSAGES_URL,
-                data=body,
-                headers=headers,
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=240) as response:
-                    raw = response.read()
-                break
-            except urllib.error.HTTPError as error:
-                last_error = error
-                if (
-                    error.code in _ANTHROPIC_RETRYABLE
-                    and attempt + 1 < _ANTHROPIC_ATTEMPTS
-                ):
-                    time.sleep(_retry_delay(attempt, error))
-                    continue
-                raise _anthropic_http_error(error, self._api_key) from error
-            except (urllib.error.URLError, TimeoutError, OSError) as error:
-                last_error = error
-                if attempt + 1 < _ANTHROPIC_ATTEMPTS:
-                    time.sleep(_retry_delay(attempt, None))
-                    continue
-                raise RuntimeUnavailable(
-                    _redact_secret(str(error), self._api_key)
-                ) from error
-        else:
-            raise RuntimeUnavailable(
-                _redact_secret(str(last_error), self._api_key)
-            )
-        try:
-            if isinstance(raw, str):
-                decoded = json.loads(raw)
-            else:
-                decoded = json.loads(bytes(raw).decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as error:
-            raise RuntimeUnavailable("Anthropic response was malformed") from error
-        if not isinstance(decoded, dict):
-            raise RuntimeUnavailable("Anthropic response was malformed")
-        return decoded
+    def _record_response(self, state: _EpisodeState, record: object) -> None:
+        state.assistant_blocks.append(record)
 
 
-def _openai_compatible_http_error(
-    error: urllib.error.HTTPError,
-    *,
-    label: str,
-    endpoint: str,
-    secret: str,
-) -> RuntimeError:
-    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-    body = _redact_secret(_http_error_body(error), secret)
-    if len(body) > 4000:
-        body = body[:4000]
-    reason = "context_length_exceeded" if _hosted_context_length(body) else None
-    message = _redact_secret(
-        (
-            f"{label} request failed with HTTP {error.code} {error.reason}:\n"
-            f"{body}\n"
-            f"endpoint: {endpoint}"
-        ),
-        secret,
-    )
-    return RuntimeUnavailable(message, reason=reason)
-
-
-def _read_chat_completion(
-    payload: Mapping[object, object],
-    label: str,
-) -> tuple[str, int]:
-    """Visible content and completion-token count of one chat completion.
-
-    Only ``choices[0].message.content`` is read as model output;
-    ``reasoning_content`` and any other message field are ignored. A
-    ``length`` finish keeps whatever visible content was returned, and an
-    absent content under ``length`` is the empty string. A context-window
-    finish is a context-length runtime failure; ``network_error`` and
-    ``sensitive`` are provider failures. Any other shape fails closed.
-    """
-
-    from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-    malformed = f"{label} response was malformed"
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeUnavailable(malformed)
-    choice = choices[0]
-    if not isinstance(choice, Mapping):
-        raise RuntimeUnavailable(malformed)
-    finish = choice.get("finish_reason")
-    if finish == "model_context_window_exceeded":
-        raise RuntimeUnavailable(
-            "context_length_exceeded\n"
-            f"{label} finish_reason model_context_window_exceeded",
-            reason="context_length_exceeded",
-        )
-    if finish in _OPENAI_COMPATIBLE_PROVIDER_FAILURES:
-        raise RuntimeUnavailable(f"{label} provider failure: finish_reason {finish}")
-    if finish not in _OPENAI_COMPATIBLE_FINISHES:
-        raise RuntimeUnavailable(f"{label} response had an unsupported finish_reason")
-    message = choice.get("message")
-    if not isinstance(message, Mapping):
-        raise RuntimeUnavailable(malformed)
-    content = message.get("content")
-    if content is None and finish == "length":
-        content = ""
-    if not isinstance(content, str):
-        raise RuntimeUnavailable(malformed)
-    usage = payload.get("usage")
-    if not isinstance(usage, Mapping):
-        raise RuntimeUnavailable(malformed)
-    count = usage.get("completion_tokens")
-    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-        raise RuntimeUnavailable(malformed)
-    return content, count
-
-
-class SmolagentsOpenAICompatibleAgent:
+class SmolagentsOpenAICompatibleAgent(_HostedChatAgent):
     """An ``AgentLoop`` whose generations come from a hosted Chat Completions API.
 
-    Prompt rendering, history, action parsing, and the workflow controller
-    stay on the same path as ``SmolagentsVLLMAgent``. This class replaces
-    only the model request: a non-streaming ``POST`` to
-    ``{api_base}/chat/completions`` with Bearer authentication and no
-    native tools. Hidden reasoning is never read into model output or
-    history. The API key is an HTTP header and is omitted from ``repr``,
-    configuration JSON, request bodies, and exception text. The agent
-    accepts only configurations whose provider matches its own, so a key
-    is never sent to another provider's endpoint.
+    Only the request differs from the shared hosted path: a non-streaming
+    ``POST`` to ``{api_base}/chat/completions`` with Bearer authentication
+    and no native tools. Hidden reasoning is never read into model output
+    or history. The agent accepts only configurations whose provider
+    matches its own, so a key is never sent to another provider's
+    endpoint.
     """
+
+    _retryable = _OPENAI_COMPATIBLE_RETRYABLE
+    _attempts = _OPENAI_COMPATIBLE_ATTEMPTS
 
     def __init__(self, provider: str, api_key: str) -> None:
         from llm_behavior_ci.runtime.episode import EpisodeRejected
@@ -1487,13 +1524,9 @@ class SmolagentsOpenAICompatibleAgent:
         variable = OPENAI_COMPATIBLE_KEY_VARIABLES.get(provider)
         if variable is None:
             raise EpisodeRejected("unsupported OpenAI-compatible provider")
-        if not isinstance(api_key, str) or api_key.strip() == "":
-            raise EpisodeRejected(f"{variable} is required")
+        super().__init__(api_key, key_variable=variable)
         self._provider = provider
         self._label = _OPENAI_COMPATIBLE_LABELS[provider]
-        self._api_key = api_key.strip()
-        self._mode = "execute"
-        self._local = threading.local()
 
     @property
     def provider(self) -> str:
@@ -1501,36 +1534,6 @@ class SmolagentsOpenAICompatibleAgent:
 
     def __repr__(self) -> str:
         return f"SmolagentsOpenAICompatibleAgent(provider={self._provider!r})"
-
-    def set_mode(self, mode: str) -> None:
-        if mode not in {"plan", "execute"}:
-            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-            raise RuntimeUnavailable("mode must be plan or execute")
-        self._mode = mode
-
-    def begin(self, context: TaskContext, config: RunConfiguration) -> None:
-        validate_chat_request(config)
-        self._require_configuration(config)
-        try:
-            render_system_text(
-                prompt_version=config.agent.prompt.prompt_version,
-                plan_format_version=config.agent.prompt.plan_format_version,
-                thinking_enabled=config.agent.prompt.thinking_enabled,
-                action_interface=config.agent.action_interface,
-                mode=self._mode,
-            )
-        except UnknownPromptVersion as error:
-            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-            raise RuntimeUnavailable(str(error)) from error
-        self._local.state = _EpisodeState(context=context, config=config)
-
-    def _state(self) -> _EpisodeState:
-        state = getattr(self._local, "state", None)
-        if state is None:
-            raise RuntimeError("agent begin was not called")
-        return state
 
     def _require_configuration(
         self, config: RunConfiguration
@@ -1557,64 +1560,6 @@ class SmolagentsOpenAICompatibleAgent:
                 "OpenAI-compatible agent requires OpenAI-compatible sampling"
             )
         return model, sampling
-
-    def _system_text(self) -> str:
-        state = self._state()
-        prompt = state.config.agent.prompt
-        try:
-            return render_system_text(
-                prompt_version=prompt.prompt_version,
-                plan_format_version=prompt.plan_format_version,
-                thinking_enabled=prompt.thinking_enabled,
-                action_interface=state.config.agent.action_interface,
-                mode=self._mode,
-            )
-        except UnknownPromptVersion as error:
-            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-            raise RuntimeUnavailable(str(error)) from error
-
-    def _api_documentation(self) -> str:
-        state = self._state()
-        agent = state.config.agent
-        text = state.context.api_documentation
-        source = getattr(state.context, "api_documentation_source", None)
-        if (
-            agent.prompt.prompt_version == PROMPT_RUNTIME_AUTH_V2
-            and source is not None
-        ):
-            text = render_api_documentation(source, include_constraints=True)
-        try:
-            return resolve_api_documentation(
-                text,
-                api_docs_version=agent.api_docs_version,
-                api_docs_app=agent.api_docs_app,
-            )
-        except ApiDocsCorruptionError as error:
-            from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-            raise RuntimeUnavailable(str(error)) from error
-
-    def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
-        state = self._state()
-        built = [
-            {"role": "system", "content": self._system_text()},
-            {
-                "role": "user",
-                "content": (
-                    f"{state.context.instruction}\n"
-                    f"{self._api_documentation()}"
-                ),
-            },
-        ]
-        built.extend(state.history)
-        if tool_output is not None:
-            built.append({"role": "user", "content": tool_output})
-        return built
-
-    def endpoint(self) -> str:
-        model, _ = self._require_configuration(self._state().config)
-        return f"{model.api_base}/chat/completions"
 
     def completion_payload(
         self, messages: list[dict[str, str]]
@@ -1665,10 +1610,9 @@ class SmolagentsOpenAICompatibleAgent:
         payload["reasoning_effort"] = model.reasoning_effort
         return payload
 
-    def parse_model_output(
-        self, text: str
-    ) -> tuple[str | None, str | None, str | None]:
-        return parse_model_output(text)
+    def _endpoint(self) -> str:
+        model, _ = self._require_configuration(self._state().config)
+        return f"{model.api_base}/chat/completions"
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -1676,129 +1620,8 @@ class SmolagentsOpenAICompatibleAgent:
             "Authorization": f"Bearer {self._api_key}",
         }
 
-    def generate_turn(
-        self,
-        *,
-        tool_output: str | None,
-        extra_instruction: str | None = None,
-        parse_action: bool = True,
-    ) -> AgentTurn:
-        if self._mode == "plan":
-            raise UnsupportedCapability(
-                f"{self._label} does not expose prompt-token logprobs; "
-                "plan-mode scoring is unsupported"
-            )
-        state = self._state()
-        started_at = wall_now()
-        if tool_output is not None:
-            state.history.append({"role": "user", "content": tool_output})
-        messages = self.messages()
-        if extra_instruction is not None:
-            messages.append({"role": "user", "content": extra_instruction})
-        payload = self.completion_payload(messages)
-        began = monotonic()
-        raw = self._post(payload)
-        latency_seconds = monotonic() - began
-        output_text, token_count = _read_chat_completion(raw, self._label)
-        if parse_action:
-            rejection = None
-            try:
-                action, app_name, api_name = parse_model_output(output_text)
-            except ActionRejected as error:
-                action, app_name, api_name = None, None, None
-                rejection = str(error)
-        else:
-            action, app_name, api_name = None, None, None
-            rejection = None
-        state.history.append({"role": "assistant", "content": output_text})
-        return AgentTurn(
-            prompt_text=messages[-1]["content"],
-            output_text=output_text,
-            top_k_logprobs=(),
-            generated_token_count=token_count,
-            latency_seconds=latency_seconds,
-            started_at=started_at,
-            action=action,
-            app_name=app_name,
-            api_name=api_name,
-            rejection=rejection,
-        )
-
-    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
-        return self.generate_turn(
-            tool_output=tool_output,
-            extra_instruction=None,
-            parse_action=True,
-        )
-
-    def teacher_force_plan(
-        self,
-        *,
-        messages: list[dict[str, str]],
-        plan_text: str,
-    ) -> tuple[tuple[TokenLogprob, ...], ...]:
-        del messages, plan_text
-        raise UnsupportedCapability(
-            f"{self._label} does not expose prompt-token logprobs; "
-            "teacher-forced plan KL is unsupported"
-        )
-
-    def _post(self, payload: dict[str, object]) -> dict[str, object]:
-        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-
-        malformed = f"{self._label} response was malformed"
-        body = json.dumps(payload).encode("utf-8")
-        if self._api_key.encode("utf-8") in body:
-            raise RuntimeUnavailable(f"{self._label} request was malformed")
-        endpoint = self.endpoint()
-        headers = self._headers()
-        last_error: BaseException | None = None
-        for attempt in range(_OPENAI_COMPATIBLE_ATTEMPTS):
-            request = urllib.request.Request(
-                endpoint,
-                data=body,
-                headers=headers,
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=240) as response:
-                    raw = response.read()
-                break
-            except urllib.error.HTTPError as error:
-                last_error = error
-                if (
-                    error.code in _OPENAI_COMPATIBLE_RETRYABLE
-                    and attempt + 1 < _OPENAI_COMPATIBLE_ATTEMPTS
-                ):
-                    time.sleep(_retry_delay(attempt, error))
-                    continue
-                raise _openai_compatible_http_error(
-                    error,
-                    label=self._label,
-                    endpoint=endpoint,
-                    secret=self._api_key,
-                ) from error
-            except (urllib.error.URLError, TimeoutError, OSError) as error:
-                last_error = error
-                if attempt + 1 < _OPENAI_COMPATIBLE_ATTEMPTS:
-                    time.sleep(_retry_delay(attempt, None))
-                    continue
-                raise RuntimeUnavailable(
-                    _redact_secret(
-                        f"{self._label} request failed: {error}", self._api_key
-                    )
-                ) from error
-        else:
-            raise RuntimeUnavailable(
-                _redact_secret(str(last_error), self._api_key)
-            )
-        try:
-            if isinstance(raw, str):
-                decoded = json.loads(raw)
-            else:
-                decoded = json.loads(bytes(raw).decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError) as error:
-            raise RuntimeUnavailable(malformed) from error
-        if not isinstance(decoded, dict):
-            raise RuntimeUnavailable(malformed)
-        return decoded
+    def _read_response(
+        self, payload: Mapping[object, object]
+    ) -> tuple[str, int, object]:
+        text, count = _read_chat_completion(payload, self._label)
+        return text, count, None
