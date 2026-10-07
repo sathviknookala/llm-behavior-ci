@@ -1,13 +1,16 @@
 """Run the Spotify capability pilot: twenty execute episodes, one at a time.
 
 Requires --configuration, --task-set, --store, and --output. A vLLM
-configuration also requires --base-url. An Anthropic configuration does
-not use a local server and reads ``ANTHROPIC_API_KEY`` before task 0.
+configuration also requires --base-url. A hosted configuration refuses
+--base-url and reads its provider key before task 0: ``ANTHROPIC_API_KEY``
+for Anthropic, ``ZAI_API_KEY`` for Z.AI.
 The configuration must be the committed Spotify capability profile:
 execute horizon 20, execute token cap 192, and ``tool_access_profile``
 ``spotify_capability_v1``. vLLM runs also require temperature 0 and
-sampling seed 17. Anthropic runs leave those sampling controls unset and
-use task selection seed 17 as the experiment seed. ``git_commit`` must be
+sampling seed 17. Anthropic runs leave those sampling controls unset.
+OpenAI-compatible runs use their own hashed temperature, top-p, and
+``do_sample`` and send no seed. Hosted runs use task selection seed 17 as
+the experiment seed. ``git_commit`` must be
 HEAD and the tracked source and config tree must be clean.
 
 Prints one public JSON object after each episode. Writes one public
@@ -57,13 +60,17 @@ from llm_behavior_ci.config import (
     AgentConfiguration,
     AnthropicModelConfiguration,
     AnthropicSamplingSettings,
+    AnyModelConfiguration,
     ConfigError,
     EpisodeIdentity,
     ModelConfiguration,
+    OpenAICompatibleModelConfiguration,
+    OpenAICompatibleSamplingSettings,
     RunConfiguration,
     RunIdentity,
     SamplingSettings,
     TaskConfiguration,
+    hosted_provider,
     load_model_configuration,
     new_episode_identity,
     new_run_identity,
@@ -751,7 +758,7 @@ def _requirement_fraction(passed: int, total: int) -> int | float | None:
 
 
 def _require_pilot_configuration(
-    model: ModelConfiguration | AnthropicModelConfiguration,
+    model: AnyModelConfiguration,
     agent: AgentConfiguration,
 ) -> None:
     if agent.tool_access_profile != _PILOT_PROFILE:
@@ -778,6 +785,14 @@ def _require_pilot_configuration(
         if not isinstance(agent.sampling, AnthropicSamplingSettings):
             print(
                 "Anthropic capability pilot cannot claim vLLM sampling controls",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        return
+    if isinstance(model, OpenAICompatibleModelConfiguration):
+        if not isinstance(agent.sampling, OpenAICompatibleSamplingSettings):
+            print(
+                "OpenAI-compatible capability pilot requires OpenAI-compatible sampling",
                 file=sys.stderr,
             )
             raise SystemExit(2)
@@ -1087,32 +1102,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         model = load_model_configuration(configuration_payload["model"])
         agent = AgentConfiguration.from_dict(configuration_payload["agent"])
         _require_pilot_configuration(model, agent)
-        if isinstance(model, ModelConfiguration):
+        provider = hosted_provider(model)
+        if provider is None:
             if not isinstance(args.base_url, str) or args.base_url.strip() == "":
                 print("capability pilot requires --base-url", file=sys.stderr)
                 return 2
             endpoint_url: str | None = args.base_url
-        elif isinstance(model, AnthropicModelConfiguration):
+        else:
             if args.base_url not in (None, ""):
                 print(
-                    "Anthropic capability pilot does not use --base-url",
+                    "hosted model capability pilot does not use --base-url",
                     file=sys.stderr,
                 )
                 return 2
             endpoint_url = None
-        else:
-            print("capability pilot requires a supported model provider", file=sys.stderr)
-            return 2
         task_payload = _load_json(task_set_path)
         task, task_set = _load_task_set(task_payload)
         expected_tasks = _required_task_count(task)
         if task.task_count != expected_tasks or task_set.task_count != expected_tasks:
             print(f"capability pilot requires {expected_tasks} tasks", file=sys.stderr)
             return 2
-        if (
-            isinstance(model, AnthropicModelConfiguration)
-            and task.selection_seed != _PILOT_SEED
-        ):
+        if provider is not None and task.selection_seed != _PILOT_SEED:
             print("capability pilot requires task seed 17", file=sys.stderr)
             return 2
         adopted = _adopt_committed_setup_profile(task)

@@ -51,6 +51,16 @@ _ANTHROPIC_HASHED_FIELDS = frozenset(
         "model.effort",
     }
 )
+_OPENAI_COMPATIBLE_HASHED_FIELDS = frozenset(
+    {
+        "model.api_base",
+        "model.thinking_type",
+        "model.clear_thinking",
+        "model.reasoning_effort",
+        "agent.sampling.do_sample",
+    }
+)
+_HOSTED_HASHED_FIELDS = _ANTHROPIC_HASHED_FIELDS | _OPENAI_COMPATIBLE_HASHED_FIELDS
 
 _REPLACEMENTS = {
     "model.model.repository": "Qwen/Qwen3-1.7B",
@@ -455,11 +465,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(run_configuration_hash(configuration), digest)
         self.assertEqual(len(digest), 64)
         self.assertEqual(
-            _leaves(configuration.to_dict()) | _ANTHROPIC_HASHED_FIELDS,
+            _leaves(configuration.to_dict()) | _HOSTED_HASHED_FIELDS,
             set(HASHED_FIELDS),
         )
         self.assertTrue(
-            _ANTHROPIC_HASHED_FIELDS.isdisjoint(_leaves(configuration.to_dict()))
+            _HOSTED_HASHED_FIELDS.isdisjoint(_leaves(configuration.to_dict()))
         )
         for path in HASHED_FIELDS:
             self.assertIn(path, configuration_module.__doc__)
@@ -497,7 +507,7 @@ class ConfigurationTests(unittest.TestCase):
             canonical_configuration_json(configuration),
         )
         self.assertEqual(
-            set(HASHED_FIELDS) - set(_REPLACEMENTS) - _ANTHROPIC_HASHED_FIELDS,
+            set(HASHED_FIELDS) - set(_REPLACEMENTS) - _HOSTED_HASHED_FIELDS,
             {"agent.workflow.policy"},
         )
         payload = _payload()

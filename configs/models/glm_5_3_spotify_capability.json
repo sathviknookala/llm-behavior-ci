@@ -1,0 +1,37 @@
+{
+  "model": {
+    "provider": "zai",
+    "model_id": "glm-5.3",
+    "api_base": "https://api.z.ai/api/paas/v4",
+    "thinking_type": "enabled",
+    "clear_thinking": true,
+    "reasoning_effort": "low"
+  },
+  "agent": {
+    "smolagents_version": "1.22.0",
+    "action_interface": "code",
+    "prompt": {
+      "prompt_version": "prompt-runtime-auth-v2",
+      "plan_format_version": "plan-v1",
+      "thinking_enabled": false
+    },
+    "step_limit": 40,
+    "execute_max_model_turns": 20,
+    "tool_access_profile": "spotify_capability_v1",
+    "sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "do_sample": true,
+      "max_tokens": 1024,
+      "plan_max_tokens": 1024,
+      "execute_max_tokens": 192
+    },
+    "workflow": {
+      "policy": "plan_progress_v2",
+      "repeat_action_limit": 2,
+      "no_progress_turns": 3,
+      "completion_gate": true,
+      "max_plan_steps": 5
+    }
+  }
+}

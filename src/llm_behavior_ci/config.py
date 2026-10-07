@@ -44,6 +44,10 @@ model.model_id
 model.api_version
 model.thinking_mode
 model.effort
+model.api_base
+model.thinking_type
+model.clear_thinking
+model.reasoning_effort
 agent.smolagents_version
 agent.action_interface
 agent.prompt.prompt_version
@@ -57,6 +61,7 @@ agent.sampling.top_p
 agent.sampling.top_k
 agent.sampling.min_p
 agent.sampling.seed
+agent.sampling.do_sample
 agent.sampling.max_tokens
 agent.sampling.execute_max_tokens
 agent.sampling.plan_max_tokens
@@ -149,6 +154,18 @@ client ignores. A vLLM configuration still requires the controls and
 serializes them as before. ``recorded_execution_seed`` uses the vLLM
 sampling seed when it is set, and the run seed otherwise. The run seed
 orders the experiment; it does not make Claude generation deterministic.
+
+``model.api_base``, ``model.thinking_type``, ``model.clear_thinking``, and
+``model.reasoning_effort`` are the OpenAI-compatible hosted identity,
+together with the shared ``model.provider`` and ``model.model_id``. The
+API base is hashed because it names the service that runs the model.
+The only provider is ``zai``. ``agent.sampling.do_sample`` belongs to
+OpenAI-compatible sampling, which also sets ``agent.sampling.temperature``
+and ``agent.sampling.top_p`` when ``do_sample`` is true and omits them
+when it is false, because the provider then ignores them. It never sets
+top-k, min-p, or seed. vLLM and Anthropic configurations omit all of
+these leaves, so their canonical JSON is unchanged. An unknown provider
+is a ``ConfigError``.
 """
 
 from __future__ import annotations
@@ -157,6 +174,7 @@ import hashlib
 import json
 import math
 import re
+import urllib.parse
 import uuid
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Callable, Mapping, TypeVar, get_args, get_type_hints
@@ -175,6 +193,9 @@ ANTHROPIC_PROVIDERS = frozenset({"anthropic"})
 ANTHROPIC_THINKING_MODES = frozenset({"adaptive", "between_tools"})
 ANTHROPIC_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
 ANTHROPIC_BETWEEN_TOOLS_EFFORTS = frozenset({"low", "medium", "high"})
+OPENAI_COMPATIBLE_PROVIDERS = frozenset({"zai"})
+OPENAI_COMPATIBLE_THINKING_TYPES = frozenset({"enabled", "disabled"})
+OPENAI_COMPATIBLE_REASONING_EFFORTS = frozenset({"low", "medium", "high"})
 HASHED_FIELDS = frozenset(
     {
         "model.model.repository",
@@ -204,6 +225,10 @@ HASHED_FIELDS = frozenset(
         "model.api_version",
         "model.thinking_mode",
         "model.effort",
+        "model.api_base",
+        "model.thinking_type",
+        "model.clear_thinking",
+        "model.reasoning_effort",
         "agent.smolagents_version",
         "agent.action_interface",
         "agent.prompt.prompt_version",
@@ -217,6 +242,7 @@ HASHED_FIELDS = frozenset(
         "agent.sampling.top_k",
         "agent.sampling.min_p",
         "agent.sampling.seed",
+        "agent.sampling.do_sample",
         "agent.sampling.max_tokens",
         "agent.sampling.execute_max_tokens",
         "agent.sampling.plan_max_tokens",
@@ -404,6 +430,36 @@ def _top_k(value: object) -> int:
 def _anthropic_model_id(value: object) -> str:
     if not isinstance(value, str) or _ANTHROPIC_MODEL_ID.fullmatch(value) is None:
         raise ConfigError("model_id must be an Anthropic model id")
+    return value
+
+
+def _hosted_model_id(value: object) -> str:
+    if not isinstance(value, str) or _ANTHROPIC_MODEL_ID.fullmatch(value) is None:
+        raise ConfigError("model_id must be a lowercase hosted model id")
+    return value
+
+
+def _api_base(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or value == ""
+        or len(value) > _MAX_TEXT
+        or any(character.isspace() for character in value)
+        or value.endswith("/")
+    ):
+        raise ConfigError("api_base must be an https URL without a trailing slash")
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query != ""
+        or parsed.fragment != ""
+    ):
+        raise ConfigError(
+            "api_base must be an https URL with no credentials, query, or fragment"
+        )
     return value
 
 
@@ -764,21 +820,92 @@ class AnthropicModelConfiguration:
         return _construct(name, lambda: _load(cls, mapping))
 
 
+@dataclass(frozen=True)
+class OpenAICompatibleModelConfiguration:
+    """Behavioral identity of one hosted OpenAI-compatible chat model.
+
+    ``api_base`` is the service root; requests go to
+    ``{api_base}/chat/completions``. ``thinking_type`` and
+    ``clear_thinking`` are sent as the ``thinking`` object and
+    ``reasoning_effort`` as its own field. The API key is not a field.
+    """
+
+    provider: str
+    model_id: str
+    api_base: str
+    thinking_type: str
+    clear_thinking: bool
+    reasoning_effort: str
+
+    def __post_init__(self) -> None:
+        _choice(self.provider, OPENAI_COMPATIBLE_PROVIDERS, "provider")
+        _hosted_model_id(self.model_id)
+        _api_base(self.api_base)
+        _choice(self.thinking_type, OPENAI_COMPATIBLE_THINKING_TYPES, "thinking_type")
+        _flag(self.clear_thinking, "clear_thinking")
+        _choice(
+            self.reasoning_effort,
+            OPENAI_COMPATIBLE_REASONING_EFFORTS,
+            "reasoning_effort",
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return _plain_dict(self, OpenAICompatibleModelConfiguration)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "model configuration",
+    ) -> OpenAICompatibleModelConfiguration:
+        mapping = _object(payload, name)
+        _require_fields(mapping, cls, name)
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+HostedModelConfiguration = (
+    AnthropicModelConfiguration | OpenAICompatibleModelConfiguration
+)
+AnyModelConfiguration = ModelConfiguration | HostedModelConfiguration
+
+
 def load_model_configuration(
     payload: object,
     name: str = "model configuration",
-) -> ModelConfiguration | AnthropicModelConfiguration:
-    """Load a vLLM or Anthropic model configuration.
+) -> AnyModelConfiguration:
+    """Load a model configuration by explicit provider.
 
-    A document with no ``provider`` remains a vLLM ``ModelConfiguration``.
-    Existing vLLM JSON does not name a provider, and this loader does not
-    add one.
+    No ``provider`` is a vLLM ``ModelConfiguration``; existing vLLM JSON
+    does not name one and this loader does not add one. ``anthropic`` is
+    an ``AnthropicModelConfiguration`` and ``zai`` is an
+    ``OpenAICompatibleModelConfiguration``. Any other provider is a
+    ``ConfigError``.
     """
 
     mapping = _object(payload, name)
-    if "provider" in mapping:
+    if "provider" not in mapping:
+        return ModelConfiguration.from_dict(payload, name)
+    provider = mapping["provider"]
+    if isinstance(provider, str) and provider in ANTHROPIC_PROVIDERS:
         return AnthropicModelConfiguration.from_dict(payload, name)
-    return ModelConfiguration.from_dict(payload, name)
+    if isinstance(provider, str) and provider in OPENAI_COMPATIBLE_PROVIDERS:
+        return OpenAICompatibleModelConfiguration.from_dict(payload, name)
+    choices = ", ".join(sorted(ANTHROPIC_PROVIDERS | OPENAI_COMPATIBLE_PROVIDERS))
+    raise ConfigError(f"{name}: provider must be one of: {choices}")
+
+
+def hosted_provider(model: object) -> str | None:
+    """The hosted provider a model configuration calls, or None for local vLLM.
+
+    A local vLLM model needs an endpoint URL. A hosted model names its
+    service in configuration and must not be given one.
+    """
+
+    if isinstance(model, ModelConfiguration):
+        return None
+    if isinstance(model, (AnthropicModelConfiguration, OpenAICompatibleModelConfiguration)):
+        return model.provider
+    raise ConfigError("model must be a vLLM, Anthropic, or OpenAI-compatible configuration")
 
 
 @dataclass(frozen=True)
@@ -873,12 +1000,14 @@ _VLLM_SAMPLING_CONTROLS = frozenset(
 
 
 @dataclass(frozen=True)
-class AnthropicSamplingSettings:
+class HostedSamplingSettings:
     """Generation length for an API provider that rejects vLLM sampling.
 
     Temperature, top-p, top-k, min-p, and seed are absent rather than
     filled with values the client would ignore. ``max_tokens`` is the
-    generation cap unless the mode override is set.
+    generation cap unless the mode override is set. Anthropic
+    configurations use this class, also exported as
+    ``AnthropicSamplingSettings``.
     """
 
     max_tokens: int
@@ -900,7 +1029,7 @@ class AnthropicSamplingSettings:
         return self.max_tokens
 
     def to_dict(self) -> dict[str, object]:
-        document = _plain_dict(self, AnthropicSamplingSettings)
+        document = _plain_dict(self, HostedSamplingSettings)
         for key in ("execute_max_tokens", "plan_max_tokens"):
             if document[key] is None:
                 del document[key]
@@ -911,7 +1040,7 @@ class AnthropicSamplingSettings:
         cls,
         payload: object,
         name: str = "sampling",
-    ) -> AnthropicSamplingSettings:
+    ) -> HostedSamplingSettings:
         mapping = _object(payload, name)
         _require_fields(
             mapping,
@@ -922,18 +1051,102 @@ class AnthropicSamplingSettings:
         return _construct(name, lambda: _load(cls, mapping))
 
 
+AnthropicSamplingSettings = HostedSamplingSettings
+
+
+@dataclass(frozen=True)
+class OpenAICompatibleSamplingSettings:
+    """Request sampling an OpenAI-compatible hosted provider receives.
+
+    Every field is sent. ``do_sample`` true requires ``temperature`` and
+    ``top_p``; ``do_sample`` false requires both unset, because the
+    provider then decodes greedily and would ignore them. There is no
+    top-k, min-p, or seed field. ``max_tokens`` is the generation cap
+    unless the mode override is set.
+    """
+
+    do_sample: bool
+    max_tokens: int
+    temperature: float | None = None
+    top_p: float | None = None
+    execute_max_tokens: int | None = None
+    plan_max_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        _flag(self.do_sample, "do_sample")
+        if self.do_sample:
+            if self.temperature is None or self.top_p is None:
+                raise ConfigError("do_sample true requires temperature and top_p")
+            _temperature(self.temperature)
+            _open_unit(self.top_p, "top_p")
+        elif self.temperature is not None or self.top_p is not None:
+            raise ConfigError("do_sample false requires temperature and top_p unset")
+        _positive(self.max_tokens, "max_tokens")
+        if self.execute_max_tokens is not None:
+            _positive(self.execute_max_tokens, "execute_max_tokens")
+        if self.plan_max_tokens is not None:
+            _positive(self.plan_max_tokens, "plan_max_tokens")
+
+    def generation_max_tokens(self, mode: str) -> int:
+        if mode == "execute" and self.execute_max_tokens is not None:
+            return self.execute_max_tokens
+        if mode == "plan" and self.plan_max_tokens is not None:
+            return self.plan_max_tokens
+        return self.max_tokens
+
+    def to_dict(self) -> dict[str, object]:
+        document = _plain_dict(self, OpenAICompatibleSamplingSettings)
+        for key in ("temperature", "top_p", "execute_max_tokens", "plan_max_tokens"):
+            if document[key] is None:
+                del document[key]
+        return document
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: object,
+        name: str = "sampling",
+    ) -> OpenAICompatibleSamplingSettings:
+        mapping = _object(payload, name)
+        _require_fields(
+            mapping,
+            cls,
+            name,
+            optional=frozenset(
+                {"temperature", "top_p", "execute_max_tokens", "plan_max_tokens"}
+            ),
+        )
+        return _construct(name, lambda: _load(cls, mapping))
+
+
+AnySamplingSettings = (
+    SamplingSettings | HostedSamplingSettings | OpenAICompatibleSamplingSettings
+)
+
+
 def load_sampling_settings(
     payload: object,
     name: str = "sampling",
-) -> SamplingSettings | AnthropicSamplingSettings:
-    """Load vLLM sampling controls, or length caps when those controls are unset."""
+) -> AnySamplingSettings:
+    """Load sampling settings by schema.
+
+    ``do_sample`` present is OpenAI-compatible sampling. Otherwise all five
+    vLLM controls are vLLM sampling and none of them is hosted length-only
+    sampling. A partial or mixed schema is a ``ConfigError``.
+    """
 
     mapping = _object(payload, name)
     present = _VLLM_SAMPLING_CONTROLS & set(mapping)
+    if "do_sample" in mapping:
+        if present - {"temperature", "top_p"}:
+            raise ConfigError(
+                f"{name} with do_sample must not set top_k, min_p, or seed"
+            )
+        return OpenAICompatibleSamplingSettings.from_dict(payload, name)
     if present == _VLLM_SAMPLING_CONTROLS:
         return SamplingSettings.from_dict(payload, name)
     if not present:
-        return AnthropicSamplingSettings.from_dict(payload, name)
+        return HostedSamplingSettings.from_dict(payload, name)
     raise ConfigError(
         f"{name} must set temperature, top_p, top_k, min_p, and seed together "
         "or omit them"
@@ -946,12 +1159,18 @@ def _validate_model_sampling(model: object, sampling: object) -> None:
             raise ConfigError("vLLM configurations require vLLM sampling controls")
         return
     if isinstance(model, AnthropicModelConfiguration):
-        if not isinstance(sampling, AnthropicSamplingSettings):
+        if not isinstance(sampling, HostedSamplingSettings):
             raise ConfigError(
                 "Anthropic configurations must leave unsupported sampling controls unset"
             )
         return
-    raise ConfigError("model must be a vLLM or Anthropic configuration")
+    if isinstance(model, OpenAICompatibleModelConfiguration):
+        if not isinstance(sampling, OpenAICompatibleSamplingSettings):
+            raise ConfigError(
+                "OpenAI-compatible configurations require OpenAI-compatible sampling"
+            )
+        return
+    raise ConfigError("model must be a vLLM, Anthropic, or OpenAI-compatible configuration")
 
 
 @dataclass(frozen=True)
@@ -1012,7 +1231,7 @@ class AgentConfiguration:
     action_interface: str
     prompt: PromptSettings
     step_limit: int
-    sampling: SamplingSettings | AnthropicSamplingSettings
+    sampling: AnySamplingSettings
     api_docs_version: str | None = None
     api_docs_app: str | None = None
     tool_access_profile: str | None = None
@@ -1024,8 +1243,11 @@ class AgentConfiguration:
         _choice(self.action_interface, ACTION_INTERFACES, "action_interface")
         _kind(self.prompt, PromptSettings, "prompt")
         _positive(self.step_limit, "step_limit")
-        if not isinstance(self.sampling, (SamplingSettings, AnthropicSamplingSettings)):
-            raise ConfigError("sampling must be vLLM or Anthropic sampling settings")
+        if not isinstance(
+            self.sampling,
+            (SamplingSettings, HostedSamplingSettings, OpenAICompatibleSamplingSettings),
+        ):
+            raise ConfigError("sampling must be vLLM, hosted, or OpenAI-compatible settings")
         if (self.api_docs_version is None) != (self.api_docs_app is None):
             raise ConfigError(
                 "api_docs_version and api_docs_app must be set together"
@@ -1162,7 +1384,7 @@ class TaskConfiguration:
 
 @dataclass(frozen=True)
 class RunConfiguration:
-    model: ModelConfiguration | AnthropicModelConfiguration
+    model: AnyModelConfiguration
     agent: AgentConfiguration
     task: TaskConfiguration
     run_seed: int
@@ -1226,10 +1448,10 @@ def recorded_execution_seed(configuration: RunConfiguration) -> int:
     """The integer an episode records as its execution seed.
 
     A vLLM sampling seed is sent to the server and is the execution seed.
-    An Anthropic configuration does not send a generation seed. The
-    recorded value is then ``run_seed``, which orders the experiment and
-    the task stream. It is not a claim that Claude generation is
-    deterministic.
+    Anthropic and OpenAI-compatible configurations do not send a
+    generation seed. The recorded value is then ``run_seed``, which
+    orders the experiment and the task stream. It is not a claim that
+    hosted generation is deterministic.
     """
 
     if not isinstance(configuration, RunConfiguration):

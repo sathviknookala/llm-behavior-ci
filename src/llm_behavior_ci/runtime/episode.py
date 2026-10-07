@@ -101,8 +101,8 @@ def is_live_runtime(runtime: RuntimeDependencies) -> bool:
     around several agents (a switching agent used to run reference and
     candidate through one gate call) exposes them through
     ``underlying_agents()``; every one of them must be a real
-    ``SmolagentsVLLMAgent`` or ``SmolagentsAnthropicAgent`` for the runtime
-    to count as live.
+    ``SmolagentsVLLMAgent``, ``SmolagentsAnthropicAgent``, or
+    ``SmolagentsOpenAICompatibleAgent`` for the runtime to count as live.
     ``build_runtime`` binds ``tool_access_profile`` and
     ``appworld_setup_profile`` with ``functools.partial``; that partial is
     live when it wraps ``LiveAppWorldSession`` and names no other argument.
@@ -110,6 +110,7 @@ def is_live_runtime(runtime: RuntimeDependencies) -> bool:
 
     from llm_behavior_ci.runtime.agent import (
         SmolagentsAnthropicAgent,
+        SmolagentsOpenAICompatibleAgent,
         SmolagentsVLLMAgent,
     )
 
@@ -117,7 +118,11 @@ def is_live_runtime(runtime: RuntimeDependencies) -> bool:
         return False
     underlying = getattr(runtime.agent, "underlying_agents", None)
     agents = underlying() if callable(underlying) else (runtime.agent,)
-    live_agents = (SmolagentsVLLMAgent, SmolagentsAnthropicAgent)
+    live_agents = (
+        SmolagentsVLLMAgent,
+        SmolagentsAnthropicAgent,
+        SmolagentsOpenAICompatibleAgent,
+    )
     return len(agents) > 0 and all(
         isinstance(agent, live_agents) for agent in agents
     )
@@ -864,7 +869,10 @@ def build_runtime(
     A vLLM configuration requires ``endpoint_url``. An Anthropic
     configuration does not use a local server; it reads
     ``ANTHROPIC_API_KEY`` and fails before any episode when the key is
-    missing. The key is held only for the request header.
+    missing. An OpenAI-compatible configuration likewise refuses
+    ``endpoint_url``, because ``model.api_base`` names the service, and
+    reads its provider's key variable (``ZAI_API_KEY`` for ``zai``). The
+    key is held only for the request header.
 
     Imports the live AppWorld session adapter only when called. Does not
     import vLLM or smolagents; vLLM stays a served HTTP endpoint, never an
@@ -890,9 +898,14 @@ def build_runtime(
     if mode not in {"plan", "execute"}:
         raise EpisodeRejected("mode must be plan or execute")
     validate_chat_request(configuration)
-    from llm_behavior_ci.config import AnthropicModelConfiguration
+    from llm_behavior_ci.config import (
+        AnthropicModelConfiguration,
+        OpenAICompatibleModelConfiguration,
+    )
     from llm_behavior_ci.runtime.agent import (
+        OPENAI_COMPATIBLE_KEY_VARIABLES,
         SmolagentsAnthropicAgent,
+        SmolagentsOpenAICompatibleAgent,
         SmolagentsVLLMAgent,
     )
     from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
@@ -920,6 +933,24 @@ def build_runtime(
         if api_key == "":
             raise EpisodeRejected("ANTHROPIC_API_KEY is required")
         base_agent = SmolagentsAnthropicAgent(api_key)
+    elif isinstance(configuration.model, OpenAICompatibleModelConfiguration):
+        if endpoint_url not in (None, ""):
+            raise EpisodeRejected(
+                "OpenAI-compatible runtime does not use a local model endpoint"
+            )
+        if not configuration.model.clear_thinking:
+            raise EpisodeRejected(
+                "OpenAI-compatible runtime requires clear_thinking true"
+            )
+        variable = OPENAI_COMPATIBLE_KEY_VARIABLES.get(configuration.model.provider)
+        if variable is None:
+            raise EpisodeRejected("unsupported OpenAI-compatible provider")
+        api_key = os.environ.get(variable, "").strip()
+        if api_key == "":
+            raise EpisodeRejected(f"{variable} is required")
+        base_agent = SmolagentsOpenAICompatibleAgent(
+            configuration.model.provider, api_key
+        )
     else:
         if not isinstance(endpoint_url, str) or endpoint_url.strip() == "":
             raise EpisodeRejected("endpoint url is required")
