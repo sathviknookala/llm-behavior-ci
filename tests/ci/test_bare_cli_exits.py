@@ -135,6 +135,7 @@ class BareCliExitTests(unittest.TestCase):
         for script in (
             "scripts/evaluation/build_run_configuration.py",
             "scripts/evaluation/build_task_selection_allowance.py",
+            "scripts/evaluation/calibrate_hosted.py",
             "scripts/evaluation/collect_baseline.py",
             "scripts/evaluation/rehearse_dev_stream.py",
             "scripts/evaluation/simulate_power.py",

@@ -101,6 +101,10 @@ py scripts/evaluation/capture_aa.py \
 
 Hardware is `not_applicable` and `nvidia-smi` is never called; elapsed wall time is recorded. `--observe-hardware` is refused for a hosted configuration.
 
+### 3a. Resumable calibration
+
+`scripts/evaluation/calibrate_hosted.py` is the bounded path for steps 3 and 4. `--prepare` inventories stores and captures, fills empty slots only from the same configuration hash, and writes a checkpoint plus a public report. Episodes from another hash stay inventory. A same-hash execute pair fills one A/A slot. Its reference is a healthy production draw and can support a baseline success estimate; the report counts how many baseline slots those references would add and does not assign the episode to both. `--run` resumes the checkpoint and stops after `--max-model-episodes` model episodes. The repetition count in the examples below is a provisional execution budget, not a power-based sample target: that target needs repeated production draws on at least two scenarios, aligned do-nothing outcomes, and a caller-supplied harm margin and alpha. `test_normal` is refused.
+
 ### 4. Production and do-nothing baseline
 
 ```bash
