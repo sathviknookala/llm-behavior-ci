@@ -714,8 +714,30 @@ class ServiceLifecycleTests(unittest.TestCase):
         )
 
     def test_promotion_changes_routing_and_resets_monitoring(self) -> None:
+        from llm_behavior_ci.config import DistributionalMonitorSettings
+        from llm_behavior_ci.lifecycle.monitoring import (
+            DistributionalMonitor,
+            monitoring_period_id,
+        )
+
+        tool_monitor = DistributionalMonitor(
+            DistributionalMonitorSettings(
+                signal="tool_selection",
+                reference_counts=(("calendar.lookup", 9), ("mail.send", 1)),
+                window_episodes=50,
+                alpha=0.01,
+                correction="none",
+            ),
+            reference_configuration_hash=run_configuration_hash(self.production),
+            clock=self.clock,
+            dedup_seconds=0.0,
+            period_id="period-0",
+        )
         client, app = self._client(
-            self._dependencies(horizon_episodes=1, harm_margin=0.1)
+            replace(
+                self._dependencies(horizon_episodes=1, harm_margin=0.1),
+                tool_selection_monitor=tool_monitor,
+            )
         )
         state = app.state.service
         before_period = state.monitor_period_id
@@ -743,9 +765,14 @@ class ServiceLifecycleTests(unittest.TestCase):
         )
         self.assertNotEqual(state.monitor_period_id, before_period)
         self.assertEqual(
+            state.monitor_period_id,
+            monitoring_period_id(run_configuration_hash(self.candidate), previous_hash),
+        )
+        self.assertEqual(
             state.dependencies.monitor.period_id,
             state.monitor_period_id,
         )
+        self.assertEqual(tool_monitor.period_id, state.monitor_period_id)
         self.assertEqual(
             state.dependencies.monitor.reference.configuration_hash,
             previous_hash,

@@ -800,10 +800,16 @@ class AACaptureTests(unittest.TestCase):
     ):
         lock = threading.Lock()
         calls = {"n": 0}
+        built = {"n": 0}
 
         def factory(mode: str) -> RuntimeDependencies:
             clock = Clock()
-            agent = PairAgent(clock, mode=mode, diverge=diverge)
+            with lock:
+                candidate_side = built["n"] % 2 == 1
+                built["n"] += 1
+            agent = PairAgent(
+                clock, mode=mode, diverge=diverge, force_candidate=candidate_side
+            )
 
             def session_factory(task_id: str) -> World:
                 if slow_task is not None and task_id == slow_task:
@@ -1372,11 +1378,19 @@ class AACaptureTests(unittest.TestCase):
                     ),
                 )
 
+        built: list[str] = []
+
         def factory(mode: str) -> RuntimeDependencies:
             clock = Clock()
+            built.append(mode)
             return RuntimeDependencies(
                 session_factory=lambda task_id: World(task_id, f"state:{task_id}"),
-                agent=TeacherForceAgent(clock, mode=mode, diverge=True),
+                agent=TeacherForceAgent(
+                    clock,
+                    mode=mode,
+                    diverge=True,
+                    force_candidate=len(built) % 2 == 0,
+                ),
                 clock=clock,
             )
 
@@ -1429,6 +1443,7 @@ class AACaptureTests(unittest.TestCase):
         task_set = _task_set()
         arrivals = tuple(generate_stream(task_set, _stream_settings(task_set)))[:1]
         config = _stream_config(task_set)
+        forced: list[bool] = []
 
         class MismatchedSupportAgent(PairAgent):
             def messages(self, tool_output: str | None = None) -> list[dict[str, str]]:
@@ -1442,8 +1457,8 @@ class AACaptureTests(unittest.TestCase):
                 plan_text: str,
             ) -> tuple[tuple[TokenLogprob, ...], ...]:
                 del messages, plan_text
-                if not hasattr(self, "_forced"):
-                    self._forced = True
+                if not forced:
+                    forced.append(True)
                     return (
                         (
                             TokenLogprob(token_id=1, logprob=-0.1, rank=0),

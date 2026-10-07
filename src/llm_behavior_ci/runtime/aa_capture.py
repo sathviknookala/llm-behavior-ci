@@ -15,17 +15,25 @@ the counts meet that function's contract. The p-value is not a decision.
 
 ``test_normal`` is rejected here. Hardware fields stay empty unless a
 snapshot is taken. A caller-supplied probe is not GPU evidence;
-``nvidia-smi`` is. Synthetic captures leave memory and wall time unset.
+``nvidia-smi`` is. Synthetic captures leave memory unset. Elapsed wall
+time is recorded for every capture, independently of GPU telemetry.
 With no expected-process allowance, any compute process refuses a timed
 start. An explicit caller allowance names the baseline server by pid
 and/or exact process name; unexpected concurrent GPU work still refuses.
+A hosted configuration has no local GPU: ``nvidia-smi`` is never run,
+hardware is ``not_applicable``, and teacher-forced KL is recorded as
+``teacher_force_unavailable`` without opening a world.
 
+Each pair builds a reference runtime and a separate candidate runtime from
+the factory, so the two A sides never share an agent or its history.
 Concurrency 1 runs every pair in this process. Concurrency above 1 runs
 each pair in a spawned child process: AppWorld worlds and their SQLite
-state cannot cross threads. A child builds its own agent, runtime, and
+state cannot cross threads. A child builds its own agents, runtime, and
 worlds from an ``AAProcessJob`` and returns the finished ``AAPairRecord``,
-because ``run_pair`` keeps ``PairExecution`` in process-local memory. Every
-child talks to the same vLLM endpoint; no model is loaded per worker.
+because ``run_pair`` keeps ``PairExecution`` in process-local memory. A
+job carries configuration and endpoint data only; the child reads its own
+provider key. Every vLLM child talks to the same endpoint; no model is
+loaded per worker.
 """
 
 from __future__ import annotations
@@ -39,7 +47,7 @@ from statistics import fmean
 from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime
 from multiprocessing import get_context
 from pathlib import Path
@@ -50,7 +58,13 @@ from llm_behavior_ci.config import (
     RunConfiguration,
     RunIdentity,
     StreamSettings,
+    hosted_provider,
     new_run_identity,
+)
+from llm_behavior_ci.runtime.factory import (
+    ConfiguredRuntimeFactory,
+    LiveRuntimeFactory,
+    RuntimeFactoryError,
 )
 from llm_behavior_ci.records import EpisodeResult, PairedResult, TokenLogprob
 from llm_behavior_ci.runtime.episode import (
@@ -159,6 +173,8 @@ class ExecutionCost:
     initial: GpuSnapshot | None = None
     final: GpuSnapshot | None = None
     allowed_processes: tuple[GpuProcess, ...] = ()
+    elapsed_wall_seconds: float | None = None
+    hardware_applicability: str = "local_gpu"
 
 
 @dataclass(frozen=True)
@@ -464,20 +480,26 @@ def teacher_forced_plan_kl(
     task_id: str,
     configuration: RunConfiguration,
     frozen_plan_text: str,
+    candidate_runtime: RuntimeDependencies | None = None,
 ) -> TeacherForcedPlanKL:
     """Teacher-force one frozen plan under both identical A sides.
 
     Reuses the offline-gate pattern: same messages, same plan text, score
     with ``score_top_k`` only when both sides expose the same token ids in
-    the same order. A support mismatch keeps both tables and records
-    ``support_mismatch``. Missing teacher-force records
-    ``teacher_force_unavailable`` rather than falling back to independently
-    generated plans.
+    the same order. The candidate side uses ``candidate_runtime`` when it
+    is supplied. A support mismatch keeps both tables and records
+    ``support_mismatch``. Missing teacher-force, including every hosted
+    configuration, records ``teacher_force_unavailable`` rather than
+    falling back to independently generated plans.
     """
 
     unavailable = TeacherForcedPlanKL(status="teacher_force_unavailable")
+    if hosted_provider(configuration.model) is not None:
+        return unavailable
+    candidate = candidate_runtime if candidate_runtime is not None else runtime
     teacher_force = getattr(runtime.agent, "teacher_force_plan", None)
-    if not callable(teacher_force):
+    candidate_force = getattr(candidate.agent, "teacher_force_plan", None)
+    if not callable(teacher_force) or not callable(candidate_force):
         return unavailable
     session = runtime.session_factory(task_id)
     try:
@@ -495,9 +517,9 @@ def teacher_forced_plan_kl(
             if "unsupported" in str(error).lower():
                 return unavailable
             raise
-        runtime.agent.begin(context, configuration)
+        candidate.agent.begin(context, configuration)
         try:
-            candidate_positions = teacher_force(
+            candidate_positions = candidate_force(
                 messages=messages,
                 plan_text=frozen_plan_text,
             )
@@ -590,6 +612,7 @@ def _run_job(
     configuration: RunConfiguration,
     reference_run: RunIdentity,
     candidate_run: RunIdentity,
+    candidate_runtime: RuntimeDependencies | None = None,
 ) -> AAPairRecord:
     pair = run_pair(
         item.task_id,
@@ -600,6 +623,7 @@ def _run_job(
         runtime=runtime,
         mode=mode,
         scenario_id=item.scenario_id,
+        candidate_runtime=candidate_runtime,
     )
     forced_kl: TeacherForcedPlanKL | None = None
     if mode == "plan":
@@ -612,30 +636,9 @@ def _run_job(
                 task_id=item.task_id,
                 configuration=configuration,
                 frozen_plan_text=frozen,
+                candidate_runtime=candidate_runtime,
             )
     return _record(item, mode, pair, forced_kl=forced_kl)
-
-
-def build_live_runtime(base_url: str, mode: str) -> RuntimeDependencies:
-    """Build a runtime that opens one AppWorld world and talks to vLLM.
-
-    Import of the live adapters happens here. AppWorld itself is imported
-    only when a world opens. The clock is ``wall_now`` because opening a
-    world freezes ``datetime.now`` to the task date, and episode bounds have
-    to stay on the same real clock as model steps.
-    """
-
-    from llm_behavior_ci.runtime.agent import SmolagentsVLLMAgent
-    from llm_behavior_ci.runtime.appworld import LiveAppWorldSession
-    from llm_behavior_ci.runtime.clock import wall_now
-
-    agent = SmolagentsVLLMAgent(base_url)
-    agent.set_mode(mode)
-    return RuntimeDependencies(
-        session_factory=LiveAppWorldSession,
-        agent=agent,
-        clock=wall_now,
-    )
 
 
 @dataclass(frozen=True)
@@ -644,19 +647,27 @@ class ProcessRuntimeFactory:
 
     ``builder(vllm_base_url, mode)`` must be importable by name in a spawned
     child, so it is a module-level function, never a closure. Called with a
-    mode, the factory builds a runtime in the current process.
+    mode, the factory builds a runtime in the current process. Live captures
+    use ``ConfiguredRuntimeFactory`` from ``runtime.factory`` instead.
     """
 
     vllm_base_url: str
-    builder: Callable[[str, str], RuntimeDependencies] = build_live_runtime
+    builder: Callable[[str, str], RuntimeDependencies]
 
     def __call__(self, mode: str) -> RuntimeDependencies:
         return self.builder(self.vllm_base_url, mode)
 
 
+_PICKLABLE_FACTORIES = (ProcessRuntimeFactory, ConfiguredRuntimeFactory)
+
+
 @dataclass(frozen=True)
 class AAProcessJob:
-    """One pair to run in a child process. Every field pickles by value or name."""
+    """One pair to run in a child process. Every field pickles by value or name.
+
+    The factories carry configuration and endpoint data only; a hosted key
+    is read from the child's environment when its runtime is built.
+    """
 
     index: int
     item: ScheduledInput
@@ -664,8 +675,8 @@ class AAProcessJob:
     configuration: RunConfiguration
     reference_run: RunIdentity
     candidate_run: RunIdentity
-    vllm_base_url: str
-    runtime_builder: Callable[[str, str], RuntimeDependencies] = build_live_runtime
+    runtime_factory: Callable[[str], RuntimeDependencies]
+    candidate_runtime_factory: Callable[[str], RuntimeDependencies]
 
 
 def _job_context(job: AAProcessJob) -> str:
@@ -685,7 +696,8 @@ def run_process_job(job: AAProcessJob) -> tuple[int, AAPairRecord]:
     """
 
     try:
-        runtime = job.runtime_builder(job.vllm_base_url, job.mode)
+        runtime = job.runtime_factory(job.mode)
+        candidate_runtime = job.candidate_runtime_factory(job.mode)
         record = _run_job(
             runtime,
             job.item,
@@ -693,6 +705,7 @@ def run_process_job(job: AAProcessJob) -> tuple[int, AAPairRecord]:
             job.configuration,
             job.reference_run,
             job.candidate_run,
+            candidate_runtime,
         )
     except Exception as error:
         raise AAJobFailed(
@@ -957,19 +970,25 @@ def capture_aa(
     observe_hardware: bool,
     gpu_probe: Callable[[], GpuSnapshot] | None = None,
     allowed_gpu_processes: Sequence[AllowedGpuProcess] = (),
+    candidate_runtime_factory: Callable[[str], RuntimeDependencies] | None = None,
 ) -> AACaptureResult:
     """Pair one configuration with itself on a supplied stream.
 
-    ``runtime_factory`` receives the mode and must return a fresh runtime
-    for that pair. Concurrency above 1 requires a ``ProcessRuntimeFactory``:
-    each pair runs in a spawned child that calls its builder there, and
-    records come back in schedule order. Reference and candidate runs are distinct identities of
-    this same configuration. ``observe_hardware`` false leaves cost numbers
-    unset and does not shell out to ``nvidia-smi``. When it is true, every
-    compute process must be covered by ``allowed_gpu_processes`` before any
-    episode starts and again after the capture. The allowed process
-    identities must be the same set at both snapshots. Either failure
-    raises ``GpuBusy`` and does not return a capture.
+    ``runtime_factory`` receives the mode and must return a fresh runtime;
+    it is called once for the reference side and, unless
+    ``candidate_runtime_factory`` is given, once more for the candidate
+    side of every pair, so the two sides never share an agent. Concurrency
+    above 1 requires picklable factories (``ProcessRuntimeFactory`` or
+    ``ConfiguredRuntimeFactory``): each pair runs in a spawned child that
+    builds its runtimes there, and records come back in schedule order.
+    Reference and candidate runs are distinct identities of this same
+    configuration. ``observe_hardware`` false leaves memory unset and does
+    not shell out to ``nvidia-smi``; a hosted configuration refuses it.
+    When it is true, every compute process must be covered by
+    ``allowed_gpu_processes`` before any episode starts and again after
+    the capture. The allowed process identities must be the same set at
+    both snapshots. Either failure raises ``GpuBusy`` and does not return a
+    capture.
     """
 
     if not isinstance(configuration, RunConfiguration):
@@ -978,6 +997,16 @@ def capture_aa(
         raise EpisodeRejected("test_normal capture is closed")
     if configuration.task.task_set_hash != task_set_hash:
         raise EpisodeRejected("stream task set does not match the configuration")
+    hosted = hosted_provider(configuration.model) is not None
+    if hosted and observe_hardware:
+        raise EpisodeRejected(
+            "a hosted configuration has no local GPU; hardware is not applicable"
+        )
+    candidate_factory = (
+        candidate_runtime_factory
+        if candidate_runtime_factory is not None
+        else runtime_factory
+    )
     chosen = _modes(modes)
     worker_count = _positive(concurrency, "concurrency")
     schedule = repeated_schedule(arrivals, repetitions=repetitions)
@@ -993,9 +1022,13 @@ def capture_aa(
         matched_allowed = assert_gpu_processes_allowed(before, allowed)
     reference_run = new_run_identity(configuration)
     candidate_run = new_run_identity(configuration)
-    if worker_count > 1 and not isinstance(runtime_factory, ProcessRuntimeFactory):
+    if worker_count > 1 and not (
+        isinstance(runtime_factory, _PICKLABLE_FACTORIES)
+        and isinstance(candidate_factory, _PICKLABLE_FACTORIES)
+    ):
         raise EpisodeRejected(
-            "concurrency above 1 requires a ProcessRuntimeFactory"
+            "concurrency above 1 requires a ProcessRuntimeFactory "
+            "or ConfiguredRuntimeFactory"
         )
     pending = [(item, mode) for item in schedule for mode in chosen]
     started = time.perf_counter()
@@ -1008,6 +1041,7 @@ def capture_aa(
                 configuration,
                 reference_run,
                 candidate_run,
+                candidate_factory(mode),
             )
             for item, mode in pending
         ]
@@ -1021,8 +1055,8 @@ def capture_aa(
                     configuration=configuration,
                     reference_run=reference_run,
                     candidate_run=candidate_run,
-                    vllm_base_url=runtime_factory.vllm_base_url,
-                    runtime_builder=runtime_factory.builder,
+                    runtime_factory=runtime_factory,
+                    candidate_runtime_factory=candidate_factory,
                 )
                 for index, (item, mode) in enumerate(pending)
             ],
@@ -1030,19 +1064,27 @@ def capture_aa(
         )
     wall_seconds = time.perf_counter() - started
     if before is None:
-        cost = _unobserved()
+        cost = replace(
+            _unobserved(),
+            elapsed_wall_seconds=wall_seconds,
+            source="not_applicable" if hosted else "not_observed",
+            hardware_applicability="not_applicable" if hosted else "local_gpu",
+        )
     else:
         after, after_source = _snapshot(gpu_probe)
         if after_source != source:
             raise RuntimeUnavailable("GPU probe source changed during capture")
         final_matched = assert_gpu_processes_allowed(after, allowed)
         assert_baseline_identity_unchanged(matched_allowed, final_matched)
-        cost = _cost(
-            before,
-            after,
-            wall_seconds,
-            source,
-            allowed_processes=matched_allowed,
+        cost = replace(
+            _cost(
+                before,
+                after,
+                wall_seconds,
+                source,
+                allowed_processes=matched_allowed,
+            ),
+            elapsed_wall_seconds=wall_seconds,
         )
     records = tuple(records_list)
     if len(records) != len(pending):
@@ -1135,6 +1177,10 @@ def format_summary(result: AACaptureResult) -> str:
         else f"teacher_forced_kl_nats: {kl_floor}",
         f"hardware_observed: {str(result.cost.hardware_observed).lower()}",
         f"hardware_source: {result.cost.source}",
+        f"hardware_applicability: {result.cost.hardware_applicability}",
+        "elapsed_wall_seconds:"
+        if result.cost.elapsed_wall_seconds is None
+        else f"elapsed_wall_seconds: {result.cost.elapsed_wall_seconds}",
     ]
     if result.cost.hardware_observed:
         lines.append(f"memory_used_mib: {result.cost.memory_used_mib}")
@@ -1185,10 +1231,37 @@ def write_local_capture(
     )
 
 
-def live_runtime_factory(base_url: str) -> ProcessRuntimeFactory:
-    """The live runtime factory for one vLLM endpoint; see ``build_live_runtime``."""
+def live_runtime_factories(
+    configuration: RunConfiguration,
+    vllm_base_url: str | None,
+) -> tuple[ConfiguredRuntimeFactory, ConfiguredRuntimeFactory]:
+    """Reference and candidate live factories for one A/A configuration.
 
-    return ProcessRuntimeFactory(vllm_base_url=base_url)
+    Both go through ``build_runtime``, so the workflow controller, tool
+    access profile, setup profile, and the real clock match every other
+    live command. A vLLM configuration uses ``vllm_base_url`` for both A
+    sides; a hosted one refuses it. Missing endpoints or keys fail here,
+    before any world opens.
+    """
+
+    hosted = hosted_provider(configuration.model) is not None
+    url = None if vllm_base_url is None or vllm_base_url.strip() == "" else vllm_base_url
+    if hosted and url is not None:
+        raise RuntimeFactoryError(
+            "a hosted configuration must not be given --vllm-base-url"
+        )
+    factory = LiveRuntimeFactory.from_endpoints(
+        reference=None if hosted else url,
+        candidate=None if hosted else url,
+    )
+    factory.preflight(
+        {"reference": configuration, "candidate": configuration},
+        require_distinct_endpoints=False,
+    )
+    return (
+        ConfiguredRuntimeFactory(configuration, "reference", factory),
+        ConfiguredRuntimeFactory(configuration, "candidate", factory),
+    )
 
 
 def _load_json(path: Path) -> object:
@@ -1245,7 +1318,7 @@ def main(
     parser.add_argument("--concurrency", required=True, type=int)
     parser.add_argument("--modes", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--vllm-base-url", required=True)
+    parser.add_argument("--vllm-base-url", default=None)
     parser.add_argument("--observe-hardware", action="store_true")
     parser.add_argument(
         "--allow-gpu-pid",
@@ -1298,8 +1371,16 @@ def main(
             ]
         )
         arrivals = tuple(generate_stream(task_set, settings))
-        snapshot = read_nvidia_smi_snapshot()
-        assert_gpu_processes_allowed(snapshot, allowed)
+        reference_factory, candidate_factory = live_runtime_factories(
+            configuration, args.vllm_base_url
+        )
+        if hosted_provider(configuration.model) is None:
+            snapshot = read_nvidia_smi_snapshot()
+            assert_gpu_processes_allowed(snapshot, allowed)
+        elif allowed:
+            raise EpisodeRejected(
+                "GPU process allowances do not apply to a hosted configuration"
+            )
         result = capture_aa(
             configuration,
             arrivals,
@@ -1307,7 +1388,8 @@ def main(
             repetitions=args.repetitions,
             concurrency=args.concurrency,
             modes=modes,
-            runtime_factory=live_runtime_factory(args.vllm_base_url),
+            runtime_factory=reference_factory,
+            candidate_runtime_factory=candidate_factory,
             observe_hardware=args.observe_hardware,
             allowed_gpu_processes=allowed,
         )

@@ -12,6 +12,7 @@ from llm_behavior_ci.config import (
     KL_FIDELITY_MODES,
     RunConfiguration,
     RunIdentity,
+    hosted_provider,
     new_run_identity,
     run_configuration_hash,
 )
@@ -20,6 +21,7 @@ from llm_behavior_ci.lifecycle.plan_features import (
     PlanFeatureError,
     SEMANTIC_PLAN_FEATURES,
     STRUCTURAL_PLAN_FEATURES,
+    require_semantic_coverage,
     semantic_plan_features,
     structural_plan_features,
 )
@@ -69,6 +71,39 @@ _VALIDATION_PROVENANCE_VALUES = frozenset(
 
 class GateExecutionError(ValueError):
     """Raised when the gate cannot produce a PASS or BLOCK decision."""
+
+
+class GateCapabilityError(GateExecutionError):
+    """A required gate statistic cannot be computed for these configurations.
+
+    Raised during preflight, before any world opens or any provider is
+    called. It is an execution error, never a BLOCK.
+    """
+
+
+def require_gate_capabilities(
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    required_statistics: Sequence[str],
+) -> None:
+    """Refuse a required statistic that a configuration cannot supply.
+
+    Teacher-forced KL needs prompt-token logprobs and a tokenizer, which
+    only a self-hosted vLLM configuration has. A hosted gate must drop
+    ``kl`` from ``required_statistics``; no zero, independent-generation,
+    or empty KL is substituted.
+    """
+
+    if "kl" not in required_statistics:
+        return
+    for role, configuration in (("reference", reference), ("candidate", candidate)):
+        provider = hosted_provider(configuration.model)
+        if provider is not None:
+            raise GateCapabilityError(
+                f"teacher-forced plan KL is unsupported for the {role} "
+                f"configuration (hosted provider {provider} exposes no "
+                "prompt-token logprobs); remove kl from required_statistics"
+            )
 
 
 @dataclass(frozen=True)
@@ -321,6 +356,26 @@ def _cluster_label(task_id: str, scenario_id: str | None) -> str:
     return task_id
 
 
+_EMPTY_PLAN_MESSAGE = "empty plan"
+_INFRASTRUCTURE_TERMINATIONS = frozenset({"runtime_error", "timeout", "cancelled"})
+
+
+def _raise_on_runtime_failure(episode: EpisodeResult, role: str) -> None:
+    if episode.termination_reason not in _INFRASTRUCTURE_TERMINATIONS:
+        return
+    messages = [error.message for error in episode.episode_errors]
+    if episode.termination_reason == "runtime_error" and messages == [_EMPTY_PLAN_MESSAGE]:
+        return
+    kinds = sorted(
+        {call.error_kind for call in episode.provider_calls if call.error_kind}
+    )
+    detail = f" ({', '.join(kinds)})" if kinds else ""
+    raise GateExecutionError(
+        f"{role} plan episode ended in {episode.termination_reason}{detail}; "
+        "this is an execution failure, not a gate decision"
+    )
+
+
 def _plan_succeeded(episode: EpisodeResult) -> bool:
     return (
         episode.status == "completed"
@@ -447,6 +502,7 @@ def _teacher_force_pair(
     reference: RunConfiguration,
     candidate: RunConfiguration,
     frozen_plan_text: str,
+    candidate_runtime: RuntimeDependencies | None = None,
 ) -> (
     tuple[
         tuple[tuple[TokenLogprob, ...], ...],
@@ -455,8 +511,10 @@ def _teacher_force_pair(
     ]
     | str
 ):
+    candidate_side = candidate_runtime if candidate_runtime is not None else runtime
     teacher_force = getattr(runtime.agent, "teacher_force_plan", None)
-    if not callable(teacher_force):
+    candidate_force = getattr(candidate_side.agent, "teacher_force_plan", None)
+    if not callable(teacher_force) or not callable(candidate_force):
         return "teacher_force_unavailable"
     session = runtime.session_factory(task_id)
     try:
@@ -474,9 +532,9 @@ def _teacher_force_pair(
             if "unsupported" in message:
                 return "teacher_force_unavailable"
             raise GateExecutionError("teacher-force failed under reference") from error
-        runtime.agent.begin(context, candidate)
+        candidate_side.agent.begin(context, candidate)
         try:
-            candidate_positions = teacher_force(
+            candidate_positions = candidate_force(
                 messages=messages,
                 plan_text=frozen_plan_text,
             )
@@ -534,24 +592,51 @@ def run_offline_gate(
     settings: GateSettings,
     runtime: RuntimeDependencies,
     plan_evidence: PlanEvidenceInputs,
+    candidate_runtime: RuntimeDependencies | None = None,
 ) -> GateDecision:
     """Score a plan-only offline gate on a train task set.
 
     Runs ``run_pair`` in plan mode for every task, then applies the caller-
     required plan-quality, teacher-forced KL, and plan-level MMD checks.
     Thresholds come only from ``settings``. Metric definitions come only from
-    ``plan_evidence``. Execution problems raise ``GateExecutionError`` and are
-    not BLOCK decisions.
+    ``plan_evidence``. ``candidate_runtime``, when supplied, carries the
+    candidate's own agent for both the plan episode and teacher forcing;
+    worlds still come from ``runtime``. Preflight refuses, before any world
+    opens, a ``kl`` requirement on a hosted configuration and semantic
+    features whose task specs are missing or empty. Execution problems,
+    including a provider or runtime failure inside a plan episode, raise
+    ``GateExecutionError`` and are not BLOCK decisions. An empty plan is a
+    model behavior and still blocks as ``plan_run_failed``.
     """
 
     _require_train_inputs(reference, candidate, task_set, settings, plan_evidence)
     if not isinstance(runtime, RuntimeDependencies):
         raise GateExecutionError("run_offline_gate requires runtime dependencies")
+    if candidate_runtime is not None and not isinstance(
+        candidate_runtime, RuntimeDependencies
+    ):
+        raise GateExecutionError("candidate_runtime must be runtime dependencies")
+    require_gate_capabilities(reference, candidate, plan_evidence.required_statistics)
+    requested_features: list[str] = []
+    if "plan_quality" in plan_evidence.required_statistics:
+        requested_features.extend(plan_evidence.plan_quality_features)
+    if "mmd" in plan_evidence.required_statistics:
+        requested_features.extend(plan_evidence.mmd_features)
+    try:
+        require_semantic_coverage(
+            task_set.task_ids,
+            {spec.task_id: spec for spec in plan_evidence.task_plan_specs},
+            requested_features,
+        )
+    except PlanFeatureError as error:
+        raise GateExecutionError(str(error)) from error
 
     if plan_evidence.validation_provenance == VALIDATED_PROVENANCE:
-        if not is_live_runtime(runtime):
+        if not is_live_runtime(runtime) or (
+            candidate_runtime is not None and not is_live_runtime(candidate_runtime)
+        ):
             raise GateExecutionError(
-                "validated provenance requires a live AppWorld/vLLM runtime"
+                "validated provenance requires a live AppWorld runtime and live agents"
             )
         evidence_source = "gate_run"
     else:
@@ -585,9 +670,12 @@ def run_offline_gate(
                 runtime=runtime,
                 mode="plan",
                 scenario_id=scenario_id,
+                candidate_runtime=candidate_runtime,
             )
             if pair.reference.mode != "plan" or pair.candidate.mode != "plan":
                 raise GateExecutionError("paired episodes must be plan mode")
+            _raise_on_runtime_failure(pair.reference, "reference")
+            _raise_on_runtime_failure(pair.candidate, "candidate")
             if pair.reference.tool_steps or pair.candidate.tool_steps:
                 return _blocked_without_statistics(
                     reference=reference,
@@ -699,6 +787,7 @@ def run_offline_gate(
                     reference=reference,
                     candidate=candidate,
                     frozen_plan_text=reference_episode.plan_text,
+                    candidate_runtime=candidate_runtime,
                 )
                 if isinstance(forced, str):
                     kl_reason = forced

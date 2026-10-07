@@ -21,6 +21,10 @@ CheckResult, CaseAgreement, and AADependenceReport objects use the same
 field names; tuple fields are JSON arrays of values or pairs. The public
 summary shape is that tree plus \"visibility\": \"public\". Thresholds are
 not defaulted.
+
+The lock file stays local. ``--require LOCK --commitment PATH`` verifies
+the lock and writes its public commitment (digest, per-section digests,
+configuration and task-set hashes, fault versions, validation methods).
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from llm_behavior_ci.experiments.protocol import (
     ProtocolError,
     ProtocolSettings,
     lock_protocol,
+    protocol_commitment,
     require_protocol_lock,
 )
 from llm_behavior_ci.experiments.validation import (
@@ -300,6 +305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--settings")
     parser.add_argument("--output")
     parser.add_argument("--require")
+    parser.add_argument("--commitment")
     try:
         args = parser.parse_args(args_list)
     except SystemExit as error:
@@ -313,13 +319,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.settings is not None or args.output is not None:
                 return 2
             lock = require_protocol_lock(Path(args.require))
+            if args.commitment is not None:
+                commitment = Path(args.commitment)
+                if commitment.resolve() == Path(args.require).resolve():
+                    return 2
+                commitment.parent.mkdir(parents=True, exist_ok=True)
+                commitment.write_text(
+                    json.dumps(protocol_commitment(lock), sort_keys=True, indent=2) + "\n",
+                    encoding="utf-8",
+                )
             print(lock.digest)
             print(
                 "protocol lock is caller-supplied settings, not preregistration",
                 file=sys.stderr,
             )
             return 0
-        if args.settings is None or args.output is None:
+        if args.settings is None or args.output is None or args.commitment is not None:
             return 2
         settings = _settings_from_mapping(_load_json(Path(args.settings)))
         lock = lock_protocol(settings, Path(args.output))

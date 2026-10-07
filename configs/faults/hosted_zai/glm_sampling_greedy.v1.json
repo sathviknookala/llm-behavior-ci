@@ -1,0 +1,19 @@
+{
+  "fault_id": "glm_sampling_greedy",
+  "version": "1",
+  "kind": "sampling",
+  "patches": [
+    {
+      "path": "agent.sampling.do_sample",
+      "value": false
+    },
+    {
+      "path": "agent.sampling.temperature",
+      "value": null
+    },
+    {
+      "path": "agent.sampling.top_p",
+      "value": null
+    }
+  ]
+}

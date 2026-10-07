@@ -665,6 +665,55 @@ class ServeBuiltDependenciesFeedToolSelectionTests(unittest.TestCase):
             slice_attribution=False,
         ), store_path
 
+    def test_serve_hosted_production_needs_key_not_url(self) -> None:
+        import json
+        import os
+        from unittest.mock import patch
+
+        from llm_behavior_ci.config import ConfigError, TaskConfiguration
+        from llm_behavior_ci.experiments.run_config import build_run_configuration
+
+        root = Path(__file__).resolve().parents[2]
+        template = json.loads(
+            (root / "configs/models/glm_5_3_general_experimental.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        hosted = build_run_configuration(
+            template,
+            TaskConfiguration.from_dict(_payload()["task"]),
+            run_seed=7,
+            git_commit="a" * 40,
+        )
+        args, _store_path = self._args()
+        digest = run_configuration_hash(hosted)
+        args.production_config = str(self._write("hosted.json", hosted.to_dict()))
+        monitor = json.loads(Path(args.monitor_settings).read_text(encoding="utf-8"))
+        monitor["reference_configuration_hash"] = digest
+        args.monitor_settings = str(self._write("hosted_monitor.json", monitor))
+        args.frozen_reference = str(
+            self._write(
+                "hosted_frozen.json",
+                {"configuration_hash": digest, "baselines": [["task_success", 0.9]]},
+            )
+        )
+        args.production_base_url = None
+        args.candidate_base_url = None
+        secret = "zai-test-secret-value-0123456789"
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ConfigError) as caught:
+                self.serve._build_dependencies(args)
+        self.assertIn("ZAI_API_KEY", str(caught.exception))
+        with patch.dict(os.environ, {"ZAI_API_KEY": secret}, clear=True):
+            args.production_base_url = "http://production.invalid"
+            with self.assertRaises(ConfigError) as given_url:
+                self.serve._build_dependencies(args)
+            self.assertNotIn(secret, str(given_url.exception))
+            args.production_base_url = None
+            dependencies = self.serve._build_dependencies(args)
+        dependencies.store.close()
+        self.assertEqual(dependencies.runtime_factory.routes, ((digest, None),))
+
     def test_serve_built_service_feeds_tool_selection_observation(self) -> None:
         from dataclasses import replace as dc_replace
 

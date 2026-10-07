@@ -17,7 +17,7 @@ from llm_behavior_ci.config import (
     OpenAICompatibleSamplingSettings,
     RunConfiguration,
 )
-from llm_behavior_ci.records import TokenLogprob
+from llm_behavior_ci.records import ProviderCall, TokenLogprob
 from llm_behavior_ci.runtime.actions import ActionRejected, parse_model_output
 from llm_behavior_ci.runtime.clock import monotonic, wall_now
 from llm_behavior_ci.runtime.api_docs import (
@@ -26,7 +26,7 @@ from llm_behavior_ci.runtime.api_docs import (
 )
 from llm_behavior_ci.runtime.appworld import TaskContext, render_api_documentation
 from llm_behavior_ci.runtime.prompts import (
-    PROMPT_RUNTIME_AUTH_V2,
+    INTERFACE_V2_PROMPTS,
     UnknownPromptVersion,
     render_system_text,
 )
@@ -560,7 +560,7 @@ class SmolagentsVLLMAgent(_SmolModel):
         text = state.context.api_documentation
         source = getattr(state.context, "api_documentation_source", None)
         if (
-            agent.prompt.prompt_version == PROMPT_RUNTIME_AUTH_V2
+            agent.prompt.prompt_version in INTERFACE_V2_PROMPTS
             and source is not None
         ):
             text = render_api_documentation(source, include_constraints=True)
@@ -1106,6 +1106,62 @@ def _read_chat_completion(
     return content, count
 
 
+def _usage_count(source: object, *path: str) -> int | None:
+    value: object = source
+    for key in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def anthropic_usage(payload: object) -> dict[str, int | None]:
+    """Sanitized Anthropic usage counts. Unreported counts stay ``None``."""
+
+    usage = payload.get("usage") if isinstance(payload, Mapping) else None
+    return {
+        "input_tokens": _usage_count(usage, "input_tokens"),
+        "output_tokens": _usage_count(usage, "output_tokens"),
+        "cache_read_tokens": _usage_count(usage, "cache_read_input_tokens"),
+        "cache_write_tokens": _usage_count(usage, "cache_creation_input_tokens"),
+        "reasoning_tokens": None,
+    }
+
+
+def chat_completion_usage(payload: object) -> dict[str, int | None]:
+    """Sanitized Chat Completions usage counts. Unreported counts stay ``None``."""
+
+    usage = payload.get("usage") if isinstance(payload, Mapping) else None
+    return {
+        "input_tokens": _usage_count(usage, "prompt_tokens"),
+        "output_tokens": _usage_count(usage, "completion_tokens"),
+        "cache_read_tokens": _usage_count(
+            usage, "prompt_tokens_details", "cached_tokens"
+        ),
+        "cache_write_tokens": None,
+        "reasoning_tokens": _usage_count(
+            usage, "completion_tokens_details", "reasoning_tokens"
+        ),
+    }
+
+
+_UNKNOWN_USAGE: dict[str, int | None] = {
+    "input_tokens": None,
+    "output_tokens": None,
+    "cache_read_tokens": None,
+    "cache_write_tokens": None,
+    "reasoning_tokens": None,
+}
+
+
+@dataclass
+class _RequestTrace:
+    attempts: int = 0
+    error_kind: str | None = None
+
+
 class _HostedChatAgent:
     """The provider-independent half of a hosted-API ``AgentLoop``.
 
@@ -1117,8 +1173,13 @@ class _HostedChatAgent:
     visible text, a token count, and an optional replay record kept in
     process memory. The API key is an HTTP header and is omitted from
     ``repr``, configuration JSON, request bodies, and exception text.
-    Plan mode and teacher-forced plan KL are unsupported because hosted
-    APIs do not expose prompt-token logprobs.
+    Plan mode sends the plan prompt with the task and API documentation
+    under ``plan_max_tokens`` and returns the visible text as the plan; no
+    action is parsed from it and no logprob table is attached.
+    Teacher-forced plan KL is unsupported because hosted APIs do not
+    expose prompt-token logprobs. Every request, including one that fails
+    after retries, appends a sanitized ``ProviderCall``;
+    ``drain_provider_calls`` returns and clears them.
     """
 
     _label: str
@@ -1157,12 +1218,52 @@ class _HostedChatAgent:
 
             raise RuntimeUnavailable(str(error)) from error
         self._local.state = _EpisodeState(context=context, config=config)
+        self._local.provider_calls = []
 
     def _state(self) -> _EpisodeState:
         state = getattr(self._local, "state", None)
         if state is None:
             raise RuntimeError("agent begin was not called")
         return state
+
+    def drain_provider_calls(self) -> tuple[ProviderCall, ...]:
+        calls = getattr(self._local, "provider_calls", None) or []
+        self._local.provider_calls = []
+        return tuple(calls)
+
+    def _usage(self, payload: object) -> dict[str, int | None]:
+        del payload
+        return dict(_UNKNOWN_USAGE)
+
+    def _append_call(
+        self,
+        *,
+        trace: _RequestTrace,
+        latency_seconds: float,
+        status: str,
+        usage: Mapping[str, int | None],
+    ) -> None:
+        state = self._state()
+        calls = getattr(self._local, "provider_calls", None)
+        if calls is None:
+            calls = []
+            self._local.provider_calls = calls
+        model = state.config.model
+        calls.append(
+            ProviderCall(
+                provider=str(getattr(model, "provider", "unknown")),
+                model_id=str(getattr(model, "model_id", "unknown")),
+                mode=self._mode,
+                request_index=len(calls),
+                attempts=trace.attempts,
+                status=status,
+                latency_seconds=max(0.0, float(latency_seconds)),
+                error_kind=None if status == "succeeded" else (
+                    trace.error_kind or "malformed_response"
+                ),
+                **dict(usage),
+            )
+        )
 
     def _require_configuration(self, config: RunConfiguration) -> object:
         raise NotImplementedError
@@ -1189,7 +1290,7 @@ class _HostedChatAgent:
         text = state.context.api_documentation
         source = getattr(state.context, "api_documentation_source", None)
         if (
-            agent.prompt.prompt_version == PROMPT_RUNTIME_AUTH_V2
+            agent.prompt.prompt_version in INTERFACE_V2_PROMPTS
             and source is not None
         ):
             text = render_api_documentation(source, include_constraints=True)
@@ -1252,11 +1353,8 @@ class _HostedChatAgent:
         extra_instruction: str | None = None,
         parse_action: bool = True,
     ) -> AgentTurn:
-        if self._mode == "plan":
-            raise UnsupportedCapability(
-                f"{self._label} does not expose prompt-token logprobs; "
-                "plan-mode scoring is unsupported"
-            )
+        from llm_behavior_ci.runtime.episode import RuntimeUnavailable
+
         state = self._state()
         started_at = wall_now()
         if tool_output is not None:
@@ -1265,11 +1363,36 @@ class _HostedChatAgent:
         if extra_instruction is not None:
             messages.append({"role": "user", "content": extra_instruction})
         payload = self.completion_payload(messages)
+        trace = _RequestTrace()
+        raw: dict[str, object] | None = None
         began = monotonic()
-        raw = self._post(payload)
+        try:
+            raw = self._post(payload, trace)
+            output_text, token_count, record = self._read_response(raw)
+        except RuntimeUnavailable as error:
+            if trace.error_kind is None:
+                trace.error_kind = (
+                    "context_length_exceeded"
+                    if getattr(error, "reason", None) == "context_length_exceeded"
+                    else "provider_failure"
+                    if "provider failure" in str(error)
+                    else "malformed_response"
+                )
+            self._append_call(
+                trace=trace,
+                latency_seconds=monotonic() - began,
+                status="failed",
+                usage=_UNKNOWN_USAGE if raw is None else self._usage(raw),
+            )
+            raise
         latency_seconds = monotonic() - began
-        output_text, token_count, record = self._read_response(raw)
-        if parse_action:
+        self._append_call(
+            trace=trace,
+            latency_seconds=latency_seconds,
+            status="succeeded",
+            usage=self._usage(raw),
+        )
+        if parse_action and self._mode != "plan":
             rejection = None
             try:
                 action, app_name, api_name = parse_model_output(output_text)
@@ -1313,17 +1436,24 @@ class _HostedChatAgent:
             "teacher-forced plan KL is unsupported"
         )
 
-    def _post(self, payload: dict[str, object]) -> dict[str, object]:
+    def _post(
+        self,
+        payload: dict[str, object],
+        trace: _RequestTrace | None = None,
+    ) -> dict[str, object]:
         from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 
+        trace = trace if trace is not None else _RequestTrace()
         malformed = f"{self._label} response was malformed"
         body = json.dumps(payload).encode("utf-8")
         if self._api_key.encode("utf-8") in body:
+            trace.error_kind = "malformed_response"
             raise RuntimeUnavailable(f"{self._label} request was malformed")
         endpoint = self._endpoint()
         headers = self._headers()
         last_error: BaseException | None = None
         for attempt in range(self._attempts):
+            trace.attempts = attempt + 1
             request = urllib.request.Request(
                 endpoint,
                 data=body,
@@ -1339,21 +1469,29 @@ class _HostedChatAgent:
                 if error.code in self._retryable and attempt + 1 < self._attempts:
                     time.sleep(_retry_delay(attempt, error))
                     continue
-                raise _hosted_http_error(
+                failure = _hosted_http_error(
                     error,
                     label=self._label,
                     endpoint=endpoint,
                     secret=self._api_key,
-                ) from error
+                )
+                trace.error_kind = (
+                    "context_length_exceeded"
+                    if getattr(failure, "reason", None) == "context_length_exceeded"
+                    else "http_error"
+                )
+                raise failure from error
             except (urllib.error.URLError, TimeoutError, OSError) as error:
                 last_error = error
                 if attempt + 1 < self._attempts:
                     time.sleep(_retry_delay(attempt, None))
                     continue
+                trace.error_kind = "network_error"
                 raise RuntimeUnavailable(
                     _redact_secret(str(error), self._api_key)
                 ) from error
         else:
+            trace.error_kind = "network_error"
             raise RuntimeUnavailable(
                 _redact_secret(str(last_error), self._api_key)
             )
@@ -1363,8 +1501,10 @@ class _HostedChatAgent:
             else:
                 decoded = json.loads(bytes(raw).decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as error:
+            trace.error_kind = "malformed_response"
             raise RuntimeUnavailable(malformed) from error
         if not isinstance(decoded, dict):
+            trace.error_kind = "malformed_response"
             raise RuntimeUnavailable(malformed)
         return decoded
 
@@ -1500,6 +1640,9 @@ class SmolagentsAnthropicAgent(_HostedChatAgent):
         count = _output_token_count(payload)
         return text, count, _replay_blocks(payload.get("content"))
 
+    def _usage(self, payload: object) -> dict[str, int | None]:
+        return anthropic_usage(payload)
+
     def _record_response(self, state: _EpisodeState, record: object) -> None:
         state.assistant_blocks.append(record)
 
@@ -1625,3 +1768,6 @@ class SmolagentsOpenAICompatibleAgent(_HostedChatAgent):
     ) -> tuple[str, int, object]:
         text, count = _read_chat_completion(payload, self._label)
         return text, count, None
+
+    def _usage(self, payload: object) -> dict[str, int | None]:
+        return chat_completion_usage(payload)

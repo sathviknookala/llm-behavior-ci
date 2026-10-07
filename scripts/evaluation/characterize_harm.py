@@ -1,9 +1,14 @@
 """Characterize whether a declared fault is harmful on a frozen dev task set.
 
-Requires --base, --candidate, --task-set, --fault, --margin,
---confidence-level, --resamples, and --seed. Runtime comes from
-LLM_BEHAVIOR_CI_RUNTIME (module:function). Does not freeze a label under
-results/. Bare invocation exits 2.
+Requires --base, --task-set, --fault, --margin, --confidence-level,
+--resamples, and --seed. --candidate is optional; without it the candidate
+is ``apply_fault(base, fault)``, and with it the file must equal that.
+--live-runtime builds one execute runtime per role through the shared
+runtime factory: a vLLM role needs --reference-endpoint or
+--candidate-endpoint, a hosted role takes none and reads its key from the
+environment. Without --live-runtime, LLM_BEHAVIOR_CI_RUNTIME
+(module:function) injects one runtime for CPU tests. Does not freeze a
+label under results/. Bare invocation exits 2.
 """
 
 from __future__ import annotations
@@ -20,10 +25,12 @@ from pathlib import Path
 from llm_behavior_ci.config import ConfigError, RunConfiguration
 from llm_behavior_ci.experiments.faults import (
     FaultError,
+    apply_fault,
     load_fault,
     measure_harm,
 )
-from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.runtime.episode import EpisodeRejected, RuntimeDependencies
+from llm_behavior_ci.runtime.factory import LiveRuntimeFactory
 from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
@@ -118,7 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Measure harm for one declared fault without freezing under results/."
     )
     parser.add_argument("--base", required=True)
-    parser.add_argument("--candidate", required=True)
+    parser.add_argument("--candidate", default=None)
     parser.add_argument("--task-set", required=True)
     parser.add_argument("--fault", required=True)
     parser.add_argument("--margin", required=True, type=float)
@@ -126,6 +133,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--resamples", required=True, type=int)
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--live-runtime", action="store_true")
+    parser.add_argument("--reference-endpoint", default=None)
+    parser.add_argument("--candidate-endpoint", default=None)
     try:
         args = parser.parse_args(args_list)
     except SystemExit as error:
@@ -135,9 +145,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(code)
 
     runtime_spec = os.environ.get("LLM_BEHAVIOR_CI_RUNTIME")
-    if runtime_spec is None or runtime_spec.strip() == "":
+    if not args.live_runtime and (runtime_spec is None or runtime_spec.strip() == ""):
         print(
-            "LLM_BEHAVIOR_CI_RUNTIME is required (module:function returning RuntimeDependencies)",
+            "pass --live-runtime, or set LLM_BEHAVIOR_CI_RUNTIME "
+            "(module:function returning RuntimeDependencies) for CPU tests",
             file=sys.stderr,
         )
         return 2
@@ -149,11 +160,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         base = RunConfiguration.from_dict(_load_json(Path(args.base)))
-        candidate = RunConfiguration.from_dict(_load_json(Path(args.candidate)))
-        task_set = _load_task_set(_load_json(Path(args.task_set)))
         fault = load_fault(Path(args.fault))
+        candidate = (
+            apply_fault(base, fault)
+            if args.candidate is None
+            else RunConfiguration.from_dict(_load_json(Path(args.candidate)))
+        )
+        task_set = _load_task_set(_load_json(Path(args.task_set)))
         enforce_committed_provenance(base)
-        runtime = _load_runtime(runtime_spec)
+        candidate_runtime = None
+        if args.live_runtime:
+            factory = LiveRuntimeFactory.from_endpoints(
+                reference=args.reference_endpoint,
+                candidate=args.candidate_endpoint,
+            )
+            factory.preflight({"reference": base, "candidate": candidate})
+            runtime = factory(base, mode="execute", role="reference")
+            candidate_runtime = factory(candidate, mode="execute", role="candidate")
+        else:
+            runtime = _load_runtime(runtime_spec)
         label = measure_harm(
             base,
             candidate,
@@ -164,6 +189,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             confidence_level=float(args.confidence_level),
             resamples=int(args.resamples),
             seed=int(args.seed),
+            candidate_runtime=candidate_runtime,
         )
         document = {
             "record": "harm_label",
@@ -187,7 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path.write_text(text + "\n", encoding="utf-8")
         print(text)
         return 0
-    except (FaultError, ConfigError, SelectionError, ProvenanceError) as error:
+    except (FaultError, ConfigError, SelectionError, ProvenanceError, EpisodeRejected) as error:
         print(str(error) or "harm characterization failed", file=sys.stderr)
         return 1
     except Exception:

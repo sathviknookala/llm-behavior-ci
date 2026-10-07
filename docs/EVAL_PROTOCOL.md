@@ -85,6 +85,14 @@ A/A dependence is accepted for provenance `local_runtime`, or for `gpu` when the
 
 `STUDY_BUDGETS` caps how large a `cpu_fast`, `simulation`, or `gpu` call may be (`CONSTRAINTS.md`). The caps are not protocol parameters.
 
+## Hosted GLM reference path (DRAFT)
+
+`docs/HOSTED_LIFECYCLE.md` is the contract and runbook for developing the three tiers on Z.AI GLM-5.3. GLM-5.3 is a provisional hosted reference, not the Qwen3-4B production path and not a qualified baseline. Sonnet's 14/20 (`results/spotify_capability_20_sonnet_5_5.json`) is not a GLM baseline. On a hosted configuration the Tier 1 default is the plan-quality paired bootstrap plus MMD; teacher-forced plan KL is self-hosted only, and a hosted gate that requires `kl` fails in preflight. Tier 2 stops on paired binary evaluator success. `horizon_reached_without_harm` promotion is an exposure policy, not evidence of harmlessness. Every threshold stays DRAFT. Synthetic tests are software evidence only.
+
+The benchmark and the dev rehearsal share one hashed arrival schedule (`experiments/schedule.py`, `benchmark-schedule-v1`): stream settings, healthy prefix, abrupt or ramped onset, analysis horizon, canary fraction and assignment seed, and simulated clock start. Monitors run on the simulated clock and apply `outcome_delay_seconds` on it. Healthy-prefix alarms are reported separately from post-onset delay. The schedule's values are not protocol slots until they are written in the table above.
+
+Hosted usage is per-request sanitized accounting (`ProviderCall`): attempts, status, latency, and the token counts the provider reported, with unknown counts left unknown. Cost is computed only from a versioned pricing file. The full protocol lock stays local; its public commitment is a digest and per-section digests (`lock_protocol.py --require LOCK --commitment PATH`).
+
 ## What each tier is allowed to use
 
 The library implements the full set in `STAGES.md` stage 2. The plan-only gate, the canary controller, and the production monitor are CPU decision paths. Their thresholds come from the caller and are not the open slots above. The A/A capture records paired outcomes and plan-scoring inputs and does not apply the decision rules below. Each consumer uses a subset:
@@ -116,7 +124,7 @@ Scope line that travels with the claim: seeded AppWorld task streams with simula
 
 ## What is not ground truth
 
-An LLM judge. The agent's own claim that it completed a task. A plan-quality metric by itself. A divergence with no evaluator-measured drop in task success. A threshold chosen on `test_normal`. A fault label revised after `test_normal`. A method that has not passed its null check. A synthetic-null false-alarm rate reported without the A/A and task-mix-shift streams. A `benchmark_eligible` flag on caller-supplied provenance. A normal-approximation power number. A top-k versus full KL error on supplied arrays reported as a vLLM truncation floor.
+An LLM judge. The agent's own claim that it completed a task. A plan-quality metric by itself. A divergence with no evaluator-measured drop in task success. A threshold chosen on `test_normal`. A fault label revised after `test_normal`. A method that has not passed its null check. A synthetic-null false-alarm rate reported without the A/A and task-mix-shift streams. A `benchmark_eligible` flag on caller-supplied provenance. A normal-approximation power number (`simulate_power.py`'s empirical clustered simulation is the planning number; neither is a result until committed under `results/`). A hosted model's plan KL of any kind. A top-k versus full KL error on supplied arrays reported as a vLLM truncation floor.
 
 ## Run log
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 from collections import Counter
 from collections.abc import Sequence
@@ -136,12 +137,51 @@ class NormalizedEpisode:
     difficulty: int | None
 
 
+class MissingSliceReference(MonitorRejected):
+    """Raised when a per-slice reference is required but the slice has none."""
+
+
 @dataclass(frozen=True)
 class FrozenReference:
-    """Caller-supplied frozen baselines for the previous known-good config."""
+    """Caller-supplied frozen baselines for the previous known-good config.
+
+    ``slice_baselines`` maps a slice name to that slice's own baselines.
+    When it is empty, a slice detector starts from the aggregate
+    ``baselines`` (the aggregate-reference approximation). When it is
+    non-empty, ``source`` must name where the baselines were measured, and
+    a slice that has no entry raises ``MissingSliceReference`` rather than
+    falling back to the aggregate.
+    """
 
     configuration_hash: str
     baselines: tuple[tuple[str, float], ...]
+    slice_baselines: tuple[tuple[str, tuple[tuple[str, float], ...]], ...] = ()
+    source: str | None = None
+
+    def __post_init__(self) -> None:
+        names = [name for name, _values in self.slice_baselines]
+        if len(set(names)) != len(names):
+            raise MonitorRejected("slice_baselines must name each slice once")
+        if any(not isinstance(name, str) or name == "" for name in names):
+            raise MonitorRejected("slice_baselines names must be non-empty strings")
+        if self.slice_baselines and (
+            not isinstance(self.source, str) or self.source == ""
+        ):
+            raise MonitorRejected("per-slice baselines require a non-empty source")
+
+    @property
+    def per_slice(self) -> bool:
+        return bool(self.slice_baselines)
+
+    def baselines_for_slice(self, slice_name: str) -> tuple[tuple[str, float], ...]:
+        if not self.per_slice:
+            return self.baselines
+        for name, values in self.slice_baselines:
+            if name == slice_name:
+                return values
+        raise MissingSliceReference(
+            f"frozen reference from {self.source} has no baseline for slice {slice_name}"
+        )
 
 
 @dataclass(frozen=True)
@@ -157,6 +197,7 @@ class Alert:
     boundary: float | None
     sample_size: int
     raised_at: datetime
+    period_id: str | None = None
 
     def to_public_dict(self) -> dict:
         payload = {
@@ -184,6 +225,7 @@ class Alert:
             boundary=self.boundary,
             sample_size=self.sample_size,
             raised_at=self.raised_at,
+            period_id=self.period_id,
         )
 
     @classmethod
@@ -198,6 +240,7 @@ class Alert:
             boundary=record.boundary,
             sample_size=record.sample_size,
             raised_at=record.raised_at,
+            period_id=record.period_id,
         )
 
 
@@ -680,9 +723,24 @@ class ProductionMonitor:
             slice_name=slice_name,
         )
 
-    def reset_for_promotion(self, reference: FrozenReference) -> None:
+    def reset_for_promotion(
+        self,
+        reference: FrozenReference,
+        *,
+        period_id: str | None = None,
+    ) -> None:
+        """Rebuild every detector against ``reference`` and start a new period.
+
+        ``period_id``, when given, replaces the monitoring period so alert
+        incident keys from before the promotion cannot suppress alerts after it.
+        """
+
         if not isinstance(reference, FrozenReference):
             raise MonitorRejected("reference must be FrozenReference")
+        if period_id is not None and (not isinstance(period_id, str) or period_id == ""):
+            raise MonitorRejected("period_id must be a non-empty string when set")
+        if period_id is not None:
+            self._period_id = period_id
         self._reference = reference
         self._reference_configuration_hash = reference.configuration_hash
         self._detectors = self._detectors_from(reference)
@@ -691,14 +749,40 @@ class ProductionMonitor:
         self._last_alert_at.clear()
         self._slice_detectors.clear()
 
+    def release_due(self, *, period_id: str | None = None) -> tuple[Alert, ...]:
+        """Apply every held delayed observation whose outcome delay has passed.
+
+        A scheduled stream calls this after advancing its simulated clock, so
+        outcomes become visible to the detectors exactly when the schedule
+        says they arrive, even when no new observation follows.
+        """
+
+        self._check_period(period_id)
+        return tuple(self._release_ready(self._clock()))
+
+    @property
+    def held_count(self) -> int:
+        return len(self._held)
+
+    @property
+    def outcome_delay_seconds(self) -> float:
+        return float(self._settings.outcome_delay_seconds)
+
     def _check_period(self, period_id: str | None) -> None:
         if self._period_id is None:
             return
         if period_id != self._period_id:
             raise MonitorRejected("period_id does not match the monitoring period")
 
-    def _detectors_from(self, reference: FrozenReference) -> dict[str, list[Detector]]:
-        baselines = _baselines_for_signals(reference.baselines, self._settings.signals)
+    def _detectors_from(
+        self,
+        reference: FrozenReference,
+        baseline_pairs: tuple[tuple[str, float], ...] | None = None,
+    ) -> dict[str, list[Detector]]:
+        baselines = _baselines_for_signals(
+            reference.baselines if baseline_pairs is None else baseline_pairs,
+            self._settings.signals,
+        )
         try:
             return build_detectors(
                 signals=self._settings.signals,
@@ -762,9 +846,10 @@ class ProductionMonitor:
         if slice_name != observation.signal:
             key = (observation.signal, slice_name)
             if key not in self._slice_detectors:
-                self._slice_detectors[key] = self._detectors_from(self._reference)[
-                    observation.signal
-                ]
+                self._slice_detectors[key] = self._detectors_from(
+                    self._reference,
+                    self._reference.baselines_for_slice(slice_name),
+                )[observation.signal]
             alerts.extend(
                 self._run_detectors(
                     self._slice_detectors[key],
@@ -823,6 +908,7 @@ class ProductionMonitor:
             boundary=evidence.boundary,
             sample_size=evidence.sample_size,
             raised_at=raised_at,
+            period_id=self._period_id,
         )
 
 
@@ -858,6 +944,7 @@ class DistributionalMonitor:
         reference_configuration_hash: str,
         clock: Callable[[], datetime],
         dedup_seconds: float,
+        period_id: str | None = None,
     ) -> None:
         if not isinstance(settings, DistributionalMonitorSettings):
             raise MonitorRejected(
@@ -889,6 +976,9 @@ class DistributionalMonitor:
         )
         self._slice_detectors: dict[str, object] = {}
         self._last_alert_at: dict[str, datetime] = {}
+        if period_id is not None and (not isinstance(period_id, str) or period_id == ""):
+            raise MonitorRejected("period_id must be a non-empty string when set")
+        self._period_id = period_id
 
     @property
     def signal(self) -> str:
@@ -910,20 +1000,35 @@ class DistributionalMonitor:
             self._apply(self._detector, counts, observation, slice_name=self.signal)
         )
         if resolved_slice != self.signal:
-            detector = self._slice_detectors.setdefault(
-                resolved_slice,
-                build_distributional_detector(
+            detector = self._slice_detectors.get(resolved_slice)
+            if detector is None:
+                detector = build_distributional_detector(
                     signal=self._settings.signal,
-                    reference_counts=dict(self._settings.reference_counts),
+                    reference_counts=self._reference_counts_for(resolved_slice),
                     window_episodes=self._settings.window_episodes,
                     alpha=self._settings.alpha,
                     correction=self._settings.correction,
-                ),
-            )
+                )
+                self._slice_detectors[resolved_slice] = detector
             alerts.extend(
                 self._apply(detector, counts, observation, slice_name=resolved_slice)
             )
         return tuple(alerts)
+
+    @property
+    def period_id(self) -> str | None:
+        return self._period_id
+
+    def _reference_counts_for(self, slice_name: str) -> dict[str, int]:
+        if not self._settings.slice_reference_counts:
+            return dict(self._settings.reference_counts)
+        for name, counts in self._settings.slice_reference_counts:
+            if name == slice_name:
+                return dict(counts)
+        raise MissingSliceReference(
+            f"{self.signal} reference from {self._settings.reference_source} "
+            f"has no distribution for slice {slice_name}"
+        )
 
     def _apply(
         self,
@@ -957,10 +1062,26 @@ class DistributionalMonitor:
                 boundary=evidence.boundary,
                 sample_size=evidence.sample_size,
                 raised_at=raised_at,
+                period_id=self._period_id,
             )
         ]
 
-    def reset(self) -> None:
+    def reset(
+        self,
+        *,
+        reference_configuration_hash: str | None = None,
+        period_id: str | None = None,
+    ) -> None:
+        """Start a fresh window; on promotion also rebind reference and period."""
+
+        if reference_configuration_hash is not None:
+            if reference_configuration_hash == "":
+                raise MonitorRejected("reference_configuration_hash must be non-empty")
+            self._reference_configuration_hash = reference_configuration_hash
+        if period_id is not None:
+            if period_id == "":
+                raise MonitorRejected("period_id must be non-empty when set")
+            self._period_id = period_id
         self._detector.reset()
         self._slice_detectors.clear()
         self._last_alert_at.clear()
@@ -972,6 +1093,7 @@ def build_distributional_monitors(
     reference_configuration_hash: str,
     clock: Callable[[], datetime],
     dedup_seconds: float,
+    period_id: str | None = None,
 ) -> dict[str, DistributionalMonitor]:
     """Build one ``DistributionalMonitor`` per configured distributional signal.
 
@@ -1001,8 +1123,23 @@ def build_distributional_monitors(
             reference_configuration_hash=reference_configuration_hash,
             clock=clock,
             dedup_seconds=dedup_seconds,
+            period_id=period_id,
         )
     return monitors
+
+
+def monitoring_period_id(serving_configuration_hash: str, reference_configuration_hash: str) -> str:
+    """Deterministic monitoring period for one serving/reference pair.
+
+    The same deployment restarted keeps its period, so stored incident keys
+    still de-duplicate; a promotion changes the serving hash and opens a new
+    period.
+    """
+
+    digest = hashlib.sha256(
+        f"{serving_configuration_hash}:{reference_configuration_hash}".encode("utf-8")
+    ).hexdigest()
+    return f"period-{digest[:32]}"
 
 
 def _baselines_for_signals(

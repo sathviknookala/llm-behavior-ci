@@ -7,10 +7,12 @@ required entities, and tool-ordering constraints. Nothing here reads an
 evaluator outcome, a tool trace, or anything produced after the plan
 episode terminates.
 
-``PLAN_FEATURE_SCHEMA_VERSION`` names this feature vector so a caller can
-pin, log, or reject a mismatched schema once a later stage binds it into
-the protocol lock. Changing a feature's definition, adding one, or
-removing one is a new version.
+``PLAN_FEATURE_SCHEMA_VERSION`` names this feature vector; the protocol
+lock and validation artifacts bind it, and a lock written under another
+version is rejected. Changing a feature's definition, adding one, or
+removing one is a new version. ``plan-features-v2`` reads a tool reference
+as ``app.api`` or the action spelling ``apis.app.api``; v1 split
+``apis.app.api`` into the invalid pair ``apis.app``.
 
 Two pure functions produce the vector: ``structural_plan_features`` needs
 only the plan text (character/line/token shape; kept as supplementary
@@ -26,11 +28,11 @@ same vector.
 from __future__ import annotations
 
 import re
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from llm_behavior_ci.tasks.plan_specs import TaskPlanSpec
 
-PLAN_FEATURE_SCHEMA_VERSION = "plan-features-v1"
+PLAN_FEATURE_SCHEMA_VERSION = "plan-features-v2"
 
 STRUCTURAL_PLAN_FEATURES = frozenset(
     {
@@ -65,8 +67,47 @@ SEMANTIC_PLAN_FEATURES = frozenset(
 
 PLAN_TEXT_FEATURES = STRUCTURAL_PLAN_FEATURES | SEMANTIC_PLAN_FEATURES
 
+SUBGOAL_FEATURES = frozenset(
+    {"requirement_coverage_fraction", "subgoal_covered_count", "subgoal_total_count"}
+)
+ENTITY_FEATURES = frozenset(
+    {"entity_coverage_fraction", "entity_covered_count", "entity_total_count"}
+)
+DEPENDENCY_FEATURES = frozenset(
+    {
+        "dependency_violation_count",
+        "dependency_applicable_count",
+        "dependency_consistency_fraction",
+    }
+)
+
 _NUMBERED_STEP = re.compile(r"^\s*\d+\.")
-_TOOL_REFERENCE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
+_TOOL_CHAIN = re.compile(
+    r"(?<![A-Za-z0-9_.])[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+(?![A-Za-z0-9_])"
+)
+_ACTION_NAMESPACE = "apis"
+
+
+def tool_references(line: str) -> tuple[tuple[str, bool], ...]:
+    """Every dotted reference in ``line`` as ``(normalized, well_formed)``.
+
+    ``app.api`` and the action spelling ``apis.app.api`` both normalize to
+    lowercase ``app.api`` and are well formed. Any other dotted chain,
+    such as ``a.b.c`` or ``apis.app``, is one malformed reference kept
+    verbatim, so it counts as invalid rather than being split into a
+    valid-looking pair.
+    """
+
+    found: list[tuple[str, bool]] = []
+    for match in _TOOL_CHAIN.finditer(line):
+        parts = match.group(0).lower().split(".")
+        if len(parts) == 2 and parts[0] != _ACTION_NAMESPACE:
+            found.append((".".join(parts), True))
+        elif len(parts) == 3 and parts[0] == _ACTION_NAMESPACE:
+            found.append((".".join(parts[1:]), True))
+        else:
+            found.append((".".join(parts), False))
+    return tuple(found)
 
 
 class PlanFeatureError(ValueError):
@@ -152,9 +193,8 @@ def semantic_plan_features(
     valid_mentions: list[tuple[int, str]] = []
     invalid_mentions: list[tuple[int, str]] = []
     for step_index, line in enumerate(non_empty):
-        for match in _TOOL_REFERENCE.finditer(line):
-            token = match.group(0).lower()
-            if token in available:
+        for token, well_formed in tool_references(line):
+            if well_formed and token in available:
                 valid_mentions.append((step_index, token))
             else:
                 invalid_mentions.append((step_index, token))
@@ -224,6 +264,46 @@ def semantic_plan_features(
         "dependency_applicable_count": float(applicable),
         "dependency_consistency_fraction": dependency_consistency_fraction,
     }
+
+
+def require_semantic_coverage(
+    task_ids: Sequence[str],
+    specs: Mapping[str, TaskPlanSpec],
+    features: Sequence[str],
+) -> None:
+    """Refuse a gate whose semantic features would be vacuous or missing.
+
+    Every task needs a spec when any semantic feature is requested.
+    Subgoal features need declared subgoals, entity features need declared
+    entities, and dependency features need declared pairs, on every task:
+    the vacuous ``1.0`` the extractor returns for an empty declaration is
+    not evidence that a plan covered anything. The error names counts, not
+    task ids.
+    """
+
+    requested = set(features) & SEMANTIC_PLAN_FEATURES
+    if not requested:
+        return
+    missing = [task_id for task_id in task_ids if task_id not in specs]
+    if missing:
+        raise PlanFeatureError(
+            f"semantic plan features need a task_plan_spec for every gate task; "
+            f"{len(missing)} of {len(task_ids)} are missing"
+        )
+    checks = (
+        (SUBGOAL_FEATURES, "subgoal_keywords", lambda spec: spec.subgoal_keywords),
+        (ENTITY_FEATURES, "required_entities", lambda spec: spec.required_entities),
+        (DEPENDENCY_FEATURES, "dependency_pairs", lambda spec: spec.dependency_pairs),
+    )
+    for group, name, read in checks:
+        if not requested & group:
+            continue
+        empty = sum(1 for task_id in task_ids if not read(specs[task_id]))
+        if empty:
+            raise PlanFeatureError(
+                f"{', '.join(sorted(requested & group))} need non-empty {name}; "
+                f"{empty} of {len(task_ids)} gate tasks declare none"
+            )
 
 
 def extract_plan_features(

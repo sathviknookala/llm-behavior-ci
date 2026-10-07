@@ -49,6 +49,10 @@ The model still owns API selection, entity selection, ids, filters, pagination, 
 
 Plan mode stays on `SmolagentsVLLMAgent` and is not wrapped, so Tier 1 plan traces and teacher-forced plan KL stay on the unwrapped agent. `plan_progress_v1` on `configs/models/qwen3_14b_awq_spotify_capability.json` completed the 20-task Spotify capability pilot at 0/20 (`results/spotify_capability_20_workflow.json`). It is a failed Stage-1 baseline candidate, not a qualified baseline. `plan_progress_v2` is the separate config `configs/models/qwen3_14b_awq_spotify_capability_v2.json`. Its pilot is 0/20 in `results/spotify_capability_20_plan_progress_v2.json`. The controller stays frozen. `prompt-runtime-auth-v2` (`configs/models/qwen3_14b_awq_spotify_capability_v2_interface.json`) corrects API-constraint rendering and execute-time action and completion instructions. Its pilot is 0/20 in `results/spotify_capability_20_plan_progress_v2_interface.json`. It is not a qualified baseline (`docs/DECISIONS.md` D22).
 
+### Hosted providers
+
+A hosted configuration (Anthropic, or Z.AI through the OpenAI-compatible client) replaces vLLM in the model row only; AppWorld, the gateway, the tiers, and the evaluator are unchanged. Every live command builds its runtimes through `runtime/factory.py`: one runtime per configuration, mode, and role; a vLLM role needs its own endpoint and a hosted role takes none and reads its key from the environment. A hosted plan episode is the visible plan text with zero tools, no evaluator outcome, and empty logprobs. Hosted runs record sanitized per-request usage and never store provider reasoning text or keys. Teacher-forced plan KL stays self-hosted. GLM-5.3 is a provisional hosted reference for developing the tiers on `train` and `dev`, not the production model (`docs/HOSTED_LIFECYCLE.md`, `DECISIONS.md` D23).
+
 Rule for the integration boundary: every environment mutation goes through AppWorld, so its evaluator sees the true final state. smolagents' local Python executor is never the place an action runs.
 
 ## Evaluation lifecycle

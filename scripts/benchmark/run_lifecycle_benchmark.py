@@ -1,3 +1,16 @@
+"""Run the frozen lifecycle benchmark from a protocol lock.
+
+Requires --protocol, one or more --fault, --train-tasks,
+--test-normal-tasks, --baselines, --plan-evidence, and --checkpoint.
+--schedule binds an explicit hashed arrival schedule (healthy prefix,
+onset, canary fraction, simulated clock); --task-metadata supplies local
+difficulty labels for the task-mix monitor. --live-runtime builds every
+runtime through the shared factory (vLLM roles need their endpoints,
+hosted roles read their keys from the environment); without it,
+LLM_BEHAVIOR_CI_RUNTIME injects one runtime for CPU tests. Bare
+invocation exits 2.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -16,13 +29,16 @@ from llm_behavior_ci.experiments.benchmark import (
 )
 from llm_behavior_ci.experiments.faults import FaultError, load_fault
 from llm_behavior_ci.experiments.protocol import ProtocolError, require_protocol_lock
+from llm_behavior_ci.experiments.run_config import RunConfigError, load_local_task_manifest
+from llm_behavior_ci.experiments.schedule import BenchmarkSchedule, ScheduleError
+from llm_behavior_ci.runtime.factory import LiveRuntimeFactory
 from llm_behavior_ci.lifecycle.monitoring import FrozenReference
 from llm_behavior_ci.lifecycle.offline_gate import (
     GateExecutionError,
     PlanEvidenceInputs,
     plan_evidence_from_dict,
 )
-from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.runtime.episode import EpisodeRejected, RuntimeDependencies
 from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
 from llm_behavior_ci.tasks.selection import (
     SelectionError,
@@ -160,6 +176,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--plan-evidence", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--export", default=None)
+    parser.add_argument("--schedule", default=None)
+    parser.add_argument("--task-metadata", default=None)
+    parser.add_argument("--live-runtime", action="store_true")
+    parser.add_argument("--reference-endpoint", default=None)
+    parser.add_argument("--candidate-endpoint", default=None)
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
     except SystemExit as error:
@@ -169,9 +190,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(code)
 
     runtime_spec = os.environ.get("LLM_BEHAVIOR_CI_RUNTIME")
-    if runtime_spec is None or runtime_spec.strip() == "":
+    if not args.live_runtime and (runtime_spec is None or runtime_spec.strip() == ""):
         print(
-            "LLM_BEHAVIOR_CI_RUNTIME is required (module:function returning RuntimeDependencies)",
+            "pass --live-runtime, or set LLM_BEHAVIOR_CI_RUNTIME "
+            "(module:function returning RuntimeDependencies) for CPU tests",
             file=sys.stderr,
         )
         return 2
@@ -201,11 +223,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise BenchmarkError(
                 "plan evidence validation_provenance must be synthetic_fixture or validated"
             )
-        runtime = _load_runtime(runtime_spec)
+        schedule = None
+        if args.schedule is not None:
+            schedule = BenchmarkSchedule.from_dict(_load_json(Path(args.schedule)))
+        difficulty_for = None
+        if args.task_metadata is not None:
+            manifest = load_local_task_manifest(Path(args.task_metadata))
+            if manifest.task_set.task_set_hash != test_normal_tasks.task_set_hash:
+                raise BenchmarkError("task metadata must describe the test_normal task set")
+            difficulty_for = manifest.difficulty
+        runtime = None
+        runtime_factory = None
+        if args.live_runtime:
+            runtime_factory = LiveRuntimeFactory.from_endpoints(
+                reference=args.reference_endpoint,
+                candidate=args.candidate_endpoint,
+            )
+        else:
+            runtime = _load_runtime(runtime_spec)
         result = run_lifecycle_benchmark(
             protocol,
             faults,
             runtime=runtime,
+            runtime_factory=runtime_factory,
+            schedule=schedule,
+            difficulty_for=difficulty_for,
             train_tasks=train_tasks,
             test_normal_tasks=test_normal_tasks,
             reference_baselines=baselines,
@@ -227,6 +269,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         SelectionError,
         GateExecutionError,
         ProvenanceError,
+        ScheduleError,
+        RunConfigError,
+        EpisodeRejected,
     ) as error:
         print(str(error) or "lifecycle benchmark failed", file=sys.stderr)
         return 1

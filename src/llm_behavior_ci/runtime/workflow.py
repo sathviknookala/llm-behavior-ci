@@ -16,7 +16,7 @@ from llm_behavior_ci.runtime.agent import (
     SmolagentsVLLMAgent,
 )
 from llm_behavior_ci.runtime.appworld import TaskContext, ToolResult
-from llm_behavior_ci.runtime.prompts import PROMPT_RUNTIME_AUTH_V2
+from llm_behavior_ci.runtime.prompts import INTERFACE_V2_PROMPTS
 
 _MIN_PLAN_STEPS = 2
 _MAX_PLAN_STEP_CHARS = 120
@@ -602,6 +602,10 @@ class WorkflowControlledAgent:
     def underlying_agents(self) -> tuple[_BaseAgent, ...]:
         return (self._base_agent,)
 
+    def drain_provider_calls(self) -> tuple[object, ...]:
+        drain = getattr(self._base_agent, "drain_provider_calls", None)
+        return tuple(drain()) if callable(drain) else ()
+
     def _state(self) -> WorkflowState:
         state = getattr(self._local, "state", None)
         if state is None:
@@ -630,7 +634,7 @@ class WorkflowControlledAgent:
         state = self._state()
         instruction = workflow_instruction(state, self._settings)
         if state.recoverable_api_error_pending:
-            if getattr(self._local, "prompt_version", None) == PROMPT_RUNTIME_AUTH_V2:
+            if getattr(self._local, "prompt_version", None) in INTERFACE_V2_PROMPTS:
                 instruction = f"{instruction}\n\n{_API_ERROR_RECOVERY}"
             state.recoverable_api_error_pending = False
         raw = self._base_agent.generate_turn(

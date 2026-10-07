@@ -16,6 +16,8 @@ class PlanFormatTemplate:
 
 
 PROMPT_RUNTIME_AUTH_V2 = "prompt-runtime-auth-v2"
+PROMPT_GENERAL_AUTH_V1 = "prompt-general-auth-v1"
+INTERFACE_V2_PROMPTS = frozenset({PROMPT_RUNTIME_AUTH_V2, PROMPT_GENERAL_AUTH_V1})
 
 _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
     "prompt-v1": PromptTemplate(
@@ -126,6 +128,27 @@ _PROMPT_REGISTRY: dict[str, PromptTemplate] = {
             "Mutate state only through AppWorld-executed actions.\n"
             "Do not invent APIs that are absent from the documentation.\n"
             "Authentication and session credentials are managed by the runtime.\n"
+            "Use tool results to progress toward the requested task.\n"
+        ),
+    ),
+    PROMPT_GENERAL_AUTH_V1: PromptTemplate(
+        version=PROMPT_GENERAL_AUTH_V1,
+        system_body=(
+            "You are an AppWorld tool-using agent.\n"
+            "Follow the task instruction and the API documentation.\n"
+            "Mutate state only through AppWorld-executed actions.\n"
+            "Do not invent APIs that are absent from the documentation.\n"
+            "Before calling any app API that requires authentication, retrieve "
+            "the existing user's credentials using the documented supervisor "
+            "credential APIs.\n"
+            "Use the returned username and password exactly to log into that app.\n"
+            "Reuse the returned access token for later authenticated calls.\n"
+            "Never fabricate usernames, passwords, tokens, IDs, or "
+            "authentication state.\n"
+            "Do not create a new account unless the user task explicitly "
+            "requests account creation.\n"
+            "Reuse credentials, tokens, IDs, and other values returned by "
+            "earlier API calls whenever later calls require them.\n"
             "Use tool results to progress toward the requested task.\n"
         ),
     ),
@@ -292,7 +315,7 @@ def render_system_text(
 
 def _execute_instruction(*, prompt_version: str, action_interface: str) -> str:
     if action_interface == "code":
-        if prompt_version == PROMPT_RUNTIME_AUTH_V2:
+        if prompt_version in INTERFACE_V2_PROMPTS:
             return _RUNTIME_AUTH_V2_EXECUTE
         if prompt_version in {
             "prompt-v2",
@@ -307,7 +330,7 @@ def _execute_instruction(*, prompt_version: str, action_interface: str) -> str:
             "prompt-v2",
             "prompt-v4",
             "prompt-runtime-auth-v1",
-            PROMPT_RUNTIME_AUTH_V2,
+            *INTERFACE_V2_PROMPTS,
         }:
             raise ValueError(
                 f"{prompt_version} does not support tool_calling action interface"

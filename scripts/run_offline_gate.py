@@ -1,3 +1,14 @@
+"""Run the plan-only offline gate.
+
+Requires --reference, --candidate, --task-set, --settings, and
+--plan-evidence. --live-runtime builds one plan-mode runtime per role: a
+vLLM role needs --reference-endpoint or --candidate-endpoint, a hosted
+role takes none and reads its key from the environment. A required
+``kl`` statistic on a hosted configuration fails in preflight. With
+--episode-store the validation artifact is recorded for later admission.
+Bare invocation exits 2.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -12,10 +23,16 @@ from llm_behavior_ci.lifecycle.offline_gate import (
     GateExecutionError,
     PlanEvidenceInputs,
     plan_evidence_from_dict,
+    require_gate_capabilities,
     run_offline_gate,
 )
 from llm_behavior_ci.records import assert_public_payload, public_record_dict
-from llm_behavior_ci.runtime.episode import RuntimeDependencies, build_runtime
+from llm_behavior_ci.runtime.episode import EpisodeRejected, RuntimeDependencies
+from llm_behavior_ci.runtime.factory import (
+    LiveRuntimeFactory,
+    RuntimeFactory,
+    RuntimeFactoryError,
+)
 from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
 from llm_behavior_ci.storage import EpisodeStore, StorageError
 from llm_behavior_ci.tasks.selection import (
@@ -76,80 +93,23 @@ def _load_plan_evidence(payload: object) -> PlanEvidenceInputs:
     return plan_evidence_from_dict(payload)
 
 
-class _SwitchingAgent:
-    def __init__(
-        self,
-        *,
-        reference_agent: object,
-        candidate_agent: object,
-        reference_hash: str,
-        candidate_hash: str,
-    ) -> None:
-        self._reference_agent = reference_agent
-        self._candidate_agent = candidate_agent
-        self._reference_hash = reference_hash
-        self._candidate_hash = candidate_hash
-        self._active = reference_agent
-
-    def begin(self, context: object, config: RunConfiguration) -> None:
-        from llm_behavior_ci.config import run_configuration_hash
-
-        digest = run_configuration_hash(config)
-        if digest == self._reference_hash:
-            self._active = self._reference_agent
-        elif digest == self._candidate_hash:
-            self._active = self._candidate_agent
-        else:
-            raise GateExecutionError("live runtime configuration is not registered")
-        self._active.begin(context, config)
-
-    def messages(self, tool_output: str | None = None) -> object:
-        return self._active.messages(tool_output=tool_output)
-
-    def next_turn(self, *, tool_output: str | None) -> object:
-        return self._active.next_turn(tool_output=tool_output)
-
-    def teacher_force_plan(self, **kwargs: object) -> object:
-        method = getattr(self._active, "teacher_force_plan", None)
-        if not callable(method):
-            raise AttributeError("teacher_force_plan")
-        return method(**kwargs)
-
-    def set_mode(self, mode: str) -> None:
-        for agent in (self._reference_agent, self._candidate_agent):
-            setter = getattr(agent, "set_mode", None)
-            if callable(setter):
-                setter(mode)
-
-    def underlying_agents(self) -> tuple[object, ...]:
-        return (self._reference_agent, self._candidate_agent)
-
-
-def _live_runtime(
+def _role_runtimes(
     reference: RunConfiguration,
     candidate: RunConfiguration,
-    *,
-    reference_endpoint: str,
-    candidate_endpoint: str,
-) -> RuntimeDependencies:
-    from llm_behavior_ci.config import run_configuration_hash
+    factory: RuntimeFactory,
+) -> tuple[RuntimeDependencies, RuntimeDependencies]:
+    """Separate plan-mode runtimes for the two roles, after preflight.
 
-    if reference_endpoint.strip() == "" or candidate_endpoint.strip() == "":
-        raise GateExecutionError("live runtime requires reference and candidate endpoints")
-    if reference_endpoint == candidate_endpoint:
-        raise GateExecutionError("live runtime endpoints must be distinct")
-    reference_runtime = build_runtime(reference, reference_endpoint, mode="plan")
-    candidate_runtime = build_runtime(candidate, candidate_endpoint, mode="plan")
-    agent = _SwitchingAgent(
-        reference_agent=reference_runtime.agent,
-        candidate_agent=candidate_runtime.agent,
-        reference_hash=run_configuration_hash(reference),
-        candidate_hash=run_configuration_hash(candidate),
-    )
-    return RuntimeDependencies(
-        session_factory=reference_runtime.session_factory,
-        agent=agent,
-        clock=reference_runtime.clock,
+    A vLLM role needs its own endpoint; two vLLM roles with different
+    configurations need distinct endpoints. A hosted role takes no endpoint
+    and needs its key in the environment. Identical configurations still
+    get two agents, so the roles never share history.
+    """
+
+    factory.preflight({"reference": reference, "candidate": candidate})
+    return (
+        factory(reference, mode="plan", role="reference"),
+        factory(candidate, mode="plan", role="candidate"),
     )
 
 
@@ -183,6 +143,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     runtime: RuntimeDependencies | None = None,
+    runtime_factory: RuntimeFactory | None = None,
 ) -> int:
     if argv is None and len(sys.argv) <= 1:
         return 2
@@ -224,28 +185,37 @@ def main(
         task_set = _load_task_set(_load_json(args.task_set))
         settings = GateSettings.from_dict(_load_json(args.settings))
         plan_evidence = _load_plan_evidence(_load_json(args.plan_evidence))
-        if runtime is not None:
+        require_gate_capabilities(
+            reference, candidate, plan_evidence.required_statistics
+        )
+        candidate_runtime: RuntimeDependencies | None = None
+        if runtime is not None or runtime_factory is not None:
             if args.live_runtime:
                 raise GateExecutionError(
                     "injected runtime cannot be combined with --live-runtime"
                 )
-            active_runtime = runtime
-        elif args.live_runtime:
-            enforce_committed_provenance(reference)
-            if args.reference_endpoint is None or args.candidate_endpoint is None:
-                raise GateExecutionError(
-                    "--live-runtime requires --reference-endpoint and --candidate-endpoint"
+            if runtime_factory is not None:
+                active_runtime, candidate_runtime = _role_runtimes(
+                    reference, candidate, runtime_factory
                 )
-            active_runtime = _live_runtime(
-                reference,
-                candidate,
-                reference_endpoint=args.reference_endpoint,
-                candidate_endpoint=args.candidate_endpoint,
+            else:
+                active_runtime = runtime
+        elif args.live_runtime:
+            enforce_committed_provenance(reference, candidate)
+            factory = LiveRuntimeFactory.from_endpoints(
+                reference=args.reference_endpoint,
+                candidate=args.candidate_endpoint,
             )
+            try:
+                active_runtime, candidate_runtime = _role_runtimes(
+                    reference, candidate, factory
+                )
+            except RuntimeFactoryError as error:
+                raise GateExecutionError(str(error)) from error
         else:
             raise GateExecutionError(
                 "runtime required: inject runtime for CPU or pass --live-runtime "
-                "with --reference-endpoint and --candidate-endpoint"
+                "(vLLM roles also need --reference-endpoint/--candidate-endpoint)"
             )
         decision = run_offline_gate(
             reference,
@@ -254,6 +224,7 @@ def main(
             settings=settings,
             runtime=active_runtime,
             plan_evidence=plan_evidence,
+            candidate_runtime=candidate_runtime,
         )
         if args.episode_store is not None:
             store = EpisodeStore(Path(args.episode_store))
@@ -267,6 +238,7 @@ def main(
         SelectionError,
         StorageError,
         ProvenanceError,
+        EpisodeRejected,
     ) as error:
         print(str(error) or "offline gate execution failed", file=sys.stderr)
         return 2

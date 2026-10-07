@@ -1,6 +1,19 @@
 # Scripts
 
-`run_offline_gate.py` runs the plan-only offline gate. It requires `--reference`, `--candidate`, `--task-set`, and `--settings`. With no arguments it exits 2. A PASS prints a public JSON decision and exits 0; a BLOCK exits 1. It is not a protocol release gate.
+`run_offline_gate.py` runs the plan-only offline gate. It requires `--reference`, `--candidate`, `--task-set`, `--settings`, and `--plan-evidence`. `--live-runtime` builds one plan-mode runtime per role through `runtime/factory.py`: a vLLM role needs `--reference-endpoint` or `--candidate-endpoint`, a hosted role takes none and reads its key from the environment. A hosted configuration with `kl` in `required_statistics` fails before any runtime is built. Provider and preflight failures exit 2 and are not BLOCK. `--episode-store` records the validation artifact for admission. With no arguments it exits 2. A PASS prints a public JSON decision and exits 0; a BLOCK exits 1. It is not a protocol release gate.
+
+The hosted lifecycle commands (runbook: `docs/HOSTED_LIFECYCLE.md`) each exit 2 when bare and print no task ids:
+
+- `evaluation/build_run_configuration.py` builds a run configuration from a committed template and a local manifest, binds HEAD, refuses a dirty tree or an output under `results/`, and runs the tool-access preflight.
+- `evaluation/collect_baseline.py` runs production and do-nothing episodes on fresh worlds with `--repetitions`; pair keys are `<task id>#r<n>` and missing outcomes stay null. The output is local.
+- `evaluation/simulate_power.py` simulates clustered paired power and the null rejection rate from a local baseline file. `evaluation/assess_harm_study.py --baselines` reads the same file; its normal approximation stays advisory.
+- `evaluation/rehearse_dev_stream.py` runs the scheduled monitor stream on a dev task set with the benchmark's code and a resumable local state file.
+- `evaluation/export_usage.py` writes public hosted-usage aggregates from one store; cost only with `--pricing`.
+- `evaluation/lock_protocol.py --require LOCK --commitment PATH` writes the public commitment of a local lock.
+- `data/annotate_task_metadata.py` adds difficulty and required apps to a git-ignored `train` or `dev` manifest; `test_*` is refused.
+- `data/plan_specs.py skeleton|validate` authors and checks local task plan specs for the gate's semantic plan features.
+
+`evaluation/characterize_harm.py` and `benchmark/run_lifecycle_benchmark.py` take `--live-runtime` with role endpoints and build runtimes through the same factory; `LLM_BEHAVIOR_CI_RUNTIME` remains the CPU injection hook. The benchmark also takes `--schedule` (a `benchmark-schedule-v1` document) and `--task-metadata`. `service/serve.py` routes runtimes by configuration hash: a hosted configuration takes no `--*-base-url`, a vLLM configuration needs one, and `--task-metadata` supplies difficulty slices.
 
 `evaluation/profile_capture_limits.py` reads one local A/A capture and writes a public limit profile. It requires `--capture`, `--output`, `--label`, `--step-limit`, and `--max-tokens`. It does not run inference and does not change those limits. With no arguments it exits 2. Plan token lengths in the profile are not execute-limit evidence.
 

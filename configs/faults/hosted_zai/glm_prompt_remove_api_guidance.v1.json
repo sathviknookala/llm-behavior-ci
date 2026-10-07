@@ -1,0 +1,11 @@
+{
+  "fault_id": "glm_prompt_remove_api_guidance",
+  "version": "1",
+  "kind": "prompt",
+  "patches": [
+    {
+      "path": "agent.prompt.prompt_version",
+      "value": "prompt-no-api-guidance"
+    }
+  ]
+}

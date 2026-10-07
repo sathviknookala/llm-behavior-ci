@@ -162,6 +162,58 @@ class BaselineRunnerTests(unittest.TestCase):
         self.assertEqual(sessions[0].evaluate_count, 1)
         self.assertEqual(sessions[1].evaluate_count, 1)
 
+    def test_repetitions_get_distinct_pair_keys_and_manifest_apps(self) -> None:
+        config = _config()
+        clock = _clock()
+        _clock_holder.clear()
+        _clock_holder.append(clock)
+
+        class Bare(Session):
+            required_apps = None
+
+        arrivals = (
+            TaskArrival(
+                index=0,
+                task_id="task-dev",
+                scenario_id="scenario-1",
+                scheduled_offset_seconds=0.0,
+                stream_seed=17,
+            ),
+        )
+        rows = []
+        for repetition in range(2):
+            rows.extend(
+                collect_baseline_outcomes(
+                    arrivals,
+                    config,
+                    production_runtime=RuntimeDependencies(
+                        session_factory=Bare, agent=StopAgent(), clock=clock
+                    ),
+                    do_nothing_runtime=RuntimeDependencies(
+                        session_factory=Bare, agent=StopAgent(), clock=clock
+                    ),
+                    repetition=repetition,
+                    required_apps_for=lambda task_id: ("spotify", "supervisor"),
+                )
+            )
+        self.assertEqual(
+            [item.pair_key for item in rows],
+            ["task-dev#r0", "task-dev#r0", "task-dev#r1", "task-dev#r1"],
+        )
+        self.assertEqual({item.app for item in rows}, {"spotify"})
+        with self.assertRaises(EpisodeRejected):
+            collect_baseline_outcomes(
+                arrivals,
+                config,
+                production_runtime=RuntimeDependencies(
+                    session_factory=Bare, agent=StopAgent(), clock=clock
+                ),
+                do_nothing_runtime=RuntimeDependencies(
+                    session_factory=Bare, agent=StopAgent(), clock=clock
+                ),
+                repetition=-1,
+            )
+
     def test_closed_splits_and_results_paths_are_refused(self) -> None:
         config = _config("test_normal")
         with self.assertRaisesRegex(EpisodeRejected, "closed"):

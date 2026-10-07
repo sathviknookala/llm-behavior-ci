@@ -383,7 +383,8 @@ class FaultPatchValidationTests(unittest.TestCase):
         )
         with self.assertRaises(FaultError) as ctx:
             apply_fault(base, fault)
-        self.assertIn("outside the declared fault", str(ctx.exception))
+        self.assertIn("does not change model.quantization.method", str(ctx.exception))
+        self.assertIn("declared_noop", str(ctx.exception))
 
     def test_lora_and_api_documentation_are_now_representable(self) -> None:
         base = _base()

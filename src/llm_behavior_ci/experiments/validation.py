@@ -1767,9 +1767,17 @@ def main_harm(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--spec", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--results-root", default=None)
+    parser.add_argument("--baselines", default=None)
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
-        report = _harm_from_payload(_load_json(Path(args.spec)))
+        payload = _load_json(Path(args.spec))
+        if args.baselines is not None:
+            if not isinstance(payload, dict):
+                raise ValidationError("harm spec must be an object")
+            if payload.get("outcomes"):
+                raise ValidationError("pass outcomes in the spec or --baselines, not both")
+            payload = {**payload, "outcomes": load_local_baseline_rows(Path(args.baselines))}
+        report = _harm_from_payload(payload)
         root = Path(args.results_root) if args.results_root else default_results_root()
         write_public_report(
             public_harm_summary(report),
@@ -4265,6 +4273,24 @@ def _harm_from_payload(payload: object) -> HarmStudyReport:
         )
     except KeyError as error:
         raise ValidationError("harm spec is missing a field") from error
+
+
+def load_local_baseline_rows(path: Path) -> list[object]:
+    """Read the ``outcomes`` list of a ``write_local_baselines`` file."""
+
+    payload = _load_json(path)
+    if not isinstance(payload, dict) or payload.get("visibility") != "local":
+        raise ValidationError("baselines must be a local baseline file")
+    rows = payload.get("outcomes")
+    if not isinstance(rows, list) or not rows:
+        raise ValidationError("baseline file has no outcomes")
+    return rows
+
+
+def load_local_baselines(path: Path) -> tuple[BaselineOutcome, ...]:
+    """Load ``BaselineOutcome`` rows from a local baseline file."""
+
+    return tuple(_baseline_from_dict(item) for item in load_local_baseline_rows(path))
 
 
 def _baseline_from_dict(payload: object) -> BaselineOutcome:

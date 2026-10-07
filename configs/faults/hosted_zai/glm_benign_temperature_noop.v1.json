@@ -1,0 +1,12 @@
+{
+  "fault_id": "glm_benign_temperature_noop",
+  "version": "1",
+  "kind": "benign_control",
+  "control": "declared_noop",
+  "patches": [
+    {
+      "path": "agent.sampling.temperature",
+      "value": 1.0
+    }
+  ]
+}

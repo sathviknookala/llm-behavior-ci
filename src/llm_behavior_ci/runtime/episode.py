@@ -308,9 +308,51 @@ def run_episode(
     ``session.evaluate`` on a world that is already open. A closed session,
     a world that was never opened, or any failure of that attempt leaves
     the outcome unset. ``scenario_id`` is stored on the local task reference
-    when the caller has one; it is not ground truth.
+    when the caller has one; it is not ground truth. A hosted agent's
+    sanitized ``ProviderCall`` rows, including failed requests, are
+    attached as ``provider_calls``; other agents attach none.
     """
 
+    _drain_provider_calls(runtime.agent)
+    result = _run_episode_steps(
+        task_id,
+        config,
+        mode,
+        run=run,
+        runtime=runtime,
+        pair_id=pair_id,
+        on_start=on_start,
+        on_step=on_step,
+        scenario_id=scenario_id,
+        evaluate_after_runtime_failure=evaluate_after_runtime_failure,
+    )
+    calls = _drain_provider_calls(runtime.agent)
+    if calls:
+        result = replace(result, provider_calls=calls)
+    return result
+
+
+def _drain_provider_calls(agent: object) -> tuple:
+    drain = getattr(agent, "drain_provider_calls", None)
+    if not callable(drain):
+        return ()
+    calls = drain()
+    return tuple(calls) if isinstance(calls, (tuple, list)) else ()
+
+
+def _run_episode_steps(
+    task_id: str,
+    config: RunConfiguration,
+    mode: Literal["plan", "execute"],
+    *,
+    run: RunIdentity,
+    runtime: RuntimeDependencies,
+    pair_id: str | None,
+    on_start: Callable[[EpisodeIdentity, RunIdentity], None] | None,
+    on_step: Callable[[ModelStep | ToolStep], None] | None,
+    scenario_id: str | None,
+    evaluate_after_runtime_failure: bool,
+) -> EpisodeResult:
     _reject(task_id, config, mode, run)
     identity = new_episode_identity(run, pair_id=pair_id)
     if on_start is not None:

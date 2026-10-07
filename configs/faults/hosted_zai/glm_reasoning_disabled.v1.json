@@ -1,0 +1,11 @@
+{
+  "fault_id": "glm_reasoning_disabled",
+  "version": "1",
+  "kind": "reasoning",
+  "patches": [
+    {
+      "path": "model.thinking_type",
+      "value": "disabled"
+    }
+  ]
+}

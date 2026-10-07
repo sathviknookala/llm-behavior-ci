@@ -32,7 +32,7 @@ def _spec(**overrides: object) -> TaskPlanSpec:
 
 class SchemaTests(unittest.TestCase):
     def test_schema_version_is_stable_and_named(self) -> None:
-        self.assertEqual(PLAN_FEATURE_SCHEMA_VERSION, "plan-features-v1")
+        self.assertEqual(PLAN_FEATURE_SCHEMA_VERSION, "plan-features-v2")
         self.assertTrue(STRUCTURAL_PLAN_FEATURES)
         self.assertTrue(SEMANTIC_PLAN_FEATURES)
         self.assertEqual(

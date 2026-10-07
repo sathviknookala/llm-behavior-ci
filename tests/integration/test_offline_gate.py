@@ -444,6 +444,82 @@ class OfflineGateIntegrationTests(unittest.TestCase):
             self.assertNotIn('"outcome": "PASS"', stderr.getvalue())
             self.assertNotIn('"outcome": "BLOCK"', stderr.getvalue())
 
+    def _hosted_cli(self, evidence: PlanEvidenceInputs, factory) -> tuple[int, str, str]:
+        from llm_behavior_ci.experiments.faults import apply_fault, load_fault
+        from llm_behavior_ci.experiments.run_config import build_run_configuration
+
+        main = _load_cli_main()
+        task_set = _task_set()
+        qwen = _config(task_set, run_seed=7)
+        root_dir = Path(__file__).resolve().parents[2]
+        template = json.loads(
+            (root_dir / "configs/models/glm_5_3_general_experimental.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        reference = build_run_configuration(
+            template,
+            qwen.task,
+            run_seed=7,
+            git_commit=qwen.git_commit,
+            protocol_hash=qwen.protocol_hash,
+        )
+        candidate = apply_fault(
+            reference,
+            load_fault(root_dir / "configs/faults/hosted_zai/glm_reasoning_disabled.v1.json"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {}
+            for name, payload in (
+                ("reference", reference.to_dict()),
+                ("candidate", candidate.to_dict()),
+                ("task-set", _task_set_dict(task_set)),
+                ("settings", _settings().to_dict()),
+                ("plan-evidence", plan_evidence_to_dict(evidence)),
+            ):
+                paths[name] = root / f"{name}.json"
+                paths[name].write_text(json.dumps(payload), encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = main(
+                    [item for name, path in paths.items() for item in (f"--{name}", str(path))],
+                    runtime_factory=factory,
+                )
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_cli_hosted_candidate_kl_fails_preflight_and_bootstrap_mmd_runs(self) -> None:
+        from llm_behavior_ci.runtime.factory import StaticRuntimeFactory
+
+        class Refusing(StaticRuntimeFactory):
+            def __call__(self, configuration, *, mode, role="reference"):
+                raise AssertionError("no runtime may be built before KL preflight")
+
+        code, stdout, stderr = self._hosted_cli(_evidence(), Refusing(reference=_runtime()))
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("remove kl from required_statistics", stderr)
+
+        built: list[tuple[str, str]] = []
+
+        class Recording(StaticRuntimeFactory):
+            def __call__(self, configuration, *, mode, role="reference"):
+                built.append((mode, role))
+                return super().__call__(configuration, mode=mode, role=role)
+
+        code, stdout, stderr = self._hosted_cli(
+            _evidence(required_statistics=("plan_quality", "mmd")),
+            Recording(reference=_runtime(), candidate=_runtime()),
+        )
+        self.assertIn(code, (0, 1), stderr)
+        self.assertEqual(sorted(built), [("plan", "candidate"), ("plan", "reference")])
+        document = json.loads(stdout)
+        self.assertEqual(
+            sorted(item["method"] for item in document["statistics"]),
+            sorted(item["method"] for item in document["statistics"] if "kl" not in item["method"]),
+        )
+
     def test_gate_library_pass_is_stable(self) -> None:
         task_set = _task_set()
         reference = _config(task_set, run_seed=7)

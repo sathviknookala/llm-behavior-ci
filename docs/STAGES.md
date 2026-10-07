@@ -2,6 +2,8 @@
 
 Read before starting or closing a stage. No stage is complete. Implementation has begun across stages 0–6, but a stage is complete only when its gate's evidence is committed. The current task stream, fake-driven episode path, paired runner, A/A capture command, statistics library, validation runner, versioned fault diffs, plan-only offline gate, canary controller, production monitor, SQLite store, public export, lifecycle benchmark harness, and shared-stream detector replay are reusable components; they are not stage-gate evidence.
 
+The hosted GLM path (`docs/HOSTED_LIFECYCLE.md`) adds code for stages 1–6: a shared runtime factory, hosted plan mode, a provider-aware gate, service, harm, baseline, and benchmark CLIs, a hosted fault catalog, a hashed arrival schedule with a simulated clock, per-slice references, restart-durable alert incidents, empirical power, usage accounting, and a public protocol commitment. None of it has run against Z.AI, and none of it closes a gate. CPU tests of that code are software evidence only.
+
 Suggested numeric defaults belong in `EVAL_PROTOCOL.md` and stay open until that file is pre-registered. Do not invent a threshold in a script.
 
 Keep the order. Stages 0–2 produce the noise floor and the null checks. Stages 3, 4, and 5 build the three evaluation tiers in `PROJECT_SPEC.md`: the Tier 1 offline CI regression gate, the Tier 2 canary, and Tier 3 continuous production monitoring. The benchmark is stage 6 and does not start before `docs/EVAL_PROTOCOL.md` is pre-registered and committed.

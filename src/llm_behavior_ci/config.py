@@ -1937,7 +1937,10 @@ class DistributionalMonitorSettings:
     enter the chi-square test). ``window_episodes`` is how many observations
     accumulate before one look. ``correction`` selects the repeated-look
     adjustment the same way ``lifecycle.detectors.build_hourly_window_detector``
-    does for scalar fixed-window tests.
+    does for scalar fixed-window tests. ``slice_reference_counts``, when
+    non-empty, gives each slice its own frozen distribution and requires
+    ``reference_source``; a slice without an entry is then refused instead
+    of being compared with the aggregate distribution.
     """
 
     signal: str
@@ -1945,6 +1948,8 @@ class DistributionalMonitorSettings:
     window_episodes: int
     alpha: float
     correction: str
+    slice_reference_counts: tuple[tuple[str, tuple[tuple[str, int], ...]], ...] = ()
+    reference_source: str | None = None
 
     def __post_init__(self) -> None:
         _choice(self.signal, DISTRIBUTIONAL_SIGNALS, "signal")
@@ -1952,15 +1957,34 @@ class DistributionalMonitorSettings:
         _positive(self.window_episodes, "window_episodes")
         _open_probability(self.alpha, "alpha")
         _choice(self.correction, DISTRIBUTIONAL_CORRECTIONS, "correction")
+        names = [name for name, _counts in self.slice_reference_counts]
+        if len(set(names)) != len(names) or any(
+            not isinstance(name, str) or name == "" for name in names
+        ):
+            raise ConfigError("slice_reference_counts must name each slice once")
+        for name, counts in self.slice_reference_counts:
+            _reference_counts(counts, f"slice_reference_counts {name}")
+        if self.slice_reference_counts and (
+            not isinstance(self.reference_source, str) or self.reference_source == ""
+        ):
+            raise ConfigError("slice_reference_counts require a reference_source")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "signal": self.signal,
             "reference_counts": [list(item) for item in self.reference_counts],
             "window_episodes": self.window_episodes,
             "alpha": self.alpha,
             "correction": self.correction,
         }
+        if self.slice_reference_counts:
+            payload["slice_reference_counts"] = [
+                [name, [list(item) for item in counts]]
+                for name, counts in self.slice_reference_counts
+            ]
+        if self.reference_source is not None:
+            payload["reference_source"] = self.reference_source
+        return payload
 
     @classmethod
     def from_dict(
@@ -1969,18 +1993,42 @@ class DistributionalMonitorSettings:
         name: str = "distributional monitor settings",
     ) -> DistributionalMonitorSettings:
         mapping = _object(payload, name)
-        _require_fields(mapping, cls, name)
-        raw_counts = mapping["reference_counts"]
-        if not isinstance(raw_counts, (list, tuple)):
-            raise ConfigError(f"{name} reference_counts must be a list of pairs")
-        counts = tuple(
-            (str(item[0]), int(item[1]))
-            for item in raw_counts
-            if isinstance(item, (list, tuple)) and len(item) == 2
+        _require_fields(
+            mapping,
+            cls,
+            name,
+            optional=frozenset({"slice_reference_counts", "reference_source"}),
         )
-        if len(counts) != len(raw_counts):
-            raise ConfigError(f"{name} reference_counts entries must be pairs")
+
+        def count_pairs(raw: object, label: str) -> tuple[tuple[str, int], ...]:
+            if not isinstance(raw, (list, tuple)):
+                raise ConfigError(f"{name} {label} must be a list of pairs")
+            pairs = tuple(
+                (str(item[0]), int(item[1]))
+                for item in raw
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            )
+            if len(pairs) != len(raw):
+                raise ConfigError(f"{name} {label} entries must be pairs")
+            return pairs
+
+        counts = count_pairs(mapping["reference_counts"], "reference_counts")
+        raw_slices = mapping.get("slice_reference_counts", [])
+        if not isinstance(raw_slices, (list, tuple)):
+            raise ConfigError(f"{name} slice_reference_counts must be a list")
+        slices: list[tuple[str, tuple[tuple[str, int], ...]]] = []
+        for item in raw_slices:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ConfigError(
+                    f"{name} slice_reference_counts entries must be [slice, counts]"
+                )
+            slices.append((str(item[0]), count_pairs(item[1], "slice_reference_counts")))
         return _construct(
             name,
-            lambda: _load(cls, mapping, reference_counts=counts),
+            lambda: _load(
+                cls,
+                mapping,
+                reference_counts=counts,
+                slice_reference_counts=tuple(slices),
+            ),
         )

@@ -460,9 +460,6 @@ class AnthropicRequestTests(unittest.TestCase):
         urlopen.assert_not_called()
         self.assertIn("unsupported", str(caught.exception))
         self.assertNotIn("token_id", str(caught.exception))
-        agent.set_mode("plan")
-        with self.assertRaises(UnsupportedCapability):
-            agent.generate_turn(tool_output=None)
 
     def test_missing_key_fails_during_runtime_construction(self) -> None:
         config = _sonnet_config()

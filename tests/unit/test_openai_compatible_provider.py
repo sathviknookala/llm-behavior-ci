@@ -665,9 +665,6 @@ class OpenAICompatibleRequestTests(unittest.TestCase):
                     messages=[{"role": "user", "content": "plan"}],
                     plan_text="1. list playlists",
                 )
-            agent.set_mode("plan")
-            with self.assertRaises(UnsupportedCapability):
-                agent.generate_turn(tool_output=None)
         urlopen.assert_not_called()
         self.assertIn("teacher-forced plan KL is unsupported", str(caught.exception))
 

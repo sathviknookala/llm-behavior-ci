@@ -1,0 +1,15 @@
+{
+  "fault_id": "glm_api_documentation_one_app",
+  "version": "1",
+  "kind": "api_documentation",
+  "patches": [
+    {
+      "path": "agent.api_docs_version",
+      "value": "api-docs-corrupt-v1"
+    },
+    {
+      "path": "agent.api_docs_app",
+      "value": "supervisor"
+    }
+  ]
+}

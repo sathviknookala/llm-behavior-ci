@@ -476,6 +476,71 @@ class ModelStep(Record):
         return _from_mapping(cls, mapping, label)
 
 
+PROVIDER_CALL_STATUSES = frozenset({"succeeded", "failed"})
+PROVIDER_ERROR_KINDS = frozenset(
+    {
+        "http_error",
+        "network_error",
+        "malformed_response",
+        "context_length_exceeded",
+        "provider_failure",
+    }
+)
+_USAGE_COUNT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+
+
+@dataclass(frozen=True)
+class ProviderCall(Record):
+    """Sanitized accounting for one hosted model request.
+
+    One row per logical request, including a request that failed after
+    its retries. ``attempts`` counts HTTP attempts, so a retried request is
+    visible. A usage count the provider did not report stays ``None``; it
+    is never zero by default. No prompt, output, reasoning text, header, or
+    key is stored here.
+    """
+
+    provider: str
+    model_id: str
+    mode: str
+    request_index: int
+    attempts: int
+    status: str
+    latency_seconds: float
+    error_kind: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        _token(self.provider, "provider")
+        _line(self.model_id, "model_id")
+        _choice(self.mode, MODES, "mode")
+        _nonnegative_int(self.request_index, "request_index")
+        _nonnegative_int(self.attempts, "attempts")
+        _choice(self.status, PROVIDER_CALL_STATUSES, "status")
+        _nonnegative_float(self.latency_seconds, "latency_seconds")
+        if self.status == "succeeded":
+            if self.error_kind is not None:
+                raise RecordError("a succeeded provider call has no error kind")
+            if self.attempts < 1:
+                raise RecordError("a succeeded provider call needs an attempt")
+        else:
+            _choice(self.error_kind, PROVIDER_ERROR_KINDS, "error_kind")
+        for name in _USAGE_COUNT_FIELDS:
+            value = getattr(self, name)
+            if value is not None:
+                _nonnegative_int(value, name)
+
+
 @dataclass(frozen=True)
 class RecordedError(Record):
     """An error recorded on a tool step or on the episode.
@@ -630,9 +695,17 @@ class EpisodeResult(Record):
     termination_reason: str
     episode_errors: tuple[RecordedError, ...]
     role: str | None
+    provider_calls: tuple[ProviderCall, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_episode(self)
+        _instances(self.provider_calls, ProviderCall, "provider_calls")
+
+    def to_dict(self) -> dict[str, object]:
+        payload = super().to_dict()
+        if not self.provider_calls:
+            payload.pop("provider_calls", None)
+        return payload
 
     @property
     def recorded_errors(self) -> tuple[RecordedError, ...]:
@@ -1051,6 +1124,65 @@ class AggregateRecord(Record):
         )
 
 
+@dataclass(frozen=True)
+class UsageAggregate(Record):
+    """Public hosted-request accounting for one provider, model, and mode.
+
+    Token totals sum only the requests that reported the count; the
+    matching ``*_unknown_requests`` field counts the requests that did not.
+    A total is ``None`` when no request reported it. ``cost`` is set only
+    from a versioned pricing input and only when no succeeded request has
+    an unknown count in a priced field; it is never estimated.
+    """
+
+    split: str
+    configuration_hash: str
+    provider: str
+    model_id: str
+    mode: str
+    request_count: int
+    failed_request_count: int
+    attempt_count: int
+    latency_seconds: float
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    input_tokens_unknown_requests: int = 0
+    output_tokens_unknown_requests: int = 0
+    cache_read_tokens_unknown_requests: int = 0
+    cache_write_tokens_unknown_requests: int = 0
+    reasoning_tokens_unknown_requests: int = 0
+    pricing_version: str | None = None
+    currency: str | None = None
+    cost: float | None = None
+
+    def __post_init__(self) -> None:
+        _choice(self.split, SPLITS, "split")
+        _sha256(self.configuration_hash, "configuration_hash")
+        _token(self.provider, "provider")
+        _line(self.model_id, "model_id")
+        _choice(self.mode, MODES, "mode")
+        _nonnegative_int(self.request_count, "request_count")
+        _nonnegative_int(self.failed_request_count, "failed_request_count")
+        _nonnegative_int(self.attempt_count, "attempt_count")
+        _nonnegative_float(self.latency_seconds, "latency_seconds")
+        if self.failed_request_count > self.request_count:
+            raise RecordError("failed requests exceed requests")
+        for name in _USAGE_COUNT_FIELDS:
+            value = getattr(self, name)
+            if value is not None:
+                _nonnegative_int(value, name)
+            _nonnegative_int(getattr(self, f"{name}_unknown_requests"), name)
+        if self.cost is not None:
+            _nonnegative_float(self.cost, "cost")
+            _line(self.pricing_version, "pricing_version")
+            _line(self.currency, "currency")
+        elif self.currency is not None and self.pricing_version is None:
+            raise RecordError("a currency needs a pricing version")
+
+
 def assert_public_payload(payload: object) -> None:
     """Reject task content and local records in a public payload."""
 
@@ -1086,6 +1218,7 @@ def _mark(cls: type[Record], visibility: str, record_name: str) -> None:
 
 _mark(TokenLogprob, LOCAL, "token logprob")
 _mark(ModelStep, LOCAL, "model step")
+_mark(ProviderCall, LOCAL, "provider call")
 _mark(RecordedError, LOCAL, "recorded error")
 _mark(ToolStep, LOCAL, "tool step")
 _mark(EvaluatorOutcome, LOCAL, "evaluator outcome")
@@ -1099,3 +1232,4 @@ _mark(TaskMixObservation, LOCAL, "task mix observation")
 _mark(StatisticalEvidence, PUBLIC, "statistical evidence")
 _mark(LifecycleDecision, PUBLIC, "lifecycle decision")
 _mark(AggregateRecord, PUBLIC, "aggregate record")
+_mark(UsageAggregate, PUBLIC, "usage aggregate")

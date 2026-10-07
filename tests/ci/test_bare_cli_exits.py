@@ -131,6 +131,33 @@ class BareCliExitTests(unittest.TestCase):
         completed = _bare("scripts/evaluation/smoke_live_episode.py")
         self.assertEqual(completed.returncode, 2)
 
+    def test_new_lifecycle_commands_exit_2(self) -> None:
+        for script in (
+            "scripts/evaluation/build_run_configuration.py",
+            "scripts/evaluation/collect_baseline.py",
+            "scripts/evaluation/rehearse_dev_stream.py",
+            "scripts/evaluation/simulate_power.py",
+            "scripts/evaluation/export_usage.py",
+            "scripts/data/annotate_task_metadata.py",
+            "scripts/data/plan_specs.py",
+        ):
+            with self.subTest(script=script):
+                completed = _bare(script)
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertNotIn("Traceback", completed.stderr)
+
+    def test_benchmark_without_runtime_source_exits_2(self) -> None:
+        completed = _run(
+            "scripts/benchmark/run_lifecycle_benchmark.py",
+            [
+                "--protocol", "p.json", "--fault", "f.json", "--train-tasks", "t.json",
+                "--test-normal-tasks", "n.json", "--baselines", "b.json",
+                "--plan-evidence", "e.json", "--checkpoint", "c.json",
+            ],
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("--live-runtime", completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

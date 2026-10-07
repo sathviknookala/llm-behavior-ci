@@ -15,6 +15,7 @@ from llm_behavior_ci.config import (
     ConfigError,
     RunConfiguration,
     hashed_values,
+    hosted_provider,
     new_run_identity,
     run_configuration_hash,
 )
@@ -51,6 +52,7 @@ _KINDS = frozenset(
         "prompt",
         "template",
         "sampling",
+        "reasoning",
         "token_limit",
         "step_limit",
         "api_documentation",
@@ -110,17 +112,22 @@ _BENIGN_CONTROLS = frozenset(
         "noop_redeploy",
         "batch_invariant",
         "logging_refactor",
+        "declared_noop",
     }
 )
+_VLLM_MODEL_PATHS = frozenset(
+    {
+        "model.model.repository",
+        "model.model.revision",
+        "model.tokenizer.repository",
+        "model.tokenizer.revision",
+    }
+)
+_ZAI_REASONING_PATHS = frozenset({"model.thinking_type", "model.reasoning_effort"})
+_ANTHROPIC_REASONING_PATHS = frozenset({"model.thinking_mode", "model.effort"})
 _KIND_PATHS: Mapping[str, frozenset[str]] = {
-    "model": frozenset(
-        {
-            "model.model.repository",
-            "model.model.revision",
-            "model.tokenizer.repository",
-            "model.tokenizer.revision",
-        }
-    ),
+    "model": _VLLM_MODEL_PATHS | frozenset({"model.model_id"}),
+    "reasoning": _ZAI_REASONING_PATHS | _ANTHROPIC_REASONING_PATHS,
     "quantization": frozenset({"model.quantization.method"}),
     "prompt": frozenset(
         {
@@ -135,10 +142,17 @@ _KIND_PATHS: Mapping[str, frozenset[str]] = {
             "agent.sampling.top_p",
             "agent.sampling.top_k",
             "agent.sampling.min_p",
+            "agent.sampling.do_sample",
         }
     ),
-    "token_limit": frozenset({"agent.sampling.max_tokens"}),
-    "step_limit": frozenset({"agent.step_limit"}),
+    "token_limit": frozenset(
+        {
+            "agent.sampling.max_tokens",
+            "agent.sampling.plan_max_tokens",
+            "agent.sampling.execute_max_tokens",
+        }
+    ),
+    "step_limit": frozenset({"agent.step_limit", "agent.execute_max_model_turns"}),
     "api_documentation": frozenset(
         {
             "agent.api_docs_version",
@@ -159,6 +173,7 @@ _BENIGN_PATHS: Mapping[str, frozenset[str]] = {
     "batch_invariant": frozenset({"model.serving.batch_invariant"}),
     "logging_refactor": frozenset({"git_commit"}),
 }
+_DECLARED_NOOP_PATHS = frozenset().union(*_KIND_PATHS.values())
 _CATALOG_KEYS = frozenset(
     {
         "fault_id",
@@ -215,6 +230,12 @@ class FaultSpec:
                 )
             if self.schema_request is not None:
                 raise FaultError("schema_request must be None")
+            if self.control == "declared_noop":
+                if not paths:
+                    raise FaultError("declared_noop names at least one patch")
+                for path in paths:
+                    _validate_patch_path(path, _DECLARED_NOOP_PATHS)
+                return
             allowed = _BENIGN_PATHS[self.control]
             path_set = frozenset(paths)
             for path in paths:
@@ -266,16 +287,92 @@ class LiveFaultAvailability:
     reason: str | None = None
 
 
-def live_fault_available(fault: FaultSpec) -> LiveFaultAvailability:
+def _provider(base: RunConfiguration) -> str:
+    return hosted_provider(base.model) or "vllm"
+
+
+def provider_fault_support(base: RunConfiguration, fault: FaultSpec) -> str | None:
+    """Why ``fault`` cannot change what ``base``'s provider is sent, or ``None``.
+
+    vLLM takes weights, quantization, adapters, the chat-template thinking
+    switch, and every vLLM sampling field. Z.AI takes ``model_id``,
+    ``thinking_type``, ``reasoning_effort``, and temperature, top-p, and
+    ``do_sample``, where temperature and top-p are sent only while
+    ``do_sample`` is true. Anthropic takes ``model_id``, ``thinking_mode``,
+    and ``effort``, and no sampling field. Prompt, API-documentation,
+    token-cap, and step-limit faults apply to every provider.
+    """
+
+    provider = _provider(base)
+    paths = frozenset(patch.path for patch in fault.patches)
+    if fault.kind == "benign_control":
+        if fault.control == "batch_invariant" and provider != "vllm":
+            return "batch_invariant is a vLLM serving flag; a hosted provider has none"
+        return None
+    if provider == "vllm":
+        if "model.model_id" in paths:
+            return "model.model_id is a hosted-provider field; a vLLM model fault patches model.model.*"
+        if fault.kind == "reasoning":
+            return "reasoning faults patch hosted-provider fields; vLLM uses the template kind"
+        if "agent.sampling.do_sample" in paths:
+            return "vLLM requests do not carry do_sample"
+        return None
+    if fault.kind in {"quantization", "lora"}:
+        return f"{fault.kind} changes served weights; hosted provider {provider} serves fixed weights"
+    if fault.kind == "template":
+        return (
+            f"hosted provider {provider} has no chat-template thinking switch; "
+            "use a reasoning fault"
+        )
+    if paths & _VLLM_MODEL_PATHS:
+        return f"hosted provider {provider} is selected by model.model_id, not model.model.*"
+    if fault.kind == "reasoning":
+        allowed = _ZAI_REASONING_PATHS if provider == "zai" else _ANTHROPIC_REASONING_PATHS
+        extra = sorted(paths - allowed)
+        if extra:
+            return f"hosted provider {provider} does not take {', '.join(extra)}"
+        return None
+    if fault.kind == "sampling":
+        if provider == "anthropic":
+            return "the Anthropic configuration sends no sampling fields"
+        unsupported = sorted(
+            paths & {"agent.sampling.top_k", "agent.sampling.min_p"}
+        )
+        if unsupported:
+            return f"hosted provider {provider} is not sent {', '.join(unsupported)}"
+        do_sample = base.agent.sampling.do_sample
+        for patch in fault.patches:
+            if patch.path == "agent.sampling.do_sample":
+                do_sample = patch.value
+        if not do_sample and any(
+            patch.path in {"agent.sampling.temperature", "agent.sampling.top_p"}
+            and patch.value is not None
+            for patch in fault.patches
+        ):
+            return "temperature and top_p are not sent while do_sample is false"
+        return None
+    return None
+
+
+def live_fault_available(
+    fault: FaultSpec,
+    base: RunConfiguration | None = None,
+) -> LiveFaultAvailability:
     """Report whether a catalog fault can be executed live.
 
     Schema-gap and GPU-backed faults stay in coverage reports as unavailable
     rather than absent. ``apply_fault`` still rejects schema-gap faults and
-    does not apply an empty patch for them.
+    does not apply an empty patch for them. With ``base``, a fault the base
+    configuration's provider cannot receive is reported unavailable with
+    the provider reason first.
     """
 
     if not isinstance(fault, FaultSpec):
         raise FaultError("live_fault_available requires a fault spec")
+    if base is not None:
+        reason = provider_fault_support(base, fault)
+        if reason is not None:
+            return LiveFaultAvailability(available=False, reason=reason)
     if fault.schema_request is not None:
         return LiveFaultAvailability(available=False, reason=str(fault.schema_request))
     if fault.kind in _LIVE_UNAVAILABLE_KINDS:
@@ -563,6 +660,8 @@ def _patches_for_base(
     the horizon it replaces. Other kinds keep their declared paths.
     """
 
+    if fault.kind == "token_limit":
+        return _token_patches_for_base(base, fault)
     if fault.kind != "step_limit":
         return fault.patches
     rewritten: list[FaultPatch] = []
@@ -586,6 +685,63 @@ def _patches_for_base(
     return tuple(rewritten)
 
 
+def _token_patches_for_base(
+    base: RunConfiguration,
+    fault: FaultSpec,
+) -> tuple[FaultPatch, ...]:
+    """Retarget a ``max_tokens`` patch onto the caps each mode actually uses.
+
+    A mode-specific cap (``plan_max_tokens``, ``execute_max_tokens``)
+    overrides ``max_tokens`` for its mode, so a patch on ``max_tokens``
+    alone would not change a request whose mode has its own cap. The value
+    lowers every effective cap it is below: a set mode cap is rewritten,
+    and ``max_tokens`` is written only while some mode still uses it. A
+    value that lowers no effective cap is refused.
+    """
+
+    rewritten: list[FaultPatch] = []
+    sampling = base.agent.sampling
+    for patch in fault.patches:
+        value = patch.value
+        if (
+            patch.path != "agent.sampling.max_tokens"
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+        ):
+            rewritten.append(patch)
+            continue
+        caps = {
+            "agent.sampling.plan_max_tokens": sampling.plan_max_tokens,
+            "agent.sampling.execute_max_tokens": sampling.execute_max_tokens,
+        }
+        effective = {
+            mode: sampling.max_tokens if cap is None else cap
+            for mode, cap in caps.items()
+        }
+        if all(value >= current for current in effective.values()):
+            raise FaultError(
+                "token_limit fault does not lower any effective cap "
+                f"(plan {effective['agent.sampling.plan_max_tokens']}, "
+                f"execute {effective['agent.sampling.execute_max_tokens']}); "
+                "choose a smaller value"
+            )
+        if any(cap is None for cap in caps.values()) and value < sampling.max_tokens:
+            rewritten.append(patch)
+        for path, cap in caps.items():
+            if cap is not None and value < cap:
+                rewritten.append(FaultPatch(path=path, value=value))
+    return tuple(rewritten)
+
+
+def _noop_paths(base: RunConfiguration, patches: Sequence[FaultPatch]) -> tuple[str, ...]:
+    before = hashed_values(base)
+    return tuple(
+        patch.path
+        for patch in patches
+        if patch.path in before and before[patch.path] == patch.value
+    )
+
+
 def apply_fault(base: RunConfiguration, fault: FaultSpec) -> RunConfiguration:
     """Return a new configuration with only the fault's declared hashed leaves changed.
 
@@ -604,8 +760,29 @@ def apply_fault(base: RunConfiguration, fault: FaultSpec) -> RunConfiguration:
         raise FaultError("apply_fault requires a fault spec")
     if not fault.representable:
         raise FaultError(str(fault.schema_request))
+    unsupported = provider_fault_support(base, fault)
+    if unsupported is not None:
+        raise FaultError(f"{fault.fault_version} is unsupported on this base: {unsupported}")
+    if fault.kind == "benign_control" and fault.control == "declared_noop":
+        changed = [
+            patch.path for patch in fault.patches
+            if patch.path not in _noop_paths(base, fault.patches)
+        ]
+        if changed:
+            raise FaultError(
+                f"{fault.fault_version} declares a no-op but changes {', '.join(sorted(changed))}"
+            )
+        return base
     document = copy.deepcopy(base.to_dict())
     patches = _patches_for_base(base, fault)
+    if fault.kind != "benign_control":
+        unchanged = _noop_paths(base, patches)
+        if unchanged:
+            raise FaultError(
+                f"{fault.fault_version} does not change {', '.join(sorted(unchanged))} "
+                "on this base; choose a different value, or declare it as a "
+                "benign_control with control declared_noop"
+            )
     declared = frozenset(patch.path for patch in patches)
     for patch in patches:
         _set_leaf(document, patch.path, patch.value)
@@ -634,6 +811,7 @@ def measure_harm(
     confidence_level: float,
     resamples: int,
     seed: int,
+    candidate_runtime: RuntimeDependencies | None = None,
 ) -> HarmLabel:
     """Label whether a declared fault is harmful on a frozen ``dev`` task set.
 
@@ -664,6 +842,8 @@ def measure_harm(
         raise FaultError("measure_harm requires run configurations")
     if not isinstance(runtime, RuntimeDependencies):
         raise FaultError("measure_harm requires runtime dependencies")
+    if candidate_runtime is not None and not isinstance(candidate_runtime, RuntimeDependencies):
+        raise FaultError("candidate_runtime must be RuntimeDependencies when set")
     produced = apply_fault(base, fault)
     if produced != candidate:
         raise FaultError("candidate is not the declared fault")
@@ -690,6 +870,7 @@ def measure_harm(
                 runtime=runtime,
                 mode="execute",
                 scenario_id=scenario_id,
+                candidate_runtime=candidate_runtime,
             )
             difference = evaluator_difference(pair)
             reference_outcome = pair.reference.evaluator_outcome

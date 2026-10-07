@@ -1,11 +1,13 @@
 # Tests
 
-Current suites:
+Current suites (counts as of the hosted-lifecycle branch):
 
-- `unit/`: 186 deterministic tests for configuration, records, task selection and streams, fake-driven episodes, lazy runtime adapters, storage, export, the statistics formulas, versioned faults, the plan-only offline gate, the canary controller, the production monitor, and shared-stream detector replay (`test_replay.py`, 8 tests). Service unit tests skip when FastAPI is absent.
-- `ci/`: 7 tests for the plan-only offline gate.
-- `integration/`: 33 synthetic tests. They connect a catalog, seeded stream, fake session and agent, episode storage, statistics isolation, and public export, and they exercise `run_pair`, A/A capture, the offline gate, the canary controller, the production monitor, and the lifecycle benchmark harness (`test_lifecycle_benchmark.py`, 6 tests) on injected worlds. They do not run smolagents, vLLM, or AppWorld, and they are not a noise-floor result or a `test_normal` benchmark run. Service integration tests skip when FastAPI is absent.
-- `validity/`: 19 CPU tests for the validation runner. They cover catalog eligibility, a constant-null canary with supplied A/A rows, a failed reference, degenerate bootstrap coverage, repeated looks, KL truncation on supplied arrays, harm-study feasibility, capture-row copying, study budgets, and the three evaluation commands. They do not read `nvidia-smi`, start AppWorld or vLLM, or commit a null, A/A, or truncation result. The GitHub workflow does not discover this suite.
+- `unit/`: 665 deterministic tests for configuration, records, task selection and streams, fake-driven episodes, lazy runtime adapters, hosted providers and hosted plan mode (`test_hosted_plan_mode.py`), hosted fault payloads (`test_hosted_faults.py`), the hashed arrival schedule (`test_schedule.py`), runtime routing, alert incidents, slice references, usage, empirical power, and the protocol commitment (`test_lifecycle_wiring.py`), storage, export, the statistics formulas, versioned faults, the plan-only offline gate, the canary controller, the production monitor, and shared-stream detector replay. Service unit tests raise `ImportError` when FastAPI is absent.
+- `ci/`: 28 tests for the plan-only offline gate and the bare-CLI exit-2 contract of every lifecycle command.
+- `integration/`: 70 synthetic tests. They connect a catalog, seeded stream, fake session and agent, episode storage, statistics isolation, and public export, and they exercise `run_pair`, A/A capture, the offline gate (including a hosted gate CLI), the canary controller, the production monitor, the service (including a hosted production config and promotion resets), and the lifecycle benchmark harness on injected worlds. They do not run smolagents, vLLM, AppWorld, or a hosted provider, and they are not a noise-floor result or a `test_normal` benchmark run.
+- `validity/`: 19 CPU tests for the validation runner. They do not read `nvidia-smi`, start AppWorld or vLLM, or commit a null, A/A, or truncation result.
+
+Every test here is software evidence. A passing suite closes no stage gate.
 
 Reserved but empty:
 

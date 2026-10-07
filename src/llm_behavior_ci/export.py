@@ -12,6 +12,7 @@ from llm_behavior_ci.records import (
     LifecycleDecision,
     RecordError,
     StatisticalEvidence,
+    UsageAggregate,
     assert_public_payload,
     public_record_dict,
 )
@@ -34,11 +35,13 @@ class AggregateResults:
     aggregates: tuple[AggregateRecord, ...]
     evidence: tuple[StatisticalEvidence, ...]
     decisions: tuple[LifecycleDecision, ...]
+    usage: tuple[UsageAggregate, ...] = ()
 
     def __post_init__(self) -> None:
         _require_tuple(self.aggregates, AggregateRecord, "aggregates")
         _require_tuple(self.evidence, StatisticalEvidence, "evidence")
         _require_tuple(self.decisions, LifecycleDecision, "decisions")
+        _require_tuple(self.usage, UsageAggregate, "usage")
 
 
 def export_public_results(aggregate: AggregateResults, *, output_path: Path) -> None:
@@ -50,6 +53,8 @@ def export_public_results(aggregate: AggregateResults, *, output_path: Path) -> 
             "evidence": [public_record_dict(item) for item in aggregate.evidence],
             "decisions": [public_record_dict(item) for item in aggregate.decisions],
         }
+        if aggregate.usage:
+            payload["usage"] = [public_record_dict(item) for item in aggregate.usage]
         assert_public_payload(payload)
     except RecordError as error:
         raise ExportError("public export failed") from error

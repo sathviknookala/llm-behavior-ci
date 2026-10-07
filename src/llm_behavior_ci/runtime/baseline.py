@@ -8,7 +8,8 @@ rows that ``assess_harm_study`` already accepts. Task ids stay in
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from llm_behavior_ci.config import RunConfiguration, new_run_identity
@@ -72,14 +73,24 @@ def collect_baseline_outcomes(
     *,
     production_runtime: RuntimeDependencies,
     do_nothing_runtime: RuntimeDependencies,
+    repetition: int | None = None,
+    required_apps_for: Callable[[str], Sequence[str] | None] | None = None,
 ) -> tuple[BaselineOutcome, ...]:
     """Run production and do-nothing on the same arrivals.
 
     ``train`` and ``dev`` only. Each arrival keeps its scenario id on both
-    roles and uses the task id as the local pair key. The app label is
-    read from ``required_apps`` on the production session when that method
-    exists.
+    roles and uses the task id as the local pair key; with ``repetition``
+    the key is ``<task id>#r<repetition>``, so repeated passes over one
+    task stay distinct pairs that share a task. The app label is read from
+    ``required_apps`` on the production session when that method exists,
+    otherwise from ``required_apps_for``. A missing evaluator outcome stays
+    ``None`` on its row.
     """
+
+    if repetition is not None and (
+        isinstance(repetition, bool) or not isinstance(repetition, int) or repetition < 0
+    ):
+        raise EpisodeRejected("repetition must be a nonnegative integer")
 
     if not isinstance(configuration, RunConfiguration):
         raise EpisodeRejected("baseline collection requires a run configuration")
@@ -116,9 +127,16 @@ def collect_baseline_outcomes(
             runtime=do_nothing_runtime,
             scenario_id=arrival.scenario_id,
         )
-        app = app_label(labels.get(arrival.task_id))
-        rows.append(outcome_from_episode(production, role="production", app=app))
-        rows.append(outcome_from_episode(nothing, role="do_nothing", app=app))
+        apps = labels.get(arrival.task_id)
+        if apps is None and required_apps_for is not None:
+            apps = required_apps_for(arrival.task_id)
+        app = app_label(apps)
+        pair = (
+            None if repetition is None else f"{arrival.task_id}#r{repetition}"
+        )
+        for episode, role in ((production, "production"), (nothing, "do_nothing")):
+            row = outcome_from_episode(episode, role=role, app=app)
+            rows.append(row if pair is None else replace(row, pair_key=pair))
     return tuple(rows)
 
 

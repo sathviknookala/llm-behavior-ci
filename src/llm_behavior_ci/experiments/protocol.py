@@ -52,6 +52,7 @@ from llm_behavior_ci.lifecycle.validation_artifact import (
     GATE_VALIDATION_ARTIFACT_SCHEMA_VERSION,
     ValidationArtifact,
 )
+from llm_behavior_ci.records import assert_public_payload
 from llm_behavior_ci.runtime.prompts import (
     UnknownPromptVersion,
     resolve_plan_format_template,
@@ -568,6 +569,53 @@ def _build_payload(settings: ProtocolSettings) -> dict[str, object]:
 
 def _digest_for_payload(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
+
+
+PROTOCOL_COMMITMENT_VERSION = "protocol-commitment-v1"
+
+
+def protocol_commitment(lock: ProtocolLock) -> dict[str, object]:
+    """The public commitment for a local protocol lock.
+
+    The full lock stays local because plan evidence and task selections
+    can name tasks. The commitment publishes the lock digest, one SHA-256
+    per top-level section of the canonical payload, the configuration and
+    task-set hashes, fault versions, and validation-report method names
+    with their flags. Revealing the lock later lets anyone recompute every
+    digest; the commitment itself contains no task content.
+    """
+
+    if not isinstance(lock, ProtocolLock):
+        raise ProtocolError("commitment requires a protocol lock")
+    if _digest_for_payload(lock.payload) != lock.digest:
+        raise ProtocolError("protocol lock digest does not match its payload")
+    faults = lock.payload.get("faults", [])
+    versions = sorted(
+        str(item.get("version"))
+        for item in faults
+        if isinstance(item, Mapping) and item.get("version") is not None
+    )
+    document = {
+        "record": "protocol_commitment",
+        "commitment_version": PROTOCOL_COMMITMENT_VERSION,
+        "protocol_digest": lock.digest,
+        "analysis_version": lock.payload.get("analysis_version"),
+        "section_digests": {
+            name: hashlib.sha256(_canonical_json(value)).hexdigest()
+            for name, value in sorted(lock.payload.items())
+        },
+        "configuration_hashes": sorted(
+            run_configuration_hash(configuration) for configuration in lock.configurations
+        ),
+        "task_set_hashes": sorted(lock.task_set_hashes),
+        "fault_versions": versions,
+        "validation_methods": [
+            {"method": method, "validated": flag}
+            for method, flag in zip(lock.method_names, lock.validated_flags, strict=True)
+        ],
+    }
+    assert_public_payload(document)
+    return document
 
 
 def verify_runtime_bindings(lock: ProtocolLock) -> None:

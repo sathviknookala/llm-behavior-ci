@@ -1,0 +1,11 @@
+{
+  "fault_id": "glm_step_limit_reduced",
+  "version": "1",
+  "kind": "step_limit",
+  "patches": [
+    {
+      "path": "agent.step_limit",
+      "value": 8
+    }
+  ]
+}

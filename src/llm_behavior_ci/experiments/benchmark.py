@@ -11,6 +11,9 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
+from itertools import takewhile
 from pathlib import Path
 from typing import Any, Literal
 
@@ -69,7 +72,19 @@ from llm_behavior_ci.records import (
     StatisticalEvidence,
     ToolSelectionObservation,
 )
+from llm_behavior_ci.experiments.schedule import (
+    BenchmarkSchedule,
+    ScheduledArrival,
+    ScheduleError,
+    SimulatedClock,
+    StreamCounters,
+    plan_arrivals,
+    run_scheduled_monitor,
+    schedule_hash,
+)
+from llm_behavior_ci.runtime.clock import wall_now
 from llm_behavior_ci.runtime.episode import (
+    EpisodeRejected,
     PairExecution,
     RuntimeDependencies,
     pair_execution,
@@ -77,6 +92,7 @@ from llm_behavior_ci.runtime.episode import (
     run_episode,
     run_pair,
 )
+from llm_behavior_ci.runtime.factory import RuntimeFactory, StaticRuntimeFactory
 from llm_behavior_ci.tasks.selection import TaskSet
 from llm_behavior_ci.tasks.streams import generate_stream
 
@@ -1177,8 +1193,9 @@ def _checkpoint_identity(
     faults: Sequence[FaultSpec],
     plan_evidence: PlanEvidenceInputs,
     reference_baselines: FrozenReference,
+    schedule: BenchmarkSchedule | None = None,
 ) -> dict[str, object]:
-    return {
+    identity: dict[str, object] = {
         "protocol_digest": protocol.digest,
         "train_configuration_hash": run_configuration_hash(train_bound),
         "test_normal_configuration_hash": run_configuration_hash(test_normal_bound),
@@ -1186,6 +1203,9 @@ def _checkpoint_identity(
         "plan_evidence": plan_evidence_to_dict(plan_evidence),
         "reference_baselines": _reference_baselines_to_dict(reference_baselines),
     }
+    if schedule is not None:
+        identity["schedule_hash"] = schedule_hash(schedule)
+    return identity
 
 
 def _validate_checkpoint_identity(
@@ -1268,7 +1288,7 @@ def run_lifecycle_benchmark(
     protocol: ProtocolLock,
     faults: Sequence[FaultSpec],
     *,
-    runtime: RuntimeDependencies,
+    runtime: RuntimeDependencies | None = None,
     train_tasks: TaskSet,
     test_normal_tasks: TaskSet,
     reference_baselines: FrozenReference,
@@ -1280,17 +1300,44 @@ def run_lifecycle_benchmark(
     candidate_runtime: RuntimeDependencies | None = None,
     gpu_memory_mib: float | None = None,
     gpu_hours: float | None = None,
+    runtime_factory: RuntimeFactory | None = None,
+    schedule: BenchmarkSchedule | None = None,
+    difficulty_for: Callable[[str], int | None] | None = None,
 ) -> BenchmarkResult:
-    """Run the three-tier lifecycle benchmark for each fault and lock seed."""
+    """Run the three-tier lifecycle benchmark for each fault and lock seed.
+
+    Runtimes come from ``runtime_factory`` (one per configuration, mode,
+    and role) or, for injected CPU runtimes, from ``runtime`` and
+    ``candidate_runtime``. With ``schedule``, the canary assigns the
+    frozen fraction over the full arrival stream and the monitor serves a
+    healthy prefix, then the faulted configuration from onset, on a
+    simulated clock; the schedule hash is part of the checkpoint identity.
+    Without it, the legacy path runs every arrival as a pair and serves the
+    faulted configuration from the first arrival.
+    """
 
     if not isinstance(protocol, ProtocolLock):
         raise BenchmarkError("run_lifecycle_benchmark requires a protocol lock")
-    if not isinstance(runtime, RuntimeDependencies):
+    if (runtime is None) == (runtime_factory is None):
+        raise BenchmarkError(
+            "run_lifecycle_benchmark requires exactly one of runtime or runtime_factory"
+        )
+    if runtime is not None and not isinstance(runtime, RuntimeDependencies):
         raise BenchmarkError("run_lifecycle_benchmark requires runtime dependencies")
     if candidate_runtime is not None and not isinstance(
         candidate_runtime, RuntimeDependencies
     ):
         raise BenchmarkError("candidate_runtime must be RuntimeDependencies when set")
+    if runtime_factory is not None and not isinstance(runtime_factory, RuntimeFactory):
+        raise BenchmarkError("runtime_factory must be a RuntimeFactory")
+    if schedule is not None and not isinstance(schedule, BenchmarkSchedule):
+        raise BenchmarkError("schedule must be a BenchmarkSchedule")
+    factory: RuntimeFactory = (
+        runtime_factory
+        if runtime_factory is not None
+        else StaticRuntimeFactory(reference=runtime, candidate=candidate_runtime)
+    )
+    clock = wall_now if runtime is None else runtime.clock
     if not isinstance(plan_evidence, PlanEvidenceInputs):
         raise BenchmarkError("run_lifecycle_benchmark requires plan evidence inputs")
     if admission_mode not in {"release", "test"}:
@@ -1341,7 +1388,13 @@ def run_lifecycle_benchmark(
         faults=faults,
         plan_evidence=plan_evidence,
         reference_baselines=reference_baselines,
+        schedule=schedule,
     )
+    if schedule is not None:
+        try:
+            scheduled_arrivals = plan_arrivals(test_normal_tasks, schedule)
+        except ScheduleError as error:
+            raise BenchmarkError(str(error)) from error
     _validate_checkpoint_identity(document, identity)
     document["identity"] = identity
     replicates_doc: dict[str, Any] = document.setdefault("replicates", {})
@@ -1387,7 +1440,7 @@ def run_lifecycle_benchmark(
                 _write_checkpoint(checkpoint, document)
                 continue
 
-            availability = live_fault_available(fault)
+            availability = live_fault_available(fault, train_bound_for_export)
             if not availability.available:
                 reason = (
                     "live fault unavailable"
@@ -1424,7 +1477,7 @@ def run_lifecycle_benchmark(
                 train_template=train_template,
                 train_tasks=train_tasks,
                 gate_settings=gate_settings,
-                runtime=runtime,
+                factory=factory,
                 plan_evidence=plan_evidence,
                 harmful=label.harmful,
                 stored=stored,
@@ -1468,8 +1521,9 @@ def run_lifecycle_benchmark(
                 test_normal_tasks=test_normal_tasks,
                 canary_settings=canary_settings,
                 stream_settings=stream_settings,
-                runtime=runtime,
-                candidate_runtime=candidate_runtime,
+                factory=factory,
+                clock=clock if schedule is None else SimulatedClock(schedule.clock_start),
+                scheduled_arrivals=None if schedule is None else scheduled_arrivals,
                 gate_decision=gate_decision,
                 allowance=allowance,
                 seed=seed,
@@ -1511,7 +1565,11 @@ def run_lifecycle_benchmark(
                     harmful=label.harmful,
                     gate=gate_outcome,
                     canary=canary_outcome,
-                    monitor=_not_reached_monitor("canary_rollback"),
+                    monitor=_not_reached_monitor(
+                        "canary_horizon_exhausted"
+                        if canary_outcome.status == "horizon_exhausted"
+                        else "canary_rollback"
+                    ),
                 )
                 outcomes.append(replicate)
                 stored["outcome"] = _serialize_replicate(replicate)
@@ -1548,7 +1606,17 @@ def run_lifecycle_benchmark(
                 )
                 break
 
-            monitor_result = _run_or_resume_monitor(
+            monitor_runner = (
+                _run_or_resume_monitor
+                if schedule is None
+                else partial(
+                    _run_or_resume_scheduled_monitor,
+                    schedule=schedule,
+                    arrivals=scheduled_arrivals,
+                    difficulty_for=difficulty_for,
+                )
+            )
+            monitor_result = monitor_runner(
                 protocol=protocol,
                 fault=fault,
                 test_normal_template=test_normal_template,
@@ -1557,8 +1625,8 @@ def run_lifecycle_benchmark(
                 distributional_monitor_settings=distributional_monitor_settings,
                 stream_settings=stream_settings,
                 reference_baselines=reference_baselines,
-                runtime=runtime,
-                candidate_runtime=candidate_runtime,
+                factory=factory,
+                clock=clock,
                 seed=seed,
                 harmful=label.harmful,
                 stored=stored,
@@ -1620,6 +1688,149 @@ def run_lifecycle_benchmark(
     return result
 
 
+def _role_runtimes(
+    factory: RuntimeFactory,
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    *,
+    mode: str,
+) -> tuple[RuntimeDependencies, RuntimeDependencies]:
+    try:
+        factory.preflight({"reference": reference, "candidate": candidate})
+        return (
+            factory(reference, mode=mode, role="reference"),
+            factory(candidate, mode=mode, role="candidate"),
+        )
+    except EpisodeRejected as error:
+        raise BenchmarkError(str(error)) from error
+
+
+def _run_or_resume_scheduled_monitor(
+    *,
+    schedule: BenchmarkSchedule,
+    arrivals: Sequence[ScheduledArrival],
+    difficulty_for: Callable[[str], int | None] | None,
+    protocol: ProtocolLock,
+    fault: FaultSpec,
+    test_normal_template: RunConfiguration,
+    test_normal_tasks: TaskSet,
+    monitor_settings: MonitorSettings,
+    distributional_monitor_settings: tuple[DistributionalMonitorSettings, ...],
+    stream_settings: StreamSettings,
+    reference_baselines: FrozenReference,
+    factory: RuntimeFactory,
+    clock: Callable[[], datetime],
+    seed: int,
+    harmful: bool,
+    stored: dict[str, Any],
+    checkpoint: Path,
+    document: dict[str, Any],
+    should_interrupt: Callable[[BenchmarkProgress], bool] | None,
+    fault_version: str,
+) -> dict[str, Any]:
+    """The monitor tier on the explicit schedule: healthy prefix, then onset.
+
+    Uses ``run_scheduled_monitor``, the same loop a dev rehearsal runs.
+    ``delay_episodes`` counts arrivals from onset to the first post-onset
+    alert; healthy-prefix alarms are stored apart and never count as
+    detection. A miss is a harmful fault without a post-onset alert; a
+    false alarm is a post-onset alert on a non-harmful fault.
+    """
+
+    del stream_settings
+    healthy, faulted = _authorize_faulted_test_normal(
+        protocol, test_normal_template, test_normal_tasks, fault
+    )
+    monitor_blob = stored.setdefault("monitor", {})
+    if isinstance(monitor_blob.get("final"), dict):
+        return {
+            "interrupted": False,
+            "outcome": _deserialize_monitor_outcome(monitor_blob["final"]),
+        }
+    simulated = SimulatedClock(schedule.clock_start)
+    monitor = ProductionMonitor(
+        monitor_settings,
+        reference_baselines,
+        clock=simulated,
+        dedup_seconds=0.0,
+    )
+    distributional = build_distributional_monitors(
+        distributional_monitor_settings,
+        reference_configuration_hash=reference_baselines.configuration_hash,
+        clock=simulated,
+        dedup_seconds=0.0,
+    )
+    started = time.perf_counter()
+
+    def runtime_for(configuration: RunConfiguration) -> RuntimeDependencies:
+        role = "reference" if configuration == healthy else "candidate"
+        return factory(configuration, mode="execute", role=role)
+
+    def interrupt(index: int) -> bool:
+        if should_interrupt is None:
+            return False
+        return should_interrupt(
+            BenchmarkProgress(
+                fault_version=fault_version,
+                replicate_seed=seed,
+                tier="monitor",
+                stream_index=index,
+            )
+        )
+
+    try:
+        result = run_scheduled_monitor(
+            schedule=schedule,
+            arrivals=arrivals,
+            healthy=healthy,
+            faulted=faulted,
+            runtime_for=runtime_for,
+            monitor=monitor,
+            distributional=distributional,
+            clock=simulated,
+            state=monitor_blob,
+            persist=lambda: _write_checkpoint(checkpoint, document),
+            difficulty_for=difficulty_for,
+            should_interrupt=interrupt,
+        )
+    except (ScheduleError, EpisodeRejected) as error:
+        raise BenchmarkError(str(error)) from error
+    compute_seconds = float(monitor_blob.get("compute_seconds", 0.0)) + (
+        time.perf_counter() - started
+    )
+    monitor_blob["compute_seconds"] = compute_seconds
+    monitor_blob["counters"] = result.counters.to_dict()
+    monitor_blob["healthy_prefix_alarms"] = result.healthy_prefix_alarms
+    detected = result.detected()
+    outcome = MonitorTierOutcome(
+        status="interrupted" if result.status == "interrupted" else "completed",
+        reason=None,
+        delay_episodes=result.post_onset_delay_episodes,
+        miss=bool(result.status == "completed" and harmful and not detected),
+        false_alarm=bool(result.status == "completed" and not harmful and detected),
+        compute_seconds=compute_seconds,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
+    )
+    if result.status == "completed":
+        monitor_blob["final"] = _serialize_monitor_outcome(outcome)
+    _write_checkpoint(checkpoint, document)
+    return {"interrupted": result.status == "interrupted", "outcome": outcome}
+
+
+def _deserialize_monitor_outcome(final: Mapping[str, Any]) -> MonitorTierOutcome:
+    return MonitorTierOutcome(
+        status=str(final["status"]),
+        reason=final.get("reason"),
+        delay_episodes=final.get("delay_episodes"),
+        miss=bool(final.get("miss", False)),
+        false_alarm=bool(final.get("false_alarm", False)),
+        compute_seconds=_optional_float(final.get("compute_seconds")),
+        agent_execution_seconds=_optional_float(final.get("agent_execution_seconds")),
+        detector_compute_seconds=_optional_float(final.get("detector_compute_seconds")),
+    )
+
+
 def _run_or_resume_gate(
     *,
     protocol: ProtocolLock,
@@ -1627,7 +1838,7 @@ def _run_or_resume_gate(
     train_template: RunConfiguration,
     train_tasks: TaskSet,
     gate_settings: GateSettings,
-    runtime: RuntimeDependencies,
+    factory: RuntimeFactory,
     plan_evidence: PlanEvidenceInputs,
     harmful: bool,
     stored: dict[str, Any],
@@ -1667,13 +1878,17 @@ def _run_or_resume_gate(
 
     started = time.perf_counter()
     try:
+        reference_runtime, candidate_runtime = _role_runtimes(
+            factory, reference, candidate, mode="plan"
+        )
         decision = run_offline_gate(
             reference,
             candidate,
             train_tasks,
             settings=gate_settings,
-            runtime=runtime,
+            runtime=reference_runtime,
             plan_evidence=plan_evidence,
+            candidate_runtime=candidate_runtime,
         )
     except GateExecutionError as error:
         raise BenchmarkError(str(error)) from error
@@ -1708,8 +1923,9 @@ def _run_or_resume_canary(
     test_normal_tasks: TaskSet,
     canary_settings: CanarySettings,
     stream_settings: StreamSettings,
-    runtime: RuntimeDependencies,
-    candidate_runtime: RuntimeDependencies | None,
+    factory: RuntimeFactory,
+    clock: Callable[[], datetime],
+    scheduled_arrivals: Sequence[ScheduledArrival] | None,
     gate_decision: GateDecision,
     allowance: TaskSelectionAllowance,
     seed: int,
@@ -1759,7 +1975,7 @@ def _run_or_resume_canary(
         reference,
         candidate,
         settings=canary_settings,
-        clock=runtime.clock,
+        clock=clock,
     )
     _start_canary_controller(
         controller,
@@ -1789,6 +2005,9 @@ def _run_or_resume_canary(
             _require_mapping(item["pair_execution"], "pair_execution")
         )
         restore_pair_execution(execution)
+        decided = canary_blob.get("decisions", {}).get(str(item["stream_index"]))
+        if isinstance(decided, dict) and callable(getattr(clock, "advance_to", None)):
+            clock.advance_to(datetime.fromisoformat(str(decided["simulated_at"])))
         controller.begin_candidate_episode()
         detector_started = time.perf_counter()
         decision = controller.observe(pair)
@@ -1822,14 +2041,40 @@ def _run_or_resume_canary(
         canary_blob["candidate_run"] = candidate_run.to_dict()
         _write_checkpoint(checkpoint, document)
 
-    stream = _stream_for_seed(stream_settings, seed)
-    horizon = canary_settings.stopping_rule.horizon_episodes
+    try:
+        reference_runtime, candidate_runtime = _role_runtimes(
+            factory, reference, candidate, mode="execute"
+        )
+    except EpisodeRejected as error:
+        raise BenchmarkError(str(error)) from error
+    counters = canary_blob.setdefault("counters", StreamCounters().to_dict())
+    if scheduled_arrivals is None:
+        stream = _stream_for_seed(stream_settings, seed)
+        horizon = canary_settings.stopping_rule.horizon_episodes
+        arrivals_iter: Any = takewhile(
+            lambda arrival: arrival.index < horizon,
+            generate_stream(test_normal_tasks, stream),
+        )
+    else:
+        horizon = len(scheduled_arrivals)
+        arrivals_iter = iter(scheduled_arrivals)
 
-    for arrival in generate_stream(test_normal_tasks, stream):
+    for arrival in arrivals_iter:
         if arrival.index >= horizon:
             break
         if arrival.index in stored_indexes:
             continue
+        if scheduled_arrivals is not None:
+            decided = canary_blob.setdefault("decisions", {})
+            decided[str(arrival.index)] = arrival.decision_dict()
+            if str(arrival.index) not in canary_blob.setdefault("counted", []):
+                canary_blob["counted"].append(str(arrival.index))
+                counters["arrivals"] += 1
+                if not arrival.canary_assigned:
+                    counters["production_only_arrivals"] += 1
+            if not arrival.canary_assigned:
+                _write_checkpoint(checkpoint, document)
+                continue
         progress = BenchmarkProgress(
             fault_version=fault_version,
             replicate_seed=seed,
@@ -1860,6 +2105,8 @@ def _run_or_resume_canary(
                 ),
             }
 
+        if scheduled_arrivals is not None and callable(getattr(clock, "advance_to", None)):
+            clock.advance_to(arrival.simulated_at)
         controller.begin_candidate_episode()
         agent_started = time.perf_counter()
         pair = run_pair(
@@ -1868,12 +2115,21 @@ def _run_or_resume_canary(
             candidate,
             reference_run=reference_run,
             candidate_run=candidate_run,
-            runtime=runtime,
+            runtime=reference_runtime,
             mode="execute",
             scenario_id=arrival.scenario_id,
             candidate_runtime=candidate_runtime,
         )
         agent_delta += time.perf_counter() - agent_started
+        counters["candidate_exposures"] += 1
+        counters["paired_outcomes"] += 1
+        if (
+            pair.reference.evaluator_outcome is not None
+            and pair.candidate.evaluator_outcome is not None
+        ):
+            counters["completed_evaluator_outcomes"] += 1
+        else:
+            counters["missing_evaluator_outcomes"] += 1
         detector_started = time.perf_counter()
         decision = controller.observe(pair)
         detector_delta += time.perf_counter() - detector_started
@@ -1902,6 +2158,24 @@ def _run_or_resume_canary(
             _write_checkpoint(checkpoint, document)
             return {"interrupted": False, "outcome": outcome}
 
+    if scheduled_arrivals is not None:
+        snap = controller.snapshot()
+        outcome = CanaryTierOutcome(
+            status="horizon_exhausted",
+            reason="analysis horizon ended before the stopping rule decided",
+            rollback_delay_episodes=None,
+            candidate_episodes_served=snap.candidate_episodes_served,
+            candidate_episodes_failed=snap.candidate_episodes_failed,
+            served_before_rollback=None,
+            in_flight_at_rollback=None,
+            compute_seconds=compute_base + (time.perf_counter() - started),
+            agent_execution_seconds=agent_base + agent_delta,
+            detector_compute_seconds=detector_base + detector_delta,
+            public_decision=None,
+        )
+        canary_blob["final"] = _serialize_canary_outcome(outcome)
+        _write_checkpoint(checkpoint, document)
+        return {"interrupted": False, "outcome": outcome}
     raise BenchmarkError("canary stream ended without rollback or promote")
 
 
@@ -1915,8 +2189,8 @@ def _run_or_resume_monitor(
     distributional_monitor_settings: tuple[DistributionalMonitorSettings, ...] = (),
     stream_settings: StreamSettings,
     reference_baselines: FrozenReference,
-    runtime: RuntimeDependencies,
-    candidate_runtime: RuntimeDependencies | None,
+    factory: RuntimeFactory,
+    clock: Callable[[], datetime],
     seed: int,
     harmful: bool,
     stored: dict[str, Any],
@@ -1928,7 +2202,10 @@ def _run_or_resume_monitor(
     _reference, candidate = _authorize_faulted_test_normal(
         protocol, test_normal_template, test_normal_tasks, fault
     )
-    active_runtime = runtime if candidate_runtime is None else candidate_runtime
+    try:
+        active_runtime = factory(candidate, mode="execute", role="candidate")
+    except EpisodeRejected as error:
+        raise BenchmarkError(str(error)) from error
 
     monitor_blob = stored.setdefault("monitor", {})
     if not isinstance(monitor_blob, dict):
@@ -1961,13 +2238,13 @@ def _run_or_resume_monitor(
     monitor = ProductionMonitor(
         monitor_settings,
         reference_baselines,
-        clock=runtime.clock,
+        clock=clock,
         dedup_seconds=0.0,
     )
     distributional_monitors = build_distributional_monitors(
         distributional_monitor_settings,
         reference_configuration_hash=reference_baselines.configuration_hash,
-        clock=runtime.clock,
+        clock=clock,
         dedup_seconds=0.0,
     )
     tool_monitor = distributional_monitors.get("tool_selection")

@@ -46,9 +46,23 @@ class AlertRecord:
     boundary: float | None
     sample_size: int
     raised_at: datetime
+    period_id: str | None = None
+
+    @property
+    def incident_key(self) -> tuple[str, str, str, str] | None:
+        """``(period, configuration, signal, slice)`` when a period is set.
+
+        One incident alerts once per monitoring period, whichever detector
+        method fired first, and the key is read back from SQLite so a
+        restarted process with the same period does not alert again.
+        """
+
+        if self.period_id is None:
+            return None
+        return (self.period_id, self.configuration_hash, self.signal, self.slice_name)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "configuration_hash": self.configuration_hash,
             "reference_configuration_hash": self.reference_configuration_hash,
             "signal": self.signal,
@@ -59,6 +73,9 @@ class AlertRecord:
             "sample_size": self.sample_size,
             "raised_at": self.raised_at.isoformat(),
         }
+        if self.period_id is not None:
+            payload["period_id"] = self.period_id
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> AlertRecord:
@@ -92,6 +109,9 @@ class AlertRecord:
             value = payload.get(key)
             if not isinstance(value, str) or value == "":
                 raise StorageError(f"alert record {key} is invalid")
+        period_id = payload.get("period_id")
+        if period_id is not None and (not isinstance(period_id, str) or period_id == ""):
+            raise StorageError("alert record period_id is invalid")
         return cls(
             configuration_hash=str(payload["configuration_hash"]),
             reference_configuration_hash=str(
@@ -104,6 +124,7 @@ class AlertRecord:
             boundary=None if boundary is None else float(boundary),
             sample_size=sample_size,
             raised_at=parsed,
+            period_id=period_id,
         )
 
 
@@ -508,6 +529,16 @@ class EpisodeStore:
 
         return self._run("load_episode", read)
 
+    def load_finished_episodes(self) -> tuple[EpisodeResult, ...]:
+        def read(connection: sqlite3.Connection) -> tuple[EpisodeResult, ...]:
+            rows = connection.execute(
+                "SELECT result_json FROM episodes WHERE state = 'finished' "
+                "AND result_json IS NOT NULL ORDER BY rowid"
+            ).fetchall()
+            return tuple(EpisodeResult.from_dict(json.loads(row[0])) for row in rows)
+
+        return self._run("load_finished_episodes", read)
+
     def load_open_episode(self, episode_id: str) -> OpenEpisode:
         def read(connection: sqlite3.Connection) -> OpenEpisode:
             row = connection.execute(
@@ -605,7 +636,21 @@ class EpisodeStore:
             raise StorageError("append_alert failed")
 
         def write(connection: sqlite3.Connection) -> tuple[AlertRecord, bool]:
-            if window > 0.0:
+            incident = alert.incident_key
+            if incident is not None:
+                rows = connection.execute(
+                    """
+                    SELECT alert_json FROM alerts
+                    WHERE signal = ? AND slice_name = ?
+                    ORDER BY alert_id
+                    """,
+                    (alert.signal, alert.slice_name),
+                ).fetchall()
+                for (payload,) in rows:
+                    existing = AlertRecord.from_dict(json.loads(payload))
+                    if existing.incident_key == incident:
+                        return existing, False
+            elif window > 0.0:
                 rows = connection.execute(
                     """
                     SELECT alert_json FROM alerts

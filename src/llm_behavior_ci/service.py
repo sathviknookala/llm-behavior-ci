@@ -7,7 +7,6 @@ import math
 import re
 import threading
 import time
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -50,6 +49,7 @@ from llm_behavior_ci.lifecycle.monitoring import (
     ProductionMonitor,
     TaskMetadata,
     UndefinedRequirementFraction,
+    monitoring_period_id,
     plan_kl_observation,
     plan_quality_observation_from_features,
     resolved_slice_name,
@@ -64,6 +64,7 @@ from llm_behavior_ci.runtime.episode import (
     run_episode,
     run_pair,
 )
+from llm_behavior_ci.runtime.factory import RuntimeFactory
 from llm_behavior_ci.storage import DeploymentDecisionRecord, EpisodeStore, StorageError
 
 _EPISODE_REQUIRED = frozenset({"task_id", "mode"})
@@ -353,6 +354,27 @@ def _apply_mode(runtime: RuntimeDependencies, mode: ModeName) -> None:
         setter(mode)
 
 
+def _runtime_for(
+    state: _ServiceState,
+    config: RunConfiguration,
+    mode: ModeName,
+    role: str,
+) -> RuntimeDependencies:
+    """One fresh runtime for ``config`` in ``mode``.
+
+    A ``RuntimeFactory`` builds the runtime for the mode (plan mode then
+    bypasses the execute workflow wrapper); a plain callable keeps the
+    legacy contract of one runtime per configuration with ``set_mode``.
+    """
+
+    factory = state.dependencies.runtime_factory
+    if isinstance(factory, RuntimeFactory):
+        return factory(config, mode=mode, role=role)
+    runtime = factory(config)
+    _apply_mode(runtime, mode)
+    return runtime
+
+
 def _persistence_callbacks(
     store: EpisodeStore,
     task_id: str,
@@ -621,16 +643,29 @@ def _apply_canary_decision(
             raise _Conflict("candidate configuration is not registered")
         state.serving_configuration = registry.candidate
         previous_hash = decision.snapshot.previous_production_configuration_hash
-        baselines = state.dependencies.monitor.reference.baselines
+        current = state.dependencies.monitor.reference
+        new_period = monitoring_period_id(
+            run_configuration_hash(registry.candidate), previous_hash
+        )
         state.dependencies.monitor.reset_for_promotion(
             FrozenReference(
                 configuration_hash=previous_hash,
-                baselines=baselines,
-            )
+                baselines=current.baselines,
+                slice_baselines=current.slice_baselines,
+                source=current.source,
+            ),
+            period_id=new_period,
         )
-        new_period = f"period-{uuid.uuid4().hex}"
+        for distributional in (
+            state.dependencies.tool_selection_monitor,
+            state.dependencies.task_mix_monitor,
+        ):
+            if distributional is not None:
+                distributional.reset(
+                    reference_configuration_hash=previous_hash,
+                    period_id=new_period,
+                )
         state.monitor_period_id = new_period
-        state.dependencies.monitor._period_id = new_period
         decided_at = decision.snapshot.promoted_at
         if decided_at is None:
             decided_at = state.dependencies.clock()
@@ -711,8 +746,7 @@ def _run_production_episode(
 ) -> dict[str, object]:
     config = state.serving_configuration
     run = new_run_identity(config)
-    runtime = state.dependencies.runtime_factory(config)
-    _apply_mode(runtime, request.mode)
+    runtime = _runtime_for(state, config, request.mode, "production")
     on_start, on_step = _persistence_callbacks(
         state.dependencies.store,
         request.task_id,
@@ -762,10 +796,8 @@ def _run_candidate_episode(
     candidate = registry.candidate
     reference_run = new_run_identity(reference)
     candidate_run = new_run_identity(candidate)
-    reference_runtime = state.dependencies.runtime_factory(reference)
-    candidate_runtime = state.dependencies.runtime_factory(candidate)
-    _apply_mode(reference_runtime, request.mode)
-    _apply_mode(candidate_runtime, request.mode)
+    reference_runtime = _runtime_for(state, reference, request.mode, "reference")
+    candidate_runtime = _runtime_for(state, candidate, request.mode, "candidate")
     on_start, on_step = _persistence_callbacks(
         state.dependencies.store,
         request.task_id,
