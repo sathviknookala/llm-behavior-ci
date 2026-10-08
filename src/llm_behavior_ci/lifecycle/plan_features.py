@@ -17,6 +17,12 @@ also reads the ``plan-v1`` step form that names the app and then the API,
 ``App Name: api_name``, when the label is one of the task's apps and the
 pair is an available tool, and adds required-tool coverage: a plan that
 names no tool no longer looks the same as a plan that names the right ones.
+``plan-features-v4`` reads a bare dotted token as a tool reference only when
+it uses the action namespace, starts with one of the task's apps, or is
+followed by call syntax; anything else, such as ``spotify_library.csv`` or
+``example.com``, is prose. A plan that names a required file is no longer
+charged an invalid tool reference for it. A hallucinated app written as bare
+prose without call syntax is not penalized.
 
 Two pure functions produce the vector: ``structural_plan_features`` needs
 only the plan text (character/line/token shape; kept as supplementary
@@ -36,7 +42,7 @@ from typing import Mapping, Sequence
 
 from llm_behavior_ci.tasks.plan_specs import TaskPlanSpec
 
-PLAN_FEATURE_SCHEMA_VERSION = "plan-features-v3"
+PLAN_FEATURE_SCHEMA_VERSION = "plan-features-v4"
 
 STRUCTURAL_PLAN_FEATURES = frozenset(
     {
@@ -129,16 +135,16 @@ def tool_references(line: str) -> tuple[tuple[str, bool], ...]:
     valid-looking pair.
     """
 
-    found: list[tuple[str, bool]] = []
-    for match in _TOOL_CHAIN.finditer(line):
-        parts = match.group(0).lower().split(".")
-        if len(parts) == 2 and parts[0] != _ACTION_NAMESPACE:
-            found.append((".".join(parts), True))
-        elif len(parts) == 3 and parts[0] == _ACTION_NAMESPACE:
-            found.append((".".join(parts[1:]), True))
-        else:
-            found.append((".".join(parts), False))
-    return tuple(found)
+    return tuple(_classify(match.group(0)) for match in _TOOL_CHAIN.finditer(line))
+
+
+def _classify(chain: str) -> tuple[str, bool]:
+    parts = chain.lower().split(".")
+    if len(parts) == 2 and parts[0] != _ACTION_NAMESPACE:
+        return ".".join(parts), True
+    if len(parts) == 3 and parts[0] == _ACTION_NAMESPACE:
+        return ".".join(parts[1:]), True
+    return ".".join(parts), False
 
 
 def plan_tool_references(
@@ -154,12 +160,19 @@ def plan_tool_references(
     and only when the resulting ``app.api`` is available. An unresolved
     label is ignored rather than counted invalid, because ``Word: word`` is
     also ordinary prose. A dotted reference in the same line is read by
-    ``tool_references`` as before and is not counted twice.
+    ``tool_references`` and is not counted twice. A dotted chain counts only
+    when it starts with ``apis`` or one of the task's apps, or is followed
+    by ``(``; any other chain, such as a file name, is prose.
     """
 
-    found = list(tool_references(line))
     available = {tool.lower() for tool in available_tools}
     apps = {tool.split(".", 1)[0] for tool in available}
+    found = [
+        _classify(match.group(0))
+        for match in _TOOL_CHAIN.finditer(line)
+        if match.group(0).split(".", 1)[0].lower() in apps | {_ACTION_NAMESPACE}
+        or line[match.end() :].lstrip().startswith("(")
+    ]
     matched = _LABELLED_STEP.match(line)
     if matched is not None:
         app = "_".join(matched.group("label").lower().split())

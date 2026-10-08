@@ -11,6 +11,7 @@ from llm_behavior_ci.tasks import (
     canonical_task_set_bytes,
     catalog_from_mapping,
     load_appworld_catalog,
+    select_one_per_scenario,
     select_task_set,
     verify_task_set,
 )
@@ -50,6 +51,35 @@ def _select(catalog, count: int = 2, seed: int = 7):
 
 
 class TaskSelectionTests(unittest.TestCase):
+    def test_one_per_scenario_keeps_the_first_task_of_each_scenario_in_seeded_order(self) -> None:
+        catalog = _catalog(
+            *(
+                _entry(f"task-{scenario}-{index}", f"scenario-{scenario}")
+                for scenario in range(5)
+                for index in range(3)
+            ),
+            _entry("task-dev", "scenario-dev", split="dev"),
+        )
+        order = _select(catalog, count=15, seed=17)
+        selected = select_one_per_scenario(catalog, split="train", seed=17)
+        expected: dict[str | None, str] = {}
+        for task_id, scenario_id in zip(order.task_ids, order.scenario_ids):
+            expected.setdefault(scenario_id, task_id)
+        self.assertEqual(selected.task_ids, tuple(expected.values()))
+        self.assertEqual(selected.scenario_count, 5)
+        self.assertEqual(selected.task_count, 5)
+        self.assertEqual(selected.selection_rule, "one_per_scenario_v1")
+        self.assertEqual(
+            selected.task_set_hash,
+            select_one_per_scenario(catalog, split="train", seed=17).task_set_hash,
+        )
+        self.assertNotEqual(selected.task_set_hash, order.task_set_hash)
+
+    def test_one_per_scenario_refuses_a_task_without_a_scenario(self) -> None:
+        catalog = _catalog(_entry("task-a", "scenario-1"), _entry("task-b", None))
+        with self.assertRaises(SelectionError):
+            select_one_per_scenario(catalog, split="train", seed=17)
+
     def test_identical_seed_reproduces_the_same_ids_and_hash(self) -> None:
         catalog = _catalog(
             _entry("task-a", "scenario-1"),

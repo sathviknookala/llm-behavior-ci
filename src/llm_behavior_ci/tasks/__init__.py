@@ -12,6 +12,7 @@ from llm_behavior_ci.tasks.selection import (
     SelectionError,
     TaskSet,
     canonical_task_set_bytes,
+    select_one_per_scenario,
     select_task_set,
     verify_task_set,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "catalog_from_mapping",
     "generate_stream",
     "load_appworld_catalog",
+    "select_one_per_scenario",
     "select_task_set",
     "verify_task_set",
 ]

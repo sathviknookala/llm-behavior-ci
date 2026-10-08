@@ -34,7 +34,7 @@ def _spec(**overrides: object) -> TaskPlanSpec:
 
 class SchemaTests(unittest.TestCase):
     def test_schema_version_is_stable_and_named(self) -> None:
-        self.assertEqual(PLAN_FEATURE_SCHEMA_VERSION, "plan-features-v3")
+        self.assertEqual(PLAN_FEATURE_SCHEMA_VERSION, "plan-features-v4")
         self.assertTrue(STRUCTURAL_PLAN_FEATURES)
         self.assertTrue(SEMANTIC_PLAN_FEATURES)
         self.assertEqual(
@@ -131,6 +131,51 @@ class InvalidToolReferenceTests(unittest.TestCase):
         self.assertEqual(features["invalid_tool_reference_fraction"], 0.0)
         self.assertEqual(features["valid_tool_reference_count"], 0.0)
         self.assertEqual(features["invalid_tool_reference_count"], 0.0)
+
+
+class ProseDottedTokenTests(unittest.TestCase):
+    _TOOLS = (
+        "file_system.create_file",
+        "spotify.show_song_library",
+        "supervisor.complete_task",
+    )
+
+    def test_file_names_and_domains_are_prose_not_invalid_references(self) -> None:
+        for line in (
+            '3. File System: create_file "~/backups/spotify_library.csv"',
+            "4. save it as Amsterdam.zip and archive.tar.gz",
+            "5. see example.com for details",
+        ):
+            references = plan_tool_references(line, self._TOOLS)
+            self.assertFalse([item for item in references if item[0] != "file_system.create_file"], line)
+
+    def test_unknown_apps_in_action_or_call_form_stay_invalid(self) -> None:
+        self.assertEqual(
+            plan_tool_references("1. apis.weather.forecast()", self._TOOLS),
+            (("weather.forecast", True),),
+        )
+        self.assertEqual(
+            plan_tool_references("1. call weather.forecast (city)", self._TOOLS),
+            (("weather.forecast", True),),
+        )
+        spec = TaskPlanSpec(
+            task_id="task-files",
+            available_tools=self._TOOLS,
+            subgoal_keywords=(),
+            required_entities=(),
+            dependency_pairs=(("file_system.create_file", "supervisor.complete_task"),),
+        )
+        features = semantic_plan_features(
+            "1. File System: create_file spotify_library.csv\n2. weather.forecast()\n", spec
+        )
+        self.assertEqual(features["invalid_tool_reference_count"], 1.0)
+        self.assertEqual(features["valid_tool_reference_count"], 1.0)
+
+    def test_known_app_with_unknown_api_stays_invalid(self) -> None:
+        self.assertEqual(
+            plan_tool_references("2. spotify.delete_everything", self._TOOLS),
+            (("spotify.delete_everything", True),),
+        )
 
 
 class LabelledStepReferenceTests(unittest.TestCase):

@@ -2051,12 +2051,16 @@ def _run_or_resume_canary(
     else:
         horizon = len(scheduled_arrivals)
         arrivals_iter = iter(scheduled_arrivals)
+    pair_budget = canary_settings.stopping_rule.horizon_episodes
+    pairs_run = len(stored_indexes)
 
     for arrival in arrivals_iter:
         if arrival.index >= horizon:
             break
         if arrival.index in stored_indexes:
             continue
+        if scheduled_arrivals is not None and pairs_run >= pair_budget:
+            break
         if scheduled_arrivals is not None:
             decided = canary_blob.setdefault("decisions", {})
             decided[str(arrival.index)] = arrival.decision_dict()
@@ -2114,6 +2118,7 @@ def _run_or_resume_canary(
             candidate_runtime=candidate_runtime,
         )
         agent_delta += time.perf_counter() - agent_started
+        pairs_run += 1
         counters["candidate_exposures"] += 1
         counters["paired_outcomes"] += 1
         if (

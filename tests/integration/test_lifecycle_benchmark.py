@@ -23,6 +23,7 @@ from llm_behavior_ci.experiments.benchmark import (
     run_lifecycle_benchmark,
 )
 from llm_behavior_ci.experiments.faults import FaultPatch, FaultSpec, HarmLabel, load_fault
+from llm_behavior_ci.experiments.schedule import BenchmarkSchedule
 from llm_behavior_ci.experiments.protocol import ProtocolSettings, lock_protocol
 from llm_behavior_ci.experiments.validation import AADependenceReport, ValidationReport
 from llm_behavior_ci.lifecycle.monitoring import FrozenReference
@@ -278,6 +279,24 @@ class CountingFactory:
         if self.count % 2 == 1:
             return World(task_id, success=True)
         return World(task_id, success=self._candidate_success)
+
+
+class FailedStartWorld(World):
+    def prepare(self) -> None:
+        raise RuntimeError("environment setup failed")
+
+
+class FailedStartCandidateFactory:
+    """Gate and reference worlds start; every canary candidate world fails setup."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __call__(self, task_id: str) -> World:
+        self.count += 1
+        if self.count > _GATE_WORLDS and self.count % 2 == 0:
+            return FailedStartWorld(task_id, success=True)
+        return World(task_id, success=True)
 
 
 def _aa() -> AADependenceReport:
@@ -658,6 +677,56 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
         self.assertEqual(replicate.monitor.status, "not_reached")
         self.assertEqual(replicate.monitor.reason, "canary_rollback")
         self.assertEqual(result.candidate_episodes_served, 4)
+
+    def test_scheduled_canary_failed_starts_count_against_its_pair_horizon(self) -> None:
+        train_tasks, dev_tasks, test_tasks = _sets()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lock, baselines = _build_lock(
+                root,
+                train_tasks=train_tasks,
+                dev_tasks=dev_tasks,
+                test_normal_tasks=test_tasks,
+                harmful=True,
+                canary_horizon=3,
+                canary_alpha=0.5,
+                monitor_horizon=8,
+                with_replacement=True,
+            )
+            schedule = BenchmarkSchedule(
+                stream=StreamSettings.from_dict(lock.payload["stream"]),
+                healthy_prefix_episodes=2,
+                onset_mode="abrupt",
+                ramp_episodes=0,
+                analysis_horizon_episodes=8,
+                canary_fraction=1.0,
+                canary_assignment_seed=3,
+                clock_start=_START,
+            )
+            clock = Clock()
+            runtime = RuntimeDependencies(
+                session_factory=FailedStartCandidateFactory(),
+                agent=BenchmarkAgent(clock, block_on_temperature=False),
+                clock=clock,
+            )
+            result = run_lifecycle_benchmark(
+                lock,
+                (_temperature_fault(),),
+                runtime=runtime,
+                train_tasks=train_tasks,
+                test_normal_tasks=test_tasks,
+                reference_baselines=baselines,
+                plan_evidence=_plan_evidence(),
+                admission_mode="test",
+                checkpoint_path=root / "checkpoint.json",
+                schedule=schedule,
+            )
+        replicate = result.replicates[0]
+        self.assertEqual(replicate.gate.outcome, "PASS")
+        self.assertEqual(replicate.canary.status, "horizon_exhausted")
+        self.assertEqual(replicate.canary.candidate_episodes_served, 3)
+        self.assertEqual(replicate.monitor.status, "not_reached")
+        self.assertEqual(replicate.monitor.reason, "canary_horizon_exhausted")
 
     def test_release_admission_mode_rejects_synthetic_gate_evidence(self) -> None:
         train_tasks, dev_tasks, test_tasks = _sets()

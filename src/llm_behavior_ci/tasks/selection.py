@@ -4,6 +4,10 @@
 ``TaskConfiguration`` from that set. Selection does not construct a
 ``RunConfiguration`` and does not include instructions, API docs, or
 outcomes.
+
+``select_one_per_scenario`` (``one_per_scenario_v1``) walks the same seeded
+order as ``deterministic_sample`` and keeps the first task of every named
+scenario, so each selected task is an independent scenario cluster.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from llm_behavior_ci.config import SPLITS, TaskConfiguration
 from llm_behavior_ci.tasks.catalog import TaskCatalog
 
 _SELECTION_RULE = "deterministic_sample"
+ONE_PER_SCENARIO_RULE = "one_per_scenario_v1"
 
 
 class SelectionError(ValueError):
@@ -112,16 +117,51 @@ def select_task_set(
         raise SelectionError("count must be an integer")
     if count < 1:
         raise SelectionError("count must be a positive integer")
-    eligible = sorted(
+    items = _seeded_order(catalog, split, seed)
+    if count > len(items):
+        raise SelectionError("count exceeds the split size")
+    tasks = tuple((entry.task_id, entry.scenario_id) for entry in items[:count])
+    return _task_set(catalog, split, selection_rule, seed, tasks)
+
+
+def select_one_per_scenario(
+    catalog: TaskCatalog,
+    *,
+    split: str,
+    seed: int,
+) -> TaskSet:
+    if split not in SPLITS:
+        choices = ", ".join(sorted(SPLITS))
+        raise SelectionError(f"split must be one of: {choices}")
+    seen: set[str] = set()
+    tasks: list[tuple[str, str | None]] = []
+    for entry in _seeded_order(catalog, split, seed):
+        if entry.scenario_id is None:
+            raise SelectionError("one_per_scenario_v1 needs a scenario_id on every task")
+        if entry.scenario_id not in seen:
+            seen.add(entry.scenario_id)
+            tasks.append((entry.task_id, entry.scenario_id))
+    if not tasks:
+        raise SelectionError("split has no tasks")
+    return _task_set(catalog, split, ONE_PER_SCENARIO_RULE, seed, tuple(tasks))
+
+
+def _seeded_order(catalog: TaskCatalog, split: str, seed: int) -> list:
+    items = sorted(
         (entry for entry in catalog.entries if entry.split == split),
         key=lambda entry: entry.task_id,
     )
-    if count > len(eligible):
-        raise SelectionError("count exceeds the split size")
-    items = list(eligible)
     _shuffle(items, random.Random(seed))
-    chosen = items[:count]
-    tasks = tuple((entry.task_id, entry.scenario_id) for entry in chosen)
+    return items
+
+
+def _task_set(
+    catalog: TaskCatalog,
+    split: str,
+    selection_rule: str,
+    seed: int,
+    tasks: tuple[tuple[str, str | None], ...],
+) -> TaskSet:
     payload = canonical_task_set_bytes(
         appworld_version=catalog.appworld_version,
         split=split,
