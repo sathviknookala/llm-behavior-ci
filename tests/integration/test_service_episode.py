@@ -330,8 +330,8 @@ class ServiceEpisodeIntegrationTests(unittest.TestCase):
                 configuration_hash=digest,
                 baselines=(("task_success", 0.9),),
             ),
+            period_id="period-test",
             clock=self.clock,
-            dedup_seconds=0.0,
         )
         self._completion = {"index": 0}
 
@@ -459,8 +459,8 @@ class MultiSignalServiceMonitoringTests(unittest.TestCase):
                 configuration_hash=digest,
                 baselines=(("task_success", 0.9), ("tool_error_count", 0.0)),
             ),
+            period_id="period-test",
             clock=self.clock,
-            dedup_seconds=0.0,
         )
         self.tool_selection_monitor = DistributionalMonitor(
             DistributionalMonitorSettings(

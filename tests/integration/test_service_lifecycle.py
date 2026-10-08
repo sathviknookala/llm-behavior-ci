@@ -333,8 +333,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         self,
         production: RunConfiguration,
         *,
-        dedup_seconds: float = 60.0,
-        period_id: str | None = "period-0",
+        period_id: str = "period-0",
         threshold: float = 0.5,
     ) -> ProductionMonitor:
         digest = run_configuration_hash(production)
@@ -358,7 +357,6 @@ class ServiceLifecycleTests(unittest.TestCase):
                 baselines=(("task_success", 0.9),),
             ),
             clock=self.clock,
-            dedup_seconds=dedup_seconds,
             period_id=period_id,
         )
 
@@ -794,7 +792,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             any(item.decision == "promote" for item in decisions)
         )
 
-    def test_one_persisted_alert_inside_dedup_window(self) -> None:
+    def test_one_persisted_alert_per_incident(self) -> None:
         def factory(config: RunConfiguration) -> RuntimeDependencies:
             return self._execute_runtime(success=False)
 
@@ -803,8 +801,7 @@ class ServiceLifecycleTests(unittest.TestCase):
                 runtime_factory=factory,
                 monitor=self._monitor(
                     self.production,
-                    dedup_seconds=60.0,
-                    period_id=None,
+                    period_id="period-alerts",
                 ),
                 fraction=0.01,
                 canary_assignment_seed=0,

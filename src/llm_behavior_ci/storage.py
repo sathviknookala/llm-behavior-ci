@@ -47,6 +47,7 @@ class AlertRecord:
     sample_size: int
     raised_at: datetime
     period_id: str | None = None
+    attributed_slices: tuple[str, ...] = ()
 
     @property
     def incident_key(self) -> tuple[str, str, str, str] | None:
@@ -75,6 +76,8 @@ class AlertRecord:
         }
         if self.period_id is not None:
             payload["period_id"] = self.period_id
+        if self.attributed_slices:
+            payload["attributed_slices"] = list(self.attributed_slices)
         return payload
 
     @classmethod
@@ -112,6 +115,11 @@ class AlertRecord:
         period_id = payload.get("period_id")
         if period_id is not None and (not isinstance(period_id, str) or period_id == ""):
             raise StorageError("alert record period_id is invalid")
+        attributed = payload.get("attributed_slices", [])
+        if not isinstance(attributed, list) or any(
+            not isinstance(item, str) or item == "" for item in attributed
+        ):
+            raise StorageError("alert record attributed_slices is invalid")
         return cls(
             configuration_hash=str(payload["configuration_hash"]),
             reference_configuration_hash=str(
@@ -125,6 +133,7 @@ class AlertRecord:
             sample_size=sample_size,
             raised_at=parsed,
             period_id=period_id,
+            attributed_slices=tuple(attributed),
         )
 
 

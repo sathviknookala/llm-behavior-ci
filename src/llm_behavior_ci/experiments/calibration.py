@@ -38,7 +38,7 @@ from llm_behavior_ci.config import (
 from llm_behavior_ci.records import assert_public_payload
 from llm_behavior_ci.stats.bootstrap import clustered_paired_bootstrap
 from llm_behavior_ci.tasks.selection import TaskSet
-from llm_behavior_ci.usage import PricingTable
+from llm_behavior_ci.usage import PricingTable, UsageError, token_cost
 
 CHECKPOINT_VERSION = "calibration-checkpoint-v1"
 _OPEN_SPLITS = frozenset({"train", "dev"})
@@ -348,7 +348,7 @@ def episode_token_cost(
     observation: ScoredObservation,
     pricing: PricingTable,
 ) -> float | None:
-    """Price one episode. Unknown cache or output leaves the cost unset."""
+    """Price one episode with ``usage.token_cost``. Unknown counts leave it unset."""
 
     if observation.provider is None or observation.model_id is None:
         return None
@@ -356,20 +356,19 @@ def episode_token_cost(
     if entry is None:
         return None
     rates = dict(entry.per_million_tokens)
-    if observation.input_tokens is None or observation.output_tokens is None:
-        return None
     if "input_tokens" not in rates or "output_tokens" not in rates:
         return None
-    cache = observation.cache_read_tokens
-    if cache is None or cache > observation.input_tokens:
+    try:
+        return token_cost(
+            observation.provider,
+            rates,
+            input_tokens=observation.input_tokens,
+            output_tokens=observation.output_tokens,
+            cache_read_tokens=observation.cache_read_tokens,
+            cache_write_tokens=None,
+        )
+    except UsageError:
         return None
-    cached_rate = rates.get("cache_read_tokens", rates["input_tokens"])
-    fresh = observation.input_tokens - cache
-    return (
-        fresh * rates["input_tokens"]
-        + cache * cached_rate
-        + observation.output_tokens * rates["output_tokens"]
-    ) / 1_000_000.0
 
 
 def calibration_report(

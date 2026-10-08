@@ -140,8 +140,8 @@ class ProductionMonitorIntegrationTests(unittest.TestCase):
         monitor = ProductionMonitor(
             settings,
             reference,
+            period_id="period-test",
             clock=clock,
-            dedup_seconds=60.0,
         )
         alerts = []
         for index, token in enumerate(("2" * 32, "3" * 32, "4" * 32)):
@@ -190,8 +190,8 @@ class ProductionMonitorIntegrationTests(unittest.TestCase):
         monitor = ProductionMonitor(
             settings,
             reference,
+            period_id="period-test",
             clock=clock,
-            dedup_seconds=0.0,
         )
         prior = monitor.update(
             observation_from_episode(
@@ -212,7 +212,8 @@ class ProductionMonitorIntegrationTests(unittest.TestCase):
             FrozenReference(
                 configuration_hash=_HASH_B,
                 baselines=(("task_success", 0.8),),
-            )
+            ),
+            period_id="period-promoted",
         )
         healthy = monitor.update(
             observation_from_episode(
@@ -272,7 +273,6 @@ class ProductionMonitorIntegrationTests(unittest.TestCase):
             settings,
             reference,
             clock=clock,
-            dedup_seconds=60.0,
             period_id="production-window",
         )
         sink = LocalAlertSink(dedup_seconds=60.0)
@@ -353,7 +353,6 @@ class MixedMonitoringPeriodTests(unittest.TestCase):
             scalar_settings,
             scalar_reference,
             clock=clock,
-            dedup_seconds=0.0,
             period_id="period-a",
         )
 
@@ -414,7 +413,8 @@ class MixedMonitoringPeriodTests(unittest.TestCase):
             FrozenReference(
                 configuration_hash=_HASH_B,
                 baselines=(("task_success", 0.8),),
-            )
+            ),
+            period_id="period-b",
         )
         distributional_monitor.reset()
         with self.assertRaises(MonitorRejected):
@@ -426,7 +426,7 @@ class MixedMonitoringPeriodTests(unittest.TestCase):
                         completion_index=0,
                     ),
                 ),
-                period_id="a-different-period",
+                period_id="period-a",
             )
         healthy_after_promotion = scalar_monitor.update(
             observation_from_episode(
@@ -436,7 +436,7 @@ class MixedMonitoringPeriodTests(unittest.TestCase):
                     completion_index=0,
                 ),
             ),
-            period_id="period-a",
+            period_id="period-b",
         )
         self.assertEqual(healthy_after_promotion, ())
         self.assertEqual(scalar_monitor.reference.configuration_hash, _HASH_B)

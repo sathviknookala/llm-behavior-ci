@@ -1619,12 +1619,21 @@ class StoppingRule:
     ``alpha``, ``horizon_episodes``, and ``name`` are required. ``threshold``
     is the decision threshold for rules that use one. ``None`` means the
     named rule has no threshold parameter. No level or threshold is filled in.
+
+    ``slack`` is the CUSUM reference allowance ``k`` in the signal's own
+    units, subtracted from every deviation before it accumulates. Only a
+    ``cusum`` rule takes it. ``None`` keeps the earlier recorded behavior,
+    ``k = 0``, and is omitted from ``to_dict`` so older recorded settings
+    are unchanged; a set value is recorded. Positive slack lengthens the
+    healthy run length; it is not an α guarantee, and CUSUM stays a
+    record-only method in validation.
     """
 
     name: str
     alpha: float
     horizon_episodes: int
     threshold: float | None = None
+    slack: float | None = None
 
     def __post_init__(self) -> None:
         _rule_name(self.name, "name")
@@ -1632,9 +1641,16 @@ class StoppingRule:
         _positive(self.horizon_episodes, "horizon_episodes")
         if self.threshold is not None:
             _finite_float(self.threshold, "threshold")
+        if self.slack is not None:
+            if self.name != "cusum":
+                raise ConfigError("slack applies only to a cusum stopping rule")
+            _nonnegative_float(self.slack, "slack")
 
     def to_dict(self) -> dict[str, object]:
-        return _plain_dict(self, StoppingRule)
+        payload = _plain_dict(self, StoppingRule)
+        if self.slack is None:
+            payload.pop("slack")
+        return payload
 
     @classmethod
     def from_dict(
@@ -1643,7 +1659,7 @@ class StoppingRule:
         name: str = "stopping rule",
     ) -> StoppingRule:
         mapping = _object(payload, name)
-        _require_fields(mapping, cls, name, optional=frozenset({"threshold"}))
+        _require_fields(mapping, cls, name, optional=frozenset({"threshold", "slack"}))
         return _construct(name, lambda: _load(cls, mapping))
 
 

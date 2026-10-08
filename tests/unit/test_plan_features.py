@@ -9,6 +9,8 @@ from llm_behavior_ci.lifecycle.plan_features import (
     SEMANTIC_PLAN_FEATURES,
     STRUCTURAL_PLAN_FEATURES,
     extract_plan_features,
+    plan_tool_references,
+    require_semantic_coverage,
     semantic_plan_features,
     structural_plan_features,
 )
@@ -32,7 +34,7 @@ def _spec(**overrides: object) -> TaskPlanSpec:
 
 class SchemaTests(unittest.TestCase):
     def test_schema_version_is_stable_and_named(self) -> None:
-        self.assertEqual(PLAN_FEATURE_SCHEMA_VERSION, "plan-features-v2")
+        self.assertEqual(PLAN_FEATURE_SCHEMA_VERSION, "plan-features-v3")
         self.assertTrue(STRUCTURAL_PLAN_FEATURES)
         self.assertTrue(SEMANTIC_PLAN_FEATURES)
         self.assertEqual(
@@ -129,6 +131,82 @@ class InvalidToolReferenceTests(unittest.TestCase):
         self.assertEqual(features["invalid_tool_reference_fraction"], 0.0)
         self.assertEqual(features["valid_tool_reference_count"], 0.0)
         self.assertEqual(features["invalid_tool_reference_count"], 0.0)
+
+
+class LabelledStepReferenceTests(unittest.TestCase):
+    _TOOLS = (
+        "simple_note.login",
+        "simple_note.search_notes",
+        "supervisor.show_account_passwords",
+    )
+
+    def test_plan_v1_app_then_api_steps_are_read(self) -> None:
+        self.assertEqual(
+            plan_tool_references("2. Simple Note: search_notes for movies", self._TOOLS),
+            (("simple_note.search_notes", True),),
+        )
+        self.assertEqual(
+            plan_tool_references("1. **Supervisor**: show_account_passwords", self._TOOLS),
+            (("supervisor.show_account_passwords", True),),
+        )
+
+    def test_dotted_reference_in_a_labelled_step_is_counted_once(self) -> None:
+        self.assertEqual(
+            plan_tool_references(
+                "1. Supervisor: supervisor.show_account_passwords", self._TOOLS
+            ),
+            (("supervisor.show_account_passwords", True),),
+        )
+
+    def test_unresolved_labels_are_prose_not_invalid_references(self) -> None:
+        for line in (
+            "Plan:",
+            "Note: the user wants movies",
+            "1. Simple Note: delete_everything",
+            "3. Weather: forecast",
+        ):
+            self.assertEqual(plan_tool_references(line, self._TOOLS), (), line)
+
+    def test_labelled_and_dotted_plans_score_alike(self) -> None:
+        spec = _spec()
+        dotted = "1. calendar.list_events: list events\n2. calendar.create_event: create an event\n"
+        labelled = "1. Calendar: list_events to list events\n2. Calendar: create_event to create an event\n"
+        dotted_features = semantic_plan_features(dotted, spec)
+        labelled_features = semantic_plan_features(labelled, spec)
+        for name in (
+            "valid_tool_reference_count",
+            "tool_reference_fraction",
+            "required_tool_coverage_fraction",
+            "dependency_consistency_fraction",
+        ):
+            self.assertEqual(dotted_features[name], labelled_features[name], name)
+
+
+class RequiredToolCoverageTests(unittest.TestCase):
+    def test_plan_naming_no_tool_has_no_tool_coverage(self) -> None:
+        spec = _spec()
+        features = semantic_plan_features(
+            "1. list the events in the calendar\n2. create an event\n", spec
+        )
+        self.assertEqual(features["invalid_tool_reference_fraction"], 0.0)
+        self.assertEqual(features["dependency_consistency_fraction"], 1.0)
+        self.assertEqual(features["required_tool_coverage_fraction"], 0.0)
+        self.assertEqual(features["required_tool_total_count"], 2.0)
+
+    def test_coverage_counts_only_valid_required_tools(self) -> None:
+        spec = _spec()
+        features = semantic_plan_features(
+            "1. calendar.list_events: list events\n2. calendar.delete_all: wipe\n", spec
+        )
+        self.assertEqual(features["required_tool_coverage_fraction"], 0.5)
+        self.assertEqual(features["required_tool_covered_count"], 1.0)
+
+    def test_gate_refuses_coverage_without_declared_pairs(self) -> None:
+        spec = _spec(dependency_pairs=())
+        with self.assertRaises(PlanFeatureError):
+            require_semantic_coverage(
+                ("task-a",), {"task-a": spec}, ("required_tool_coverage_fraction",)
+            )
 
 
 class RequirementCoverageTests(unittest.TestCase):

@@ -6,7 +6,6 @@ import asyncio
 import math
 import re
 import threading
-import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -57,6 +56,7 @@ from llm_behavior_ci.lifecycle.monitoring import (
     tool_selection_observation_from_episode,
 )
 from llm_behavior_ci.records import EpisodeResult, ModelStep, ToolStep
+from llm_behavior_ci.runtime.clock import monotonic
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
     RuntimeDependencies,
@@ -123,6 +123,7 @@ class ServiceDependencies:
     ) = None
     plan_kl_mean_nats_for: Callable[[EpisodeResult], float | None] | None = None
     admission_mode: Literal["release", "test"] = "release"
+    alert_dedup_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         try:
@@ -220,8 +221,9 @@ class _ServiceState:
         self.monitor_period_id = dependencies.monitor.period_id
         self.alert_sink = LocalAlertSink(
             dependencies.store,
-            dedup_seconds=float(dependencies.monitor._dedup_seconds),
+            dedup_seconds=dependencies.alert_dedup_seconds,
         )
+        self.incidents_restored = False
         self.deployment_lock = threading.Lock()
         self._slot_lock = threading.Lock()
         self._in_flight = 0
@@ -431,6 +433,9 @@ def _feed_monitor(
     monitor = state.dependencies.monitor
     period_id = state.monitor_period_id
     store = state.dependencies.store
+    if not state.incidents_restored:
+        monitor.restore_open_incidents(store.load_alerts())
+        state.incidents_restored = True
     episode_id = episode.episode.episode_id
     all_alerts: list[Alert] = []
     updated = False
@@ -937,10 +942,10 @@ def create_app(dependencies: ServiceDependencies) -> FastAPI:
         state.admission = "open"
         yield
         state.admission = "shutting_down"
-        deadline = time.monotonic() + float(
+        deadline = monotonic() + float(
             dependencies.shutdown_timeout_seconds
         )
-        while state.in_flight() > 0 and time.monotonic() < deadline:
+        while state.in_flight() > 0 and monotonic() < deadline:
             await asyncio.sleep(0.01)
         state.close_store_once()
 

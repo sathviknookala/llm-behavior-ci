@@ -405,7 +405,7 @@ def _build_lock(
             score_margin=-0.02,
             kl_limit_nats=0.05,
             mmd_bandwidth=1.0,
-            mmd_permutations=19,
+            mmd_permutations=99,
             mmd_alpha=0.05,
             plan_format_version="plan-v1",
         ),
@@ -459,7 +459,14 @@ def _build_lock(
 def _sets():
     train_tasks = _make_task_set(
         split="train",
-        tasks=(("train-a", "scenario-1"), ("train-b", None)),
+        tasks=(
+            ("train-a", "scenario-1"),
+            ("train-b", None),
+            ("train-c", "scenario-3"),
+            ("train-d", "scenario-4"),
+            ("train-e", "scenario-5"),
+            ("train-f", "scenario-6"),
+        ),
     )
     dev_tasks = _make_task_set(split="dev", tasks=(("dev-a", None),))
     test_tasks = _make_task_set(
@@ -468,7 +475,7 @@ def _sets():
     return train_tasks, dev_tasks, test_tasks
 
 
-_GATE_WORLDS = 6
+_GATE_WORLDS = 18
 
 
 class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
@@ -943,7 +950,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                     score_margin=-0.02,
                     kl_limit_nats=0.05,
                     mmd_bandwidth=1.0,
-                    mmd_permutations=19,
+                    mmd_permutations=99,
                     mmd_alpha=0.05,
                     plan_format_version="plan-v1",
                 ),

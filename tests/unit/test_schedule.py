@@ -232,8 +232,8 @@ def _monitor(healthy: RunConfiguration, clock: SimulatedClock) -> ProductionMoni
             ),
         ),
         FrozenReference(configuration_hash=digest, baselines=(("task_success", 0.9),)),
+        period_id="period-test",
         clock=clock,
-        dedup_seconds=0.0,
     )
 
 

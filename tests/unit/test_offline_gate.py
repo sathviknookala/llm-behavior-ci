@@ -124,8 +124,18 @@ def _payload() -> dict[str, object]:
     }
 
 
-def _task_set() -> TaskSet:
-    tasks = (("task-a", "scenario-1"), ("task-b", None))
+_GATE_TASKS = (
+    ("task-a", "scenario-1"),
+    ("task-b", None),
+    ("task-c", "scenario-3"),
+    ("task-d", "scenario-4"),
+    ("task-e", "scenario-5"),
+    ("task-f", "scenario-6"),
+)
+_GATE_CLUSTERS = ("scenario-1", "task-b", "scenario-3", "scenario-4", "scenario-5", "scenario-6")
+
+
+def _task_set(tasks: tuple[tuple[str, str | None], ...] = _GATE_TASKS) -> TaskSet:
     payload = canonical_task_set_bytes(
         appworld_version="0.1.3.post1",
         split="train",
@@ -138,10 +148,10 @@ def _task_set() -> TaskSet:
         split="train",
         selection_rule="deterministic_sample",
         selection_seed=20260926,
-        task_count=2,
-        scenario_count=2,
-        task_ids=("task-a", "task-b"),
-        scenario_ids=("scenario-1", None),
+        task_count=len(tasks),
+        scenario_count=len({scenario_id or task_id for task_id, scenario_id in tasks}),
+        task_ids=tuple(task_id for task_id, _ in tasks),
+        scenario_ids=tuple(scenario_id for _, scenario_id in tasks),
         task_set_hash=task_set_hash_from_bytes(payload),
     )
 
@@ -174,7 +184,7 @@ def _settings(**overrides: object) -> GateSettings:
         "score_margin": -0.02,
         "kl_limit_nats": 0.05,
         "mmd_bandwidth": 1.0,
-        "mmd_permutations": 19,
+        "mmd_permutations": 99,
         "mmd_alpha": 0.05,
         "plan_format_version": "plan-v1",
     }
@@ -183,27 +193,19 @@ def _settings(**overrides: object) -> GateSettings:
 
 
 def _task_plan_specs() -> tuple[TaskPlanSpec, ...]:
-    spec = TaskPlanSpec(
-        task_id="task-a",
-        available_tools=("calendar.open_calendar", "calendar.create_event"),
-        subgoal_keywords=(
-            ("open the calendar",),
-            ("create an event", "add an event"),
-        ),
-        required_entities=("calendar",),
-        dependency_pairs=(("calendar.open_calendar", "calendar.create_event"),),
+    return tuple(
+        TaskPlanSpec(
+            task_id=task_id,
+            available_tools=("calendar.open_calendar", "calendar.create_event"),
+            subgoal_keywords=(
+                ("open the calendar",),
+                ("create an event", "add an event"),
+            ),
+            required_entities=("calendar",),
+            dependency_pairs=(("calendar.open_calendar", "calendar.create_event"),),
+        )
+        for task_id, _scenario_id in _GATE_TASKS
     )
-    other = TaskPlanSpec(
-        task_id="task-b",
-        available_tools=("calendar.open_calendar", "calendar.create_event"),
-        subgoal_keywords=(
-            ("open the calendar",),
-            ("create an event", "add an event"),
-        ),
-        required_entities=("calendar",),
-        dependency_pairs=(("calendar.open_calendar", "calendar.create_event"),),
-    )
-    return (spec, other)
 
 
 def _evidence(**overrides: object) -> PlanEvidenceInputs:
@@ -390,7 +392,7 @@ class OfflineGateUnitTests(unittest.TestCase):
         self.assertIsNotNone(decision.statistics[2].seed)
         self.assertEqual(decision.validation_provenance, "synthetic_fixture")
         self.assertNotEqual(decision.statistics[0].estimate, 1.0)
-        self.assertEqual(len(decision.artifact.scoring_contract_hashes), 4)
+        self.assertEqual(len(decision.artifact.scoring_contract_hashes), 2 * len(_GATE_TASKS))
         self.assertEqual(
             decision.artifact.scoring_contract_hashes,
             tuple(sorted(decision.artifact.scoring_contract_hashes)),
@@ -571,7 +573,7 @@ class OfflineGateUnitTests(unittest.TestCase):
                 plan_evidence=_evidence(required_statistics=("mmd",)),
             )
         kwargs = mmd_call.call_args.kwargs
-        self.assertEqual(kwargs["clusters"], ("scenario-1", "task-b"))
+        self.assertEqual(kwargs["clusters"], _GATE_CLUSTERS)
 
     def test_mmd_rejected(self) -> None:
         task_set = _task_set()
@@ -746,9 +748,9 @@ class OfflineGateUnitTests(unittest.TestCase):
                 ),
             )
         kwargs = mmd_call.call_args.kwargs
-        self.assertEqual(kwargs["clusters"], ("scenario-1", "task-b"))
-        self.assertEqual(kwargs["production"], ((0.5, 0.0), (0.5, 0.0)))
-        self.assertEqual(kwargs["candidate"], ((1.0, 0.0), (1.0, 0.0)))
+        self.assertEqual(kwargs["clusters"], _GATE_CLUSTERS)
+        self.assertEqual(kwargs["production"], ((0.5, 0.0),) * len(_GATE_TASKS))
+        self.assertEqual(kwargs["candidate"], ((1.0, 0.0),) * len(_GATE_TASKS))
 
     def test_semantic_features_are_deterministic_across_repeated_calls(self) -> None:
         task_set = _task_set()
@@ -1027,6 +1029,87 @@ class OfflineGateUnitTests(unittest.TestCase):
         source = root.read_text(encoding="utf-8")
         self.assertNotIn("DEMO_", source)
         self.assertNotIn("experiments", source)
+
+
+
+class SessionFactoryNeverCalled:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, task_id: str) -> FakeSession:
+        self.calls += 1
+        return FakeSession(task_id)
+
+
+class GateDesignPreflightTests(unittest.TestCase):
+    def _run(self, task_set: TaskSet, settings: GateSettings, factory) -> None:
+        reference = _config(task_set, run_seed=7)
+        candidate = _config(task_set, run_seed=8)
+        clock = _clock()
+        run_offline_gate(
+            reference,
+            candidate,
+            task_set,
+            settings=settings,
+            runtime=RuntimeDependencies(
+                session_factory=factory, agent=PlanAgent(clock), clock=clock
+            ),
+            plan_evidence=_evidence(required_statistics=("plan_quality", "mmd")),
+        )
+
+    def test_three_scenario_design_is_refused_before_any_world_opens(self) -> None:
+        factory = SessionFactoryNeverCalled()
+        with self.assertRaisesRegex(GateExecutionError, "3 independent scenario clusters"):
+            self._run(_task_set(_GATE_TASKS[:3]), _settings(mmd_permutations=199), factory)
+        self.assertEqual(factory.calls, 0)
+
+    def test_tasks_sharing_a_scenario_are_one_cluster(self) -> None:
+        shared = tuple((task_id, "scenario-1") for task_id, _ in _GATE_TASKS)
+        factory = SessionFactoryNeverCalled()
+        with self.assertRaisesRegex(GateExecutionError, "1 independent scenario clusters"):
+            self._run(_task_set(shared), _settings(mmd_permutations=999), factory)
+        self.assertEqual(factory.calls, 0)
+
+    def test_permutation_count_also_bounds_resolution(self) -> None:
+        factory = SessionFactoryNeverCalled()
+        with self.assertRaises(GateExecutionError):
+            self._run(_task_set(), _settings(mmd_permutations=19), factory)
+        self.assertEqual(factory.calls, 0)
+
+    def test_resolvable_design_runs(self) -> None:
+        factory = SessionFactoryNeverCalled()
+        self._run(_task_set(), _settings(mmd_permutations=99), factory)
+        self.assertEqual(factory.calls, 2 * len(_GATE_TASKS))
+
+
+class PlanQualityContractTests(unittest.TestCase):
+    def test_tool_terms_need_required_tool_coverage(self) -> None:
+        for feature in (
+            "invalid_tool_reference_fraction",
+            "dependency_consistency_fraction",
+            "tool_reference_fraction",
+        ):
+            with self.assertRaises(GateExecutionError, msg=feature):
+                _evidence(
+                    plan_quality_features=("requirement_coverage_fraction", feature),
+                    plan_quality_weights=(1.0, -1.0),
+                )
+        with self.assertRaises(GateExecutionError):
+            _evidence(
+                plan_quality_features=(
+                    "invalid_tool_reference_fraction",
+                    "required_tool_coverage_fraction",
+                ),
+                plan_quality_weights=(-1.0, 0.0),
+            )
+        accepted = _evidence(
+            plan_quality_features=(
+                "invalid_tool_reference_fraction",
+                "required_tool_coverage_fraction",
+            ),
+            plan_quality_weights=(-1.0, 0.5),
+        )
+        self.assertIn("required_tool_coverage_fraction", accepted.plan_quality_features)
 
 
 if __name__ == "__main__":

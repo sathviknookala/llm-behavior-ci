@@ -4,7 +4,6 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -36,6 +35,7 @@ from llm_behavior_ci.lifecycle.monitoring import (
     monitoring_period_id,
 )
 from llm_behavior_ci.records import EpisodeResult
+from llm_behavior_ci.runtime.clock import wall_now
 from llm_behavior_ci.runtime.factory import (
     ConfigurationRoutedRuntimeFactory,
     RuntimeFactoryError,
@@ -264,12 +264,11 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
         run_configuration_hash(production), frozen.configuration_hash
     )
     store = EpisodeStore(Path(args.store))
-    clock = lambda: datetime.now(timezone.utc)
+    clock = wall_now
     monitor = ProductionMonitor(
         monitor_settings,
         frozen,
         clock=clock,
-        dedup_seconds=float(args.dedup_seconds),
         period_id=period_id,
         use_slice_attribution=bool(args.slice_attribution),
     )
@@ -303,6 +302,7 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
         task_selection_allowance=allowance,
         tool_selection_monitor=distributional_monitors.get("tool_selection"),
         task_mix_monitor=distributional_monitors.get("task_mix"),
+        alert_dedup_seconds=float(args.dedup_seconds),
     )
 
 

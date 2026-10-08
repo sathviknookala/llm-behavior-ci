@@ -1732,7 +1732,7 @@ def _run_or_resume_scheduled_monitor(
         monitor_settings,
         reference_baselines,
         clock=simulated,
-        dedup_seconds=0.0,
+        period_id=f"benchmark-{reference_baselines.configuration_hash[:16]}-{seed}",
     )
     distributional = build_distributional_monitors(
         distributional_monitor_settings,
@@ -2219,7 +2219,7 @@ def _run_or_resume_monitor(
         monitor_settings,
         reference_baselines,
         clock=clock,
-        dedup_seconds=0.0,
+        period_id=f"benchmark-{reference_baselines.configuration_hash[:16]}-{seed}",
     )
     distributional_monitors = build_distributional_monitors(
         distributional_monitor_settings,

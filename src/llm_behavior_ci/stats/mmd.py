@@ -20,6 +20,27 @@ class MMDResult:
     candidate_size: int
 
 
+def paired_permutation_resolution(cluster_count: int, permutations: int) -> float:
+    """Smallest expected p-value the paired-swap MMD test can report.
+
+    With ``cluster_count`` independent clusters there are ``2**cluster_count``
+    swap patterns, and the identity and the full swap give the same
+    statistic, so even the most extreme observation is matched by a random
+    pattern with probability ``2**(1 - cluster_count)``. The Monte Carlo
+    p-value ``(exceedances + 1) / (permutations + 1)`` then has expectation
+    ``(1 + permutations * 2**(1 - cluster_count)) / (permutations + 1)``.
+    A design whose resolution exceeds α cannot reject at α whatever the
+    data, so ``offline_gate`` refuses it before any model call.
+    """
+
+    if isinstance(cluster_count, bool) or not isinstance(cluster_count, int) or cluster_count < 1:
+        raise MMDError("cluster_count must be a positive integer")
+    if isinstance(permutations, bool) or not isinstance(permutations, int) or permutations < 1:
+        raise MMDError("permutations must be a positive integer")
+    tie = 2.0 ** (1 - cluster_count)
+    return (1.0 + permutations * tie) / (permutations + 1)
+
+
 def _points(
     samples: Sequence[Sequence[float]], name: str
 ) -> tuple[tuple[float, ...], ...]:

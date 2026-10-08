@@ -394,8 +394,8 @@ def _monitor(production: RunConfiguration, clock) -> SpyMonitor:
     return SpyMonitor(
         settings,
         reference,
+        period_id="period-test",
         clock=clock,
-        dedup_seconds=0.0,
     )
 
 
@@ -430,8 +430,8 @@ def _monitor_with_plan_signals(production: RunConfiguration, clock) -> SpyMonito
     return SpyMonitor(
         settings,
         reference,
+        period_id="period-test",
         clock=clock,
-        dedup_seconds=0.0,
     )
 
 

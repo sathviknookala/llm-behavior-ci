@@ -28,6 +28,7 @@ from llm_behavior_ci.config import (
     DistributionalMonitorSettings,
     MonitorSettings,
     RunConfiguration,
+    run_configuration_hash,
 )
 from llm_behavior_ci.experiments.faults import FaultError, apply_fault, load_fault
 from llm_behavior_ci.experiments.run_config import RunConfigError, load_local_task_manifest
@@ -44,6 +45,7 @@ from llm_behavior_ci.lifecycle.monitoring import (
     MonitorRejected,
     ProductionMonitor,
     build_distributional_monitors,
+    monitoring_period_id,
 )
 from llm_behavior_ci.runtime.episode import EpisodeRejected
 from llm_behavior_ci.runtime.factory import LiveRuntimeFactory
@@ -126,7 +128,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         factory.preflight({"reference": base, "candidate": faulted})
         clock = SimulatedClock(schedule.clock_start)
-        monitor = ProductionMonitor(monitor_settings, frozen, clock=clock, dedup_seconds=0.0)
+        monitor = ProductionMonitor(
+            monitor_settings,
+            frozen,
+            clock=clock,
+            period_id=monitoring_period_id(run_configuration_hash(base), frozen.configuration_hash),
+        )
         distributional = build_distributional_monitors(
             distributional_settings,
             reference_configuration_hash=frozen.configuration_hash,

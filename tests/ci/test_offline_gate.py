@@ -91,8 +91,19 @@ def _payload() -> dict[str, object]:
     }
 
 
+_GATE_TASKS = (
+    ("task-a", "scenario-1"),
+    ("task-b", None),
+    ("task-c", "scenario-3"),
+    ("task-d", "scenario-4"),
+    ("task-e", "scenario-5"),
+    ("task-f", "scenario-6"),
+)
+_GATE_CLUSTERS = ("scenario-1", "task-b", "scenario-3", "scenario-4", "scenario-5", "scenario-6")
+
+
 def _task_set() -> TaskSet:
-    tasks = (("task-a", "scenario-1"), ("task-b", None))
+    tasks = _GATE_TASKS
     payload = canonical_task_set_bytes(
         appworld_version="0.1.3.post1",
         split="train",
@@ -105,10 +116,10 @@ def _task_set() -> TaskSet:
         split="train",
         selection_rule="deterministic_sample",
         selection_seed=20260926,
-        task_count=2,
-        scenario_count=2,
-        task_ids=("task-a", "task-b"),
-        scenario_ids=("scenario-1", None),
+        task_count=len(tasks),
+        scenario_count=len(tasks),
+        task_ids=tuple(task_id for task_id, _ in tasks),
+        scenario_ids=tuple(scenario_id for _, scenario_id in tasks),
         task_set_hash=task_set_hash_from_bytes(payload),
     )
 
@@ -134,7 +145,7 @@ def _settings() -> GateSettings:
         score_margin=-0.02,
         kl_limit_nats=0.05,
         mmd_bandwidth=1.0,
-        mmd_permutations=19,
+        mmd_permutations=99,
         mmd_alpha=0.05,
         plan_format_version="plan-v1",
     )
@@ -340,7 +351,7 @@ class OfflineGateTests(unittest.TestCase):
         bootstrap_call.assert_called_once()
         kl_call.assert_called_once()
         mmd_call.assert_called_once()
-        self.assertEqual(mmd_call.call_args.kwargs["clusters"], ("scenario-1", "task-b"))
+        self.assertEqual(mmd_call.call_args.kwargs["clusters"], _GATE_CLUSTERS)
         self.assertEqual(decision.outcome, "PASS")
         self.assertEqual(decision.reason_codes, ())
 
@@ -364,7 +375,7 @@ class OfflineGateTests(unittest.TestCase):
                 score_margin=0.01,
                 kl_limit_nats=0.05,
                 mmd_bandwidth=1.0,
-                mmd_permutations=19,
+                mmd_permutations=99,
                 mmd_alpha=0.05,
                 plan_format_version="plan-v1",
             ),

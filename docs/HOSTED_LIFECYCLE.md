@@ -196,6 +196,8 @@ Required inputs:
 
 Admission (`POST /candidates`, HTTP 409 on refusal) accepts only a stored `gate_run` PASS; `serve.py` admits in release mode, so `synthetic_fixture` evidence is refused with or without an allowance. After the train leaves are restored, every other hashed leaf must match the gate: model, agent, prompt, sampling, `run_seed`, `git_commit`, and `protocol_hash`. An allowance whose train values differ from the gate's task set fails the same hash check. Without `--task-selection-allowance` admission is strict, and a train gate cannot admit dev configurations. The service never builds a PASS.
 
+`--dedup-seconds` now applies only to the alert sink, for alerts that have no period. The production monitor opens one aggregate incident per signal per monitoring period, and slices only attribute that incident. On its first feed, the service restores the open incidents from `--store`, so a restart does not raise an incident again.
+
 Hosted roles take no `--*-base-url`. Endpoints route by configuration hash, so a promoted candidate keeps serving from its own route while the monitor compares it with the previous production reference.
 
 ### 9. Dev stream rehearsal
@@ -221,7 +223,7 @@ py scripts/evaluation/export_usage.py --store data/processed/gate.sqlite \
   --pricing data/processed/pricing/zai_v1.json --output data/processed/usage.json
 ```
 
-Without `--pricing`, or with an unknown count in a priced field, cost is null.
+Without `--pricing`, or with an unknown count in a priced field, cost is null. Z.AI cost charges `prompt_tokens − cached_tokens` at the input rate, `cached_tokens` at the cache-read rate, and `completion_tokens` once; a pricing file with a reasoning rate is refused (`docs/EVAL_PROTOCOL.md`, Method contracts).
 
 ### 11. Protocol commitment (after pre-registration only)
 

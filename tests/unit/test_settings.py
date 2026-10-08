@@ -96,7 +96,7 @@ class SettingsContractTests(unittest.TestCase):
         self.assertIsNone(rule.threshold)
         self.assertEqual(rule.alpha, 0.2)
         for field in fields(StoppingRule):
-            if field.name == "threshold":
+            if field.name in ("threshold", "slack"):
                 self.assertIsNone(field.default)
             else:
                 self.assertIs(field.default, MISSING)

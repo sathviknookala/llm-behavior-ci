@@ -111,7 +111,19 @@ class _ControllerState:
 
 
 class _FixedWindowCanary:
-    """Horizon mean of paired success differences."""
+    """Heuristic comparator: horizon mean of paired success differences.
+
+    Rolls back when the mean paired difference at the horizon is below
+    ``-harm_margin``. It is not a hypothesis test and makes no α claim: the
+    stopping rule's ``alpha`` is recorded but never read, and ``p_value`` is
+    always ``None``. At a horizon of 3 a single net loss rolls back, and an
+    identical candidate is rolled back with probability 11/32 when both sides
+    succeed independently with probability 0.5
+    (``tests/validity/test_fixed_window_null.py``). ``paired_difference_cs``
+    is the α-aware rule. Reaching the horizon without that alarm promotes
+    under ``horizon_reached_without_harm``, which is an exposure policy and
+    not evidence of non-inferiority.
+    """
 
     def __init__(self, *, harm_margin: float, horizon_episodes: int) -> None:
         self._harm_margin = harm_margin

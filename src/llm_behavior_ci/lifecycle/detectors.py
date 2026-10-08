@@ -68,7 +68,7 @@ def build_detector(
         direction = "decrease" if signal in BOUNDED_SIGNALS else "increase"
         return CUSUM(
             target=baseline_value,
-            slack=0.0,
+            slack=0.0 if rule.slack is None else rule.slack,
             threshold=rule.threshold,
             direction=direction,
         )

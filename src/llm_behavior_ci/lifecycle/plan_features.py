@@ -12,7 +12,11 @@ lock and validation artifacts bind it, and a lock written under another
 version is rejected. Changing a feature's definition, adding one, or
 removing one is a new version. ``plan-features-v2`` reads a tool reference
 as ``app.api`` or the action spelling ``apis.app.api``; v1 split
-``apis.app.api`` into the invalid pair ``apis.app``.
+``apis.app.api`` into the invalid pair ``apis.app``. ``plan-features-v3``
+also reads the ``plan-v1`` step form that names the app and then the API,
+``App Name: api_name``, when the label is one of the task's apps and the
+pair is an available tool, and adds required-tool coverage: a plan that
+names no tool no longer looks the same as a plan that names the right ones.
 
 Two pure functions produce the vector: ``structural_plan_features`` needs
 only the plan text (character/line/token shape; kept as supplementary
@@ -32,7 +36,7 @@ from typing import Mapping, Sequence
 
 from llm_behavior_ci.tasks.plan_specs import TaskPlanSpec
 
-PLAN_FEATURE_SCHEMA_VERSION = "plan-features-v2"
+PLAN_FEATURE_SCHEMA_VERSION = "plan-features-v3"
 
 STRUCTURAL_PLAN_FEATURES = frozenset(
     {
@@ -62,6 +66,9 @@ SEMANTIC_PLAN_FEATURES = frozenset(
         "dependency_violation_count",
         "dependency_applicable_count",
         "dependency_consistency_fraction",
+        "required_tool_coverage_fraction",
+        "required_tool_covered_count",
+        "required_tool_total_count",
     }
 )
 
@@ -80,12 +87,36 @@ DEPENDENCY_FEATURES = frozenset(
         "dependency_consistency_fraction",
     }
 )
+REQUIRED_TOOL_FEATURES = frozenset(
+    {
+        "required_tool_coverage_fraction",
+        "required_tool_covered_count",
+        "required_tool_total_count",
+    }
+)
+TOOL_REFERENCE_QUALITY_FEATURES = frozenset(
+    {
+        "tool_reference_fraction",
+        "invalid_tool_reference_fraction",
+        "dependency_consistency_fraction",
+    }
+)
+"""Quality terms a plan that names no tool scores without penalty or vacuously.
+
+A plan-quality score that uses any of them must also give
+``required_tool_coverage_fraction`` a positive weight
+(``offline_gate.PlanEvidenceInputs``).
+"""
 
 _NUMBERED_STEP = re.compile(r"^\s*\d+\.")
 _TOOL_CHAIN = re.compile(
     r"(?<![A-Za-z0-9_.])[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+(?![A-Za-z0-9_])"
 )
 _ACTION_NAMESPACE = "apis"
+_LABELLED_STEP = re.compile(
+    r"^\s*(?:[-*]\s*|\d+[.)]\s*)?[*_`]*(?P<label>[A-Za-z][A-Za-z0-9_ ]{0,48}?)[*_`]*\s*:\s*"
+    r"[*_`]*(?P<api>[A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_.])"
+)
 
 
 def tool_references(line: str) -> tuple[tuple[str, bool], ...]:
@@ -107,6 +138,34 @@ def tool_references(line: str) -> tuple[tuple[str, bool], ...]:
             found.append((".".join(parts[1:]), True))
         else:
             found.append((".".join(parts), False))
+    return tuple(found)
+
+
+def plan_tool_references(
+    line: str,
+    available_tools: Sequence[str],
+) -> tuple[tuple[str, bool], ...]:
+    """``tool_references`` plus the ``plan-v1`` labelled step form.
+
+    ``plan-v1`` asks each step to name the app, the API, and the effect, so
+    ``"2. Simple Note: search_notes for movies"`` names ``simple_note.
+    search_notes``. A label counts only at the start of a step, only when it
+    normalizes (case, spaces to underscores) to an app of ``available_tools``,
+    and only when the resulting ``app.api`` is available. An unresolved
+    label is ignored rather than counted invalid, because ``Word: word`` is
+    also ordinary prose. A dotted reference in the same line is read by
+    ``tool_references`` as before and is not counted twice.
+    """
+
+    found = list(tool_references(line))
+    available = {tool.lower() for tool in available_tools}
+    apps = {tool.split(".", 1)[0] for tool in available}
+    matched = _LABELLED_STEP.match(line)
+    if matched is not None:
+        app = "_".join(matched.group("label").lower().split())
+        tool = f"{app}.{matched.group('api').lower()}"
+        if app in apps and tool in available and (tool, True) not in found:
+            found.insert(0, (tool, True))
     return tuple(found)
 
 
@@ -175,7 +234,12 @@ def semantic_plan_features(
       is vacuously ``1.0``.
     - Zero tool-like references in the plan text means ``tool_reference_
       fraction`` and ``invalid_tool_reference_fraction`` are both ``0.0``:
-      a plan naming no tool at all gets no credit and no penalty.
+      a plan naming no tool at all gets no credit and no penalty from them.
+    - Required tools are the tools named in ``dependency_pairs``: a pair
+      asserts both tools are used. ``required_tool_coverage_fraction`` is
+      the share of them the plan validly references, so a plan naming no
+      tool scores ``0.0`` there. Zero declared pairs makes it vacuously
+      ``1.0``, which ``require_semantic_coverage`` refuses for a gate.
 
     A task with no ``TaskPlanSpec`` at all is not this function's problem
     to paper over: the caller (``lifecycle.offline_gate``) raises before
@@ -193,7 +257,7 @@ def semantic_plan_features(
     valid_mentions: list[tuple[int, str]] = []
     invalid_mentions: list[tuple[int, str]] = []
     for step_index, line in enumerate(non_empty):
-        for token, well_formed in tool_references(line):
+        for token, well_formed in plan_tool_references(line, task_spec.available_tools):
             if well_formed and token in available:
                 valid_mentions.append((step_index, token))
             else:
@@ -247,6 +311,14 @@ def semantic_plan_features(
         1.0 - (violations / applicable) if applicable else 1.0
     )
 
+    required_tools = {
+        tool.lower() for pair in task_spec.dependency_pairs for tool in pair
+    }
+    required_covered = len(required_tools & distinct_valid)
+    required_tool_coverage_fraction = (
+        required_covered / len(required_tools) if required_tools else 1.0
+    )
+
     return {
         "requirement_coverage_fraction": requirement_coverage_fraction,
         "subgoal_covered_count": float(subgoal_covered),
@@ -263,6 +335,9 @@ def semantic_plan_features(
         "dependency_violation_count": float(violations),
         "dependency_applicable_count": float(applicable),
         "dependency_consistency_fraction": dependency_consistency_fraction,
+        "required_tool_coverage_fraction": required_tool_coverage_fraction,
+        "required_tool_covered_count": float(required_covered),
+        "required_tool_total_count": float(len(required_tools)),
     }
 
 
@@ -294,6 +369,7 @@ def require_semantic_coverage(
         (SUBGOAL_FEATURES, "subgoal_keywords", lambda spec: spec.subgoal_keywords),
         (ENTITY_FEATURES, "required_entities", lambda spec: spec.required_entities),
         (DEPENDENCY_FEATURES, "dependency_pairs", lambda spec: spec.dependency_pairs),
+        (REQUIRED_TOOL_FEATURES, "dependency_pairs", lambda spec: spec.dependency_pairs),
     )
     for group, name, read in checks:
         if not requested & group:

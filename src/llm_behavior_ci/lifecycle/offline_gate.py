@@ -21,6 +21,7 @@ from llm_behavior_ci.lifecycle.plan_features import (
     PlanFeatureError,
     SEMANTIC_PLAN_FEATURES,
     STRUCTURAL_PLAN_FEATURES,
+    TOOL_REFERENCE_QUALITY_FEATURES,
     require_semantic_coverage,
     semantic_plan_features,
     structural_plan_features,
@@ -56,7 +57,7 @@ from llm_behavior_ci.runtime.scoring import (
     verify_scoring_contracts,
 )
 from llm_behavior_ci.stats.bootstrap import clustered_paired_bootstrap
-from llm_behavior_ci.stats.mmd import MMDError, mmd_permutation_test
+from llm_behavior_ci.stats.mmd import MMDError, mmd_permutation_test, paired_permutation_resolution
 from llm_behavior_ci.tasks.plan_specs import TaskPlanSpec
 from llm_behavior_ci.tasks.selection import SelectionError, TaskSet, verify_task_set
 
@@ -174,6 +175,14 @@ class PlanEvidenceInputs:
             for weight in self.plan_quality_weights:
                 if not isinstance(weight, (int, float)) or isinstance(weight, bool):
                     raise GateExecutionError("plan_quality_weights must be numeric")
+            weights = dict(zip(self.plan_quality_features, self.plan_quality_weights))
+            if set(weights) & TOOL_REFERENCE_QUALITY_FEATURES and not (
+                weights.get(REQUIRED_TOOL_COVERAGE_FEATURE, 0.0) > 0.0
+            ):
+                raise GateExecutionError(
+                    "plan quality terms that read tool references need "
+                    "required_tool_coverage_fraction with a positive weight"
+                )
         if "mmd" in self.required_statistics and not self.mmd_features:
             raise GateExecutionError("mmd_features must be non-empty")
         if not isinstance(self.task_plan_specs, tuple):
@@ -338,6 +347,28 @@ def _require_train_inputs(
         raise GateExecutionError(str(error)) from error
 
 
+def require_mmd_resolution(task_set: TaskSet, settings: GateSettings) -> None:
+    """Refuse a paired-MMD design that cannot reject at ``mmd_alpha``.
+
+    Clusters are the independent scenario labels the gate swaps
+    (``_cluster_label``). The check needs only the task set and settings, so
+    an insufficient design fails before any world opens or model is called.
+    """
+
+    clusters = {
+        _cluster_label(task_id, scenario_id)
+        for task_id, scenario_id in zip(task_set.task_ids, task_set.scenario_ids, strict=True)
+    }
+    resolution = paired_permutation_resolution(len(clusters), settings.mmd_permutations)
+    if resolution > settings.mmd_alpha:
+        raise GateExecutionError(
+            f"paired MMD cannot reject at mmd_alpha {settings.mmd_alpha}: "
+            f"{len(clusters)} independent scenario clusters and "
+            f"{settings.mmd_permutations} permutations give an expected smallest "
+            f"p-value of {resolution:.4f}"
+        )
+
+
 def _decision_seed(
     reference_hash: str,
     candidate_hash: str,
@@ -357,6 +388,7 @@ def _cluster_label(task_id: str, scenario_id: str | None) -> str:
 
 
 _EMPTY_PLAN_MESSAGE = "empty plan"
+REQUIRED_TOOL_COVERAGE_FEATURE = "required_tool_coverage_fraction"
 _INFRASTRUCTURE_TERMINATIONS = frozenset({"runtime_error", "timeout", "cancelled"})
 
 
@@ -617,6 +649,8 @@ def run_offline_gate(
     ):
         raise GateExecutionError("candidate_runtime must be runtime dependencies")
     require_gate_capabilities(reference, candidate, plan_evidence.required_statistics)
+    if "mmd" in plan_evidence.required_statistics:
+        require_mmd_resolution(task_set, settings)
     requested_features: list[str] = []
     if "plan_quality" in plan_evidence.required_statistics:
         requested_features.extend(plan_evidence.plan_quality_features)

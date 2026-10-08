@@ -328,8 +328,8 @@ class ProductionMonitorUnitTests(unittest.TestCase):
         monitor = ProductionMonitor(
             settings,
             reference,
+            period_id="period-test",
             clock=clock,
-            dedup_seconds=0.0,
         )
         observation = observation_from_episode(
             _episode(
@@ -361,8 +361,9 @@ class ProductionMonitorUnitTests(unittest.TestCase):
                 task_metadata=_metadata("task_success", completion_index=1),
             )
         )
-        self.assertEqual(len(second), 1)
-        self.assertEqual(second[0].sample_size, 2)
+        self.assertEqual(second, ())
+        self.assertEqual(monitor._detectors["task_success"][0].snapshot()["sample_size"], 2)
+        self.assertEqual(monitor.open_incidents, first)
 
     def test_alert_public_dict_passes_assert_public_payload(self) -> None:
         alert = Alert(
@@ -462,8 +463,8 @@ class ProductionMonitorUnitTests(unittest.TestCase):
                 configuration_hash=_HASH_A,
                 baselines=(("task_success", 0.9),),
             ),
+            period_id="period-test",
             clock=lambda: _END,
-            dedup_seconds=0.0,
         )
         with self.assertRaises(MonitorRejected):
             monitor.update(selection)  # type: ignore[arg-type]
@@ -491,8 +492,8 @@ class ProductionMonitorUnitTests(unittest.TestCase):
         monitor = ProductionMonitor(
             settings,
             reference,
+            period_id="period-test",
             clock=lambda: _END + timedelta(seconds=1),
-            dedup_seconds=0.0,
         )
         original = reference.baselines
         monitor.update(
@@ -546,7 +547,6 @@ class ProductionMonitorUnitTests(unittest.TestCase):
                 baselines=(("task_success", 0.9),),
             ),
             clock=lambda: _END,
-            dedup_seconds=0.0,
             period_id="production-1",
         )
         observation = observation_from_episode(
@@ -594,8 +594,8 @@ class ProductionMonitorUnitTests(unittest.TestCase):
             first = sink.deliver((alert,))
             second = sink.deliver((duplicate,))
             self.assertEqual(first, (alert,))
-            self.assertEqual(second, (alert,))
-            self.assertEqual(sink.delivered, (alert, alert))
+            self.assertEqual(second, ())
+            self.assertEqual(sink.delivered, (alert,))
             self.assertEqual(store.load_alerts(), (alert.to_record(),))
             self.assertEqual(len(store.load_deployment_decisions()), 1)
             store.close()
@@ -646,8 +646,8 @@ class ProductionMonitorSignalsPropertyTests(unittest.TestCase):
                     ("trajectory_length", 2.0),
                 ),
             ),
+            period_id="period-test",
             clock=lambda: _END,
-            dedup_seconds=0.0,
         )
         self.assertEqual(monitor.signals, settings.signals)
         episode = _episode(
@@ -723,8 +723,8 @@ class PlanQualityAndKLObservationTests(unittest.TestCase):
                 configuration_hash=_HASH_A,
                 baselines=(("plan_quality_score", 0.9),),
             ),
+            period_id="period-test",
             clock=lambda: _END,
-            dedup_seconds=0.0,
         )
         episode = _episode(mode="execute")
         low_quality = plan_quality_observation_from_features(
@@ -754,8 +754,8 @@ class PlanQualityAndKLObservationTests(unittest.TestCase):
                 configuration_hash=_HASH_A,
                 baselines=(("plan_kl_mean_nats", 0.0),),
             ),
+            period_id="period-test",
             clock=lambda: _END,
-            dedup_seconds=0.0,
         )
         second_episode = _episode(mode="execute", episode_token="3" * 32)
         kl_alerts = kl_monitor.update(
@@ -914,7 +914,7 @@ class DistributionalMonitorTests(unittest.TestCase):
 
 
 class SliceAttributionTests(unittest.TestCase):
-    def test_slice_specific_chain_alarms_while_aggregate_stays_quiet(self) -> None:
+    def test_slice_alarm_alone_only_attributes(self) -> None:
         settings = MonitorSettings(
             reference_configuration_hash=_HASH_A,
             outcome_delay_seconds=0.0,
@@ -935,8 +935,8 @@ class SliceAttributionTests(unittest.TestCase):
         monitor = ProductionMonitor(
             settings,
             reference,
+            period_id="period-test",
             clock=lambda: _END,
-            dedup_seconds=0.0,
             use_slice_attribution=True,
         )
 
@@ -963,9 +963,11 @@ class SliceAttributionTests(unittest.TestCase):
             observation = _success_observation(token, success=success)
             slice_name = "good" if success else "bad"
             all_alerts.extend(monitor.update(observation, slice_name=slice_name))
-        self.assertEqual(len(all_alerts), 1)
-        self.assertEqual(all_alerts[0].slice_name, "bad")
-        self.assertEqual(all_alerts[0].signal, "task_success")
+        self.assertEqual(all_alerts, [])
+        later = monitor.update(_success_observation("c" * 32, success=False), slice_name="bad")
+        self.assertEqual(len(later), 1)
+        self.assertEqual(later[0].slice_name, "task_success")
+        self.assertEqual(later[0].attributed_slices, ("bad",))
 
 
 if __name__ == "__main__":

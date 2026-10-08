@@ -258,7 +258,7 @@ _CONTRACTS: dict[str, _Contract] = {
         _contract(
             "mmd_permutation_test",
             "batch",
-            "level",
+            "at_most",
             frozenset({"gaussian"}),
             frozenset(
                 {"bandwidth", "permutations", "dimension", "null_mean", "null_scale"}
@@ -275,7 +275,7 @@ _CONTRACTS: dict[str, _Contract] = {
         _contract(
             "classifier_two_sample_test",
             "batch",
-            "level",
+            "at_most",
             frozenset({"gaussian"}),
             frozenset(
                 {
@@ -500,7 +500,15 @@ class MethodSpec:
     Monte Carlo allowances. They are not nominal α. ``null_claim`` is a
     property of the implementation: ``level`` methods are judged near α,
     ``at_most`` methods are judged at or below α, and ``record`` methods
-    are measured without a nominal false-alarm guarantee.
+    are measured without a nominal false-alarm guarantee. Permutation tests
+    are ``at_most``: their p-value ``(exceedances + 1) / (permutations + 1)``
+    is valid and discrete, so a conservative test that rejects fewer than α
+    of null samples passes.
+
+    ``alternative_shift`` asks for power under a Gaussian location shift of
+    that many null standard deviations in the candidate sample (every
+    dimension for embeddings). Power is reported apart from the null check
+    and coverage and never decides eligibility.
     """
 
     name: str
@@ -515,6 +523,7 @@ class MethodSpec:
     false_alarm_tolerance: float | None = None
     coverage_tolerance: float | None = None
     repeated_look_stride: int | None = None
+    alternative_shift: float | None = None
 
     def __post_init__(self) -> None:
         _validate_spec(self)
@@ -692,7 +701,11 @@ class ValidationReport:
 
     ``implemented`` means the name is in this package's catalog.
     ``validated`` and ``benchmark_eligible`` are true only when the minimum
-    checks passed on accepted evidence. ``gpu_floor_measured`` stays false:
+    checks passed on accepted evidence. Three properties stay separate:
+    null false-alarm control is the ``null_false_alarm`` check judged by
+    ``null_claim``, interval coverage is the ``coverage`` check, and
+    alternative power is ``power``, measured only when the spec names an
+    ``alternative_shift`` and never part of eligibility. ``gpu_floor_measured`` stays false:
     this runner does not record a live full-vocabulary floor.
     """
 
@@ -724,6 +737,7 @@ class ValidationReport:
     gpu_evidence: bool
     gpu_floor_measured: bool
     split: str | None
+    power: CheckResult | None = None
 
 
 @dataclass(frozen=True)
@@ -931,6 +945,7 @@ def method_spec(
     false_alarm_tolerance: float | None = None,
     coverage_tolerance: float | None = None,
     repeated_look_stride: int | None = None,
+    alternative_shift: float | None = None,
 ) -> MethodSpec:
     """Build a method spec from explicit parameters."""
 
@@ -947,6 +962,7 @@ def method_spec(
         false_alarm_tolerance=false_alarm_tolerance,
         coverage_tolerance=coverage_tolerance,
         repeated_look_stride=repeated_look_stride,
+        alternative_shift=alternative_shift,
     )
 
 
@@ -968,6 +984,7 @@ def method_spec_from_dict(payload: object) -> MethodSpec:
         "false_alarm_tolerance",
         "coverage_tolerance",
         "repeated_look_stride",
+        "alternative_shift",
     }
     unknown = set(payload) - allowed
     if unknown:
@@ -999,6 +1016,7 @@ def method_spec_from_dict(payload: object) -> MethodSpec:
         false_alarm_tolerance=payload.get("false_alarm_tolerance"),
         coverage_tolerance=payload.get("coverage_tolerance"),
         repeated_look_stride=payload.get("repeated_look_stride"),
+        alternative_shift=payload.get("alternative_shift"),
     )
 
 
@@ -1238,6 +1256,7 @@ def validate_method(
         gpu_evidence=_gpu_evidence(context),
         gpu_floor_measured=False,
         split=resolved_split,
+        power=_power_check(method, seeds),
     )
     digest = _hash_document(
         _validation_inputs(
@@ -1598,8 +1617,11 @@ def format_validation_summary(report: ValidationReport) -> str:
     ]
     if report.omitted_checks:
         lines.append("omitted_checks: " + ",".join(report.omitted_checks))
+    lines.append(f"null_claim: {report.null_claim}")
     for check in report.checks:
         lines.append(f"check.{check.name}: {check.status}")
+    if report.power is not None and report.power.estimate is not None:
+        lines.append(f"power: {report.power.estimate:.6f}")
     return "\n".join(lines) + "\n"
 
 
@@ -1810,6 +1832,16 @@ def _validate_spec(spec: MethodSpec) -> None:
     _optional_nonnegative(spec.coverage_tolerance, "coverage_tolerance")
     if spec.repeated_look_stride is not None:
         _positive_int(spec.repeated_look_stride, "repeated_look_stride")
+    if spec.alternative_shift is not None:
+        if spec.name not in _POWER_METHODS:
+            raise ValidationError("alternative_shift is not applicable")
+        if (
+            isinstance(spec.alternative_shift, bool)
+            or not isinstance(spec.alternative_shift, (int, float))
+            or not math.isfinite(float(spec.alternative_shift))
+            or float(spec.alternative_shift) == 0.0
+        ):
+            raise ValidationError("alternative_shift must be a finite nonzero number")
     if contract.kind == "score":
         if spec.null_sample_size != 0:
             raise ValidationError("a score method has no null sample")
@@ -1998,8 +2030,51 @@ def _window_minimum(spec: MethodSpec) -> int:
     return 1
 
 
+_POWER_METHODS = frozenset(
+    {
+        "mmd_permutation_test",
+        "classifier_two_sample_test",
+        "paired_bootstrap",
+        "clustered_paired_bootstrap",
+    }
+)
+
+
 def _simulate(spec: MethodSpec, seeds: Sequence[int]) -> tuple[_Replicate, ...]:
     return tuple(_one_replicate(spec, seed) for seed in seeds)
+
+
+def _power_check(spec: MethodSpec, seeds: Sequence[int]) -> CheckResult | None:
+    """Rejection rate under ``alternative_shift``; recorded, never judged."""
+
+    if spec.alternative_shift is None:
+        return None
+    shift = float(spec.alternative_shift)
+    if not seeds:
+        return _empty_check("alternative_power", False, "null seeds were not supplied", spec)
+    flags: list[bool] = []
+    for seed in seeds:
+        if spec.name in {"mmd_permutation_test", "classifier_two_sample_test"}:
+            replicate = _simulate_embedding(spec, seed, shift=shift)
+        else:
+            replicate = _simulate_bootstrap(spec, seed, shift=shift)
+        if replicate.false_alarm is not None:
+            flags.append(bool(replicate.false_alarm))
+    if not flags:
+        return _empty_check("alternative_power", False, "no replicate was usable", spec)
+    rate, low, high = _rate_interval(flags, spec.uncertainty_level)
+    return CheckResult(
+        name="alternative_power",
+        status="measured",
+        reason="rejection rate under the supplied alternative; not an eligibility check",
+        sample_count=len(flags),
+        seeds=tuple(seeds),
+        estimate=rate,
+        interval_low=low,
+        interval_high=high,
+        uncertainty_level=spec.uncertainty_level,
+        details=(("alternative_shift", shift),),
+    )
 
 
 def _one_replicate(spec: MethodSpec, seed: int) -> _Replicate:
@@ -2070,7 +2145,7 @@ def _simulate_chi_square(spec: MethodSpec, seed: int) -> _Replicate:
     return _batch_replicate(full, None, _repeated_flag(spec, alarm_at))
 
 
-def _simulate_embedding(spec: MethodSpec, seed: int) -> _Replicate:
+def _simulate_embedding(spec: MethodSpec, seed: int, *, shift: float = 0.0) -> _Replicate:
     params = spec.parameter_map()
     rng = random.Random(seed)
     n = spec.null_sample_size
@@ -2082,7 +2157,9 @@ def _simulate_embedding(spec: MethodSpec, seed: int) -> _Replicate:
         return tuple(rng.gauss(mean, scale) for _ in range(dimension))
 
     production = [point() for _ in range(n)]
-    candidate = [point() for _ in range(n)]
+    candidate = [
+        tuple(value + shift * scale for value in point()) for _ in range(n)
+    ]
 
     def alarm_at(size: int) -> bool | None:
         if spec.name == "mmd_permutation_test":
@@ -2109,13 +2186,13 @@ def _simulate_embedding(spec: MethodSpec, seed: int) -> _Replicate:
     return _batch_replicate(single, None, _repeated_flag(spec, alarm_at))
 
 
-def _simulate_bootstrap(spec: MethodSpec, seed: int) -> _Replicate:
+def _simulate_bootstrap(spec: MethodSpec, seed: int, *, shift: float = 0.0) -> _Replicate:
     params = spec.parameter_map()
     rng = random.Random(seed)
     n = spec.null_sample_size
     mean = float(params["null_mean"])
     scale = float(params["null_scale"])
-    candidate = [rng.gauss(mean, scale) for _ in range(n)]
+    candidate = [rng.gauss(mean, scale) + shift * scale for _ in range(n)]
     production = [rng.gauss(mean, scale) for _ in range(n)]
     labels = None
     if spec.name == "clustered_paired_bootstrap":
@@ -3883,6 +3960,7 @@ def _validation_inputs(
         "false_alarm_tolerance": spec.false_alarm_tolerance,
         "coverage_tolerance": spec.coverage_tolerance,
         "repeated_look_stride": spec.repeated_look_stride,
+        "alternative_shift": spec.alternative_shift,
         "seeds": list(seeds),
         "split": split,
         "reference_cases": [

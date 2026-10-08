@@ -198,6 +198,7 @@ class Alert:
     sample_size: int
     raised_at: datetime
     period_id: str | None = None
+    attributed_slices: tuple[str, ...] = ()
 
     def to_public_dict(self) -> dict:
         payload = {
@@ -211,6 +212,8 @@ class Alert:
             "sample_size": self.sample_size,
             "raised_at": self.raised_at.isoformat(),
         }
+        if self.attributed_slices:
+            payload["attributed_slices"] = list(self.attributed_slices)
         assert_public_payload(payload)
         return payload
 
@@ -226,6 +229,7 @@ class Alert:
             sample_size=self.sample_size,
             raised_at=self.raised_at,
             period_id=self.period_id,
+            attributed_slices=self.attributed_slices,
         )
 
     @classmethod
@@ -241,11 +245,19 @@ class Alert:
             sample_size=record.sample_size,
             raised_at=record.raised_at,
             period_id=record.period_id,
+            attributed_slices=record.attributed_slices,
         )
 
 
 class LocalAlertSink:
-    """In-process alert delivery without external notification accounts."""
+    """In-process alert delivery without external notification accounts.
+
+    ``deliver`` returns only the alerts it newly delivered. An alert whose
+    incident (``AlertRecord.incident_key``: period, configuration, signal,
+    slice) was already delivered is suppressed: with a store the check reads
+    SQLite, so it holds across a restart; without one it is kept in memory.
+    An alert with no period falls back to the ``dedup_seconds`` window.
+    """
 
     def __init__(
         self,
@@ -266,6 +278,26 @@ class LocalAlertSink:
         self._dedup_seconds = window
         self._delivered: list[Alert] = []
 
+    def _seen_in_memory(self, alert: Alert) -> bool:
+        record = alert.to_record()
+        for previous in self._delivered:
+            earlier = previous.to_record()
+            if record.incident_key is not None:
+                if earlier.incident_key == record.incident_key:
+                    return True
+                continue
+            if (
+                self._dedup_seconds > 0.0
+                and earlier.incident_key is None
+                and (earlier.signal, earlier.slice_name, earlier.method)
+                == (record.signal, record.slice_name, record.method)
+                and 0.0
+                <= (record.raised_at - earlier.raised_at).total_seconds()
+                < self._dedup_seconds
+            ):
+                return True
+        return False
+
     def deliver(self, alerts: Sequence[Alert]) -> tuple[Alert, ...]:
         if not isinstance(alerts, Sequence) or isinstance(alerts, (str, bytes)):
             raise MonitorRejected("alerts must be a sequence of Alert")
@@ -273,30 +305,33 @@ class LocalAlertSink:
         for alert in alerts:
             if not isinstance(alert, Alert):
                 raise MonitorRejected("alerts must be a sequence of Alert")
-            chosen = alert
-            if self._store is not None:
-                stored, inserted = self._store.append_alert_with_status(
-                    alert.to_record(),
-                    dedup_seconds=self._dedup_seconds,
+            if self._store is None:
+                if self._seen_in_memory(alert):
+                    continue
+                self._delivered.append(alert)
+                delivered.append(alert)
+                continue
+            stored, inserted = self._store.append_alert_with_status(
+                alert.to_record(),
+                dedup_seconds=self._dedup_seconds,
+            )
+            if not inserted:
+                continue
+            chosen = Alert.from_record(stored)
+            self._store.append_deployment_decision(
+                DeploymentDecisionRecord(
+                    configuration_hash=chosen.configuration_hash,
+                    reference_configuration_hash=chosen.reference_configuration_hash,
+                    signal=chosen.signal,
+                    slice_name=chosen.slice_name,
+                    decision="alert",
+                    method=chosen.method,
+                    estimate=chosen.estimate,
+                    boundary=chosen.boundary,
+                    sample_size=chosen.sample_size,
+                    decided_at=chosen.raised_at,
                 )
-                chosen = Alert.from_record(stored)
-                if inserted:
-                    self._store.append_deployment_decision(
-                        DeploymentDecisionRecord(
-                            configuration_hash=chosen.configuration_hash,
-                            reference_configuration_hash=(
-                                chosen.reference_configuration_hash
-                            ),
-                            signal=chosen.signal,
-                            slice_name=chosen.slice_name,
-                            decision="alert",
-                            method=chosen.method,
-                            estimate=chosen.estimate,
-                            boundary=chosen.boundary,
-                            sample_size=chosen.sample_size,
-                            decided_at=chosen.raised_at,
-                        )
-                    )
+            )
             self._delivered.append(chosen)
             delivered.append(chosen)
         return tuple(delivered)
@@ -586,7 +621,16 @@ class ProductionMonitor:
     Reference baselines are caller-supplied and are never refit from
     ``update`` observations. ``tool_selection`` and ``task_mix`` use typed
     distributional observations and are not scalar ``MONITOR_SIGNALS``.
-    When ``period_id`` is set, every update must supply the same period.
+
+    Alert policy: the aggregate detector chain of a signal opens one
+    incident per monitoring period, and only that raises an ``Alert``.
+    Slice chains run beside it for attribution only: the alert names every
+    slice whose chain has alarmed in the period so far, and a slice alarm
+    alone raises nothing. ``period_id`` is explicit and required; an update
+    that names a different period is rejected. Within a period a signal
+    alerts at most once; ``restore_open_incidents`` reloads the incidents a
+    previous process already raised, and ``reset_for_promotion`` with a new
+    period starts fresh incidents.
     """
 
     def __init__(
@@ -595,35 +639,27 @@ class ProductionMonitor:
         reference: FrozenReference,
         *,
         clock: Callable[[], datetime],
-        dedup_seconds: float,
-        period_id: str | None = None,
+        period_id: str,
         use_slice_attribution: bool = False,
     ) -> None:
         if not isinstance(settings, MonitorSettings):
             raise MonitorRejected("settings must be MonitorSettings")
         if not callable(clock):
             raise MonitorRejected("clock must be callable")
-        if isinstance(dedup_seconds, bool) or not isinstance(dedup_seconds, (int, float)):
-            raise MonitorRejected("dedup_seconds must be a finite float >= 0")
-        dedup_value = float(dedup_seconds)
-        if not math.isfinite(dedup_value) or dedup_value < 0.0:
-            raise MonitorRejected("dedup_seconds must be a finite float >= 0")
-        if period_id is not None and (
-            not isinstance(period_id, str) or period_id == ""
-        ):
-            raise MonitorRejected("period_id must be a non-empty string when set")
+        if not isinstance(period_id, str) or period_id == "":
+            raise MonitorRejected("period_id must be a non-empty string")
         if not isinstance(use_slice_attribution, bool):
             raise MonitorRejected("use_slice_attribution must be a boolean")
         self._settings = settings
         self._clock = clock
-        self._dedup_seconds = dedup_value
         self._period_id = period_id
         self._use_slice_attribution = use_slice_attribution
         self._signals = frozenset(settings.signals)
         self._outcome_delay = timedelta(seconds=settings.outcome_delay_seconds)
         self._held: list[_HeldObservation] = []
         self._seen: set[tuple[str, str]] = set()
-        self._last_alert_at: dict[str, datetime] = {}
+        self._open_incidents: dict[str, Alert] = {}
+        self._alarmed_slices: dict[str, set[str]] = {}
         self._slice_detectors: dict[tuple[str, str], list[Detector]] = {}
         if reference.configuration_hash != settings.reference_configuration_hash:
             raise MonitorRejected(
@@ -638,8 +674,39 @@ class ProductionMonitor:
         return self._reference
 
     @property
-    def period_id(self) -> str | None:
+    def period_id(self) -> str:
         return self._period_id
+
+    @property
+    def open_incidents(self) -> tuple[Alert, ...]:
+        return tuple(self._open_incidents[signal] for signal in sorted(self._open_incidents))
+
+    def restore_open_incidents(self, alerts: Sequence[Alert | AlertRecord]) -> int:
+        """Mark this period's already-raised aggregate incidents as open.
+
+        A restarted process reads its store's alerts and passes them here, so
+        a signal whose incident was raised before the restart does not alert
+        again in the same period. Alerts from other periods, other reference
+        configurations, or slice-named records are ignored. Returns how many
+        incidents were restored.
+        """
+
+        restored = 0
+        for item in alerts:
+            alert = Alert.from_record(item) if isinstance(item, AlertRecord) else item
+            if not isinstance(alert, Alert):
+                raise MonitorRejected("alerts must be Alert or AlertRecord")
+            if (
+                alert.period_id != self._period_id
+                or alert.reference_configuration_hash != self._reference_configuration_hash
+                or alert.signal not in self._signals
+                or alert.slice_name != alert.signal
+                or alert.signal in self._open_incidents
+            ):
+                continue
+            self._open_incidents[alert.signal] = alert
+            restored += 1
+        return restored
 
     @property
     def signals(self) -> tuple[str, ...]:
@@ -727,26 +794,28 @@ class ProductionMonitor:
         self,
         reference: FrozenReference,
         *,
-        period_id: str | None = None,
+        period_id: str,
     ) -> None:
         """Rebuild every detector against ``reference`` and start a new period.
 
-        ``period_id``, when given, replaces the monitoring period so alert
-        incident keys from before the promotion cannot suppress alerts after it.
+        ``period_id`` must differ from the current one, so incidents from
+        before the promotion cannot suppress alerts after it.
         """
 
         if not isinstance(reference, FrozenReference):
             raise MonitorRejected("reference must be FrozenReference")
-        if period_id is not None and (not isinstance(period_id, str) or period_id == ""):
-            raise MonitorRejected("period_id must be a non-empty string when set")
-        if period_id is not None:
-            self._period_id = period_id
+        if not isinstance(period_id, str) or period_id == "":
+            raise MonitorRejected("period_id must be a non-empty string")
+        if period_id == self._period_id:
+            raise MonitorRejected("a promotion must start a new monitoring period")
+        self._period_id = period_id
         self._reference = reference
         self._reference_configuration_hash = reference.configuration_hash
         self._detectors = self._detectors_from(reference)
         self._held.clear()
         self._seen.clear()
-        self._last_alert_at.clear()
+        self._open_incidents.clear()
+        self._alarmed_slices.clear()
         self._slice_detectors.clear()
 
     def release_due(self, *, period_id: str | None = None) -> tuple[Alert, ...]:
@@ -769,9 +838,7 @@ class ProductionMonitor:
         return float(self._settings.outcome_delay_seconds)
 
     def _check_period(self, period_id: str | None) -> None:
-        if self._period_id is None:
-            return
-        if period_id != self._period_id:
+        if period_id is not None and period_id != self._period_id:
             raise MonitorRejected("period_id does not match the monitoring period")
 
     def _detectors_from(
@@ -822,27 +889,19 @@ class ProductionMonitor:
         *,
         slice_name: str,
     ) -> list[Alert]:
-        """Run the aggregate detector chain, and a slice-specific one when named.
+        """Run the aggregate chain and, when named, the slice chain for attribution.
 
         The aggregate chain (``self._detectors[signal]``) sees every episode
-        for that signal regardless of slice, so it always reports under the
-        signal's own name. A caller-resolved ``slice_name`` different from
-        the bare signal name (see ``update_from_episode``'s difficulty- or
-        ``slice_id``-derived label) additionally feeds an independent
-        detector chain scoped to only that slice's episodes, built from the
-        same ``_detectors_from`` construction and reference as the
-        aggregate. A regression confined to one slice can then alarm on its
-        own chain even when it is too small a share of the aggregate stream
-        to move the aggregate chain, which is what lets a fired alert name
-        ``slice_name`` as the slice that moved, not just the monitored
-        signal.
+        for that signal. A caller-resolved ``slice_name`` other than the bare
+        signal also feeds an independent chain scoped to that slice, built
+        from the same reference. Every detector updates on every observation.
+        A slice alarm only records the slice as alarmed for the period. The
+        first aggregate alarm in the period opens the signal's incident and
+        returns its one alert, naming the alarmed slices; later alarms in the
+        period return nothing.
         """
 
-        alerts = self._run_detectors(
-            self._detectors[observation.signal],
-            observation,
-            slice_name=observation.signal,
-        )
+        evidence = self._first_alarm(self._detectors[observation.signal], observation.value)
         if slice_name != observation.signal:
             key = (observation.signal, slice_name)
             if key not in self._slice_detectors:
@@ -850,66 +909,36 @@ class ProductionMonitor:
                     self._reference,
                     self._reference.baselines_for_slice(slice_name),
                 )[observation.signal]
-            alerts.extend(
-                self._run_detectors(
-                    self._slice_detectors[key],
-                    observation,
-                    slice_name=slice_name,
-                )
-            )
-        return alerts
-
-    def _run_detectors(
-        self,
-        detectors: list[Detector],
-        observation: MonitorObservation,
-        *,
-        slice_name: str,
-    ) -> list[Alert]:
-        alerts: list[Alert] = []
-        for detector in detectors:
-            evidence = detector.update(observation.value)
-            if not evidence.alarm:
-                continue
-            alert = self._alert_from_evidence(
-                observation,
-                evidence,
-                slice_name=slice_name,
-            )
-            if alert is None:
-                continue
-            alerts.append(alert)
-        return alerts
-
-    def _alert_from_evidence(
-        self,
-        observation: MonitorObservation,
-        evidence: Evidence,
-        *,
-        slice_name: str,
-    ) -> Alert | None:
-        raised_at = self._clock()
-        dedup_key = f"{observation.signal}:{slice_name}"
-        last = self._last_alert_at.get(dedup_key)
-        if (
-            self._dedup_seconds > 0.0
-            and last is not None
-            and (raised_at - last).total_seconds() < self._dedup_seconds
-        ):
-            return None
-        self._last_alert_at[dedup_key] = raised_at
-        return Alert(
+            if self._first_alarm(self._slice_detectors[key], observation.value) is not None:
+                self._alarmed_slices.setdefault(observation.signal, set()).add(slice_name)
+        if evidence is None or observation.signal in self._open_incidents:
+            return []
+        alert = Alert(
             configuration_hash=observation.run.configuration_hash,
             reference_configuration_hash=self._reference_configuration_hash,
             signal=observation.signal,
-            slice_name=slice_name,
+            slice_name=observation.signal,
             method=evidence.method,
             estimate=evidence.estimate,
             boundary=evidence.boundary,
             sample_size=evidence.sample_size,
-            raised_at=raised_at,
+            raised_at=self._clock(),
             period_id=self._period_id,
+            attributed_slices=tuple(
+                sorted(self._alarmed_slices.get(observation.signal, ()))
+            ),
         )
+        self._open_incidents[observation.signal] = alert
+        return [alert]
+
+    @staticmethod
+    def _first_alarm(detectors: list[Detector], value: float) -> Evidence | None:
+        first: Evidence | None = None
+        for detector in detectors:
+            evidence = detector.update(value)
+            if evidence.alarm and first is None:
+                first = evidence
+        return first
 
 
 DistributionalObservation = ToolSelectionObservation | TaskMixObservation

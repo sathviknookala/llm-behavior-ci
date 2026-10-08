@@ -122,7 +122,6 @@ def _pricing():
                         "input_tokens": 1.4,
                         "cache_read_tokens": 0.26,
                         "output_tokens": 4.4,
-                        "reasoning_tokens": 9.0,
                     },
                 }
             ],

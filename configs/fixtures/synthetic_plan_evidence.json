@@ -3,11 +3,13 @@
   "plan_quality_features": [
     "requirement_coverage_fraction",
     "invalid_tool_reference_fraction",
+    "required_tool_coverage_fraction",
     "numbered_step_count"
   ],
   "plan_quality_weights": [
     1.0,
     -1.0,
+    1.0,
     0.1
   ],
   "mmd_features": [
@@ -27,17 +29,129 @@
   "task_plan_specs": [
     {
       "task_id": "task-a",
-      "available_tools": ["calendar.open_calendar", "calendar.create_event"],
-      "subgoal_keywords": [["open the calendar"]],
-      "required_entities": ["calendar"],
-      "dependency_pairs": []
+      "available_tools": [
+        "calendar.open_calendar",
+        "calendar.create_event"
+      ],
+      "subgoal_keywords": [
+        [
+          "open the calendar"
+        ]
+      ],
+      "required_entities": [
+        "calendar"
+      ],
+      "dependency_pairs": [
+        [
+          "calendar.open_calendar",
+          "calendar.create_event"
+        ]
+      ]
     },
     {
       "task_id": "task-b",
-      "available_tools": ["calendar.open_calendar", "calendar.create_event"],
-      "subgoal_keywords": [["open the calendar"]],
-      "required_entities": ["calendar"],
-      "dependency_pairs": []
+      "available_tools": [
+        "calendar.open_calendar",
+        "calendar.create_event"
+      ],
+      "subgoal_keywords": [
+        [
+          "open the calendar"
+        ]
+      ],
+      "required_entities": [
+        "calendar"
+      ],
+      "dependency_pairs": [
+        [
+          "calendar.open_calendar",
+          "calendar.create_event"
+        ]
+      ]
+    },
+    {
+      "task_id": "task-c",
+      "available_tools": [
+        "calendar.open_calendar",
+        "calendar.create_event"
+      ],
+      "subgoal_keywords": [
+        [
+          "open the calendar"
+        ]
+      ],
+      "required_entities": [
+        "calendar"
+      ],
+      "dependency_pairs": [
+        [
+          "calendar.open_calendar",
+          "calendar.create_event"
+        ]
+      ]
+    },
+    {
+      "task_id": "task-d",
+      "available_tools": [
+        "calendar.open_calendar",
+        "calendar.create_event"
+      ],
+      "subgoal_keywords": [
+        [
+          "open the calendar"
+        ]
+      ],
+      "required_entities": [
+        "calendar"
+      ],
+      "dependency_pairs": [
+        [
+          "calendar.open_calendar",
+          "calendar.create_event"
+        ]
+      ]
+    },
+    {
+      "task_id": "task-e",
+      "available_tools": [
+        "calendar.open_calendar",
+        "calendar.create_event"
+      ],
+      "subgoal_keywords": [
+        [
+          "open the calendar"
+        ]
+      ],
+      "required_entities": [
+        "calendar"
+      ],
+      "dependency_pairs": [
+        [
+          "calendar.open_calendar",
+          "calendar.create_event"
+        ]
+      ]
+    },
+    {
+      "task_id": "task-f",
+      "available_tools": [
+        "calendar.open_calendar",
+        "calendar.create_event"
+      ],
+      "subgoal_keywords": [
+        [
+          "open the calendar"
+        ]
+      ],
+      "required_entities": [
+        "calendar"
+      ],
+      "dependency_pairs": [
+        [
+          "calendar.open_calendar",
+          "calendar.create_event"
+        ]
+      ]
     }
   ]
 }

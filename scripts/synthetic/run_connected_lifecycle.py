@@ -248,8 +248,18 @@ def _clock():
     return tick
 
 
+_TASKS = (
+    ("task-a", "scenario-1"),
+    ("task-b", None),
+    ("task-c", "scenario-3"),
+    ("task-d", "scenario-4"),
+    ("task-e", "scenario-5"),
+    ("task-f", "scenario-6"),
+)
+
+
 def _task_set() -> TaskSet:
-    tasks = (("task-a", "scenario-1"), ("task-b", None))
+    tasks = _TASKS
     payload = canonical_task_set_bytes(
         appworld_version="0.1.3.post1",
         split="train",
@@ -262,10 +272,10 @@ def _task_set() -> TaskSet:
         split="train",
         selection_rule="deterministic_sample",
         selection_seed=20260926,
-        task_count=2,
-        scenario_count=2,
-        task_ids=("task-a", "task-b"),
-        scenario_ids=("scenario-1", None),
+        task_count=len(tasks),
+        scenario_count=len(tasks),
+        task_ids=tuple(task_id for task_id, _ in tasks),
+        scenario_ids=tuple(scenario_id for _, scenario_id in tasks),
         task_set_hash=task_set_hash_from_bytes(payload),
     )
 
@@ -556,8 +566,7 @@ def _monitor(
     production: RunConfiguration,
     clock,
     *,
-    dedup_seconds: float = 60.0,
-    period_id: str | None = "period-0",
+    period_id: str = "period-0",
     threshold: float = 0.5,
 ) -> ProductionMonitor:
     digest = run_configuration_hash(production)
@@ -581,7 +590,6 @@ def _monitor(
             baselines=(("task_success", 0.9),),
         ),
         clock=clock,
-        dedup_seconds=dedup_seconds,
         period_id=period_id,
     )
 
@@ -605,7 +613,7 @@ def main() -> int:
             score_margin=0.01,
             kl_limit_nats=0.05,
             mmd_bandwidth=1.0,
-            mmd_permutations=19,
+            mmd_permutations=99,
             mmd_alpha=0.05,
             plan_format_version="plan-v1",
         ),
@@ -626,7 +634,7 @@ def main() -> int:
             score_margin=-0.02,
             kl_limit_nats=0.05,
             mmd_bandwidth=1.0,
-            mmd_permutations=19,
+            mmd_permutations=99,
             mmd_alpha=0.05,
             plan_format_version="plan-v1",
         ),
@@ -651,7 +659,7 @@ def main() -> int:
                 score_margin=-0.02,
                 kl_limit_nats=0.05,
                 mmd_bandwidth=1.0,
-                mmd_permutations=19,
+                mmd_permutations=99,
                 mmd_alpha=0.05,
                 plan_format_version="plan-v1",
             ),
@@ -904,8 +912,7 @@ def main() -> int:
                         monitor=_monitor(
                             production,
                             clock,
-                            dedup_seconds=60.0,
-                            period_id=None,
+                            period_id="period-alerts",
                         ),
                         fraction=0.01,
                         canary_assignment_seed=0,
