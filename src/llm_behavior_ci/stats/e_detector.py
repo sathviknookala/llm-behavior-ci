@@ -20,7 +20,7 @@ class BettingEDetector:
     """Predictable-lambda betting e-process for a bounded mean.
 
     Null hypothesis: the mean is at most null_mean for direction above, and at least null_mean for direction below.
-    Assumptions: bounded iid observations and a predictable lambda, so the wealth is an e-process under that null.
+    Assumptions: bounded iid observations and a predictable lambda, so the wealth is an e-process under that null. The bet is capped so every multiplier stays nonnegative on [lower, upper]: lambda <= 1/(null_mean - lower) above, and -lambda <= 1/(upper - null_mean) below (Waudby-Smith and Ramdas, 2024).
     Direction of harm: above or below, as configured.
     Boundary: wealth crossing 1/alpha.
     Reset: wealth returns to 1.
@@ -70,11 +70,11 @@ class BettingEDetector:
         span = self._upper - self._lower
         if self._direction == "above":
             gap = running_mean - self._null_mean
-            cap = 1.0 / (self._upper - self._null_mean)
+            cap = 1.0 / (self._null_mean - self._lower)
             self._next_lambda = 0.0 if gap <= 0.0 else min(gap / span, cap)
         else:
             gap = self._null_mean - running_mean
-            cap = 1.0 / (self._null_mean - self._lower)
+            cap = 1.0 / (self._upper - self._null_mean)
             self._next_lambda = 0.0 if gap <= 0.0 else -min(gap / span, cap)
         return Evidence(
             method="betting_e_detector",

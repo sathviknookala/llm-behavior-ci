@@ -75,6 +75,28 @@ class DetectorTests(unittest.TestCase):
         detector.reset()
         self.assertAlmostEqual(detector.snapshot()["wealth"], 1, places=6)
 
+    def test_betting_e_detector_bet_keeps_every_multiplier_nonnegative(self) -> None:
+        for direction, null_mean, values in (
+            ("above", 7.0, (10.0, 10.0, 0.0)),
+            ("below", 3.0, (0.0, 0.0, 10.0)),
+        ):
+            detector = BettingEDetector(
+                null_mean=null_mean, alpha=0.05, lower=0.0, upper=10.0, direction=direction
+            )
+            for value in values:
+                evidence = detector.update(value)
+                bet = dict(evidence.details)["lambda"]
+                for worst in (0.0, 10.0):
+                    self.assertGreaterEqual(1.0 + bet * (worst - null_mean), 0.0)
+                self.assertGreaterEqual(dict(evidence.details)["wealth"], 0.0)
+
+    def test_betting_e_detector_bet_is_not_capped_by_the_safe_side(self) -> None:
+        detector = BettingEDetector(
+            null_mean=0.6, alpha=0.05, lower=-1.0, upper=1.0, direction="below"
+        )
+        evidence = detector.update(-1.0)
+        self.assertAlmostEqual(dict(evidence.details)["lambda"], -0.8)
+
     def test_harmful_shift_rejects_candidate_outside_unit_interval(self) -> None:
         detector = HarmfulShiftTest(alpha=0.05, harm_margin=0.0)
         with self.assertRaises(StatisticsError):
