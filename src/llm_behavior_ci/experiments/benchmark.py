@@ -1714,7 +1714,12 @@ def _run_or_resume_scheduled_monitor(
     ``delay_episodes`` counts arrivals from onset to the first post-onset
     alert; healthy-prefix alarms are stored apart and never count as
     detection. A miss is a harmful fault without a post-onset alert; a
-    false alarm is a post-onset alert on a non-harmful fault.
+    false alarm is a post-onset alert on a non-harmful fault. One period
+    covers the whole stream, because onset is not a deployment change. A
+    prefix alarm therefore opens the signal's incident for the rest of the
+    stream; post-onset alarms it suppresses are counted, and a miss with
+    such suppression carries the reason
+    ``post_onset_alarm_suppressed_by_prefix_incident``.
     """
 
     del stream_settings
@@ -1781,10 +1786,18 @@ def _run_or_resume_scheduled_monitor(
     monitor_blob["compute_seconds"] = compute_seconds
     monitor_blob["counters"] = result.counters.to_dict()
     monitor_blob["healthy_prefix_alarms"] = result.healthy_prefix_alarms
+    monitor_blob["prefix_incident_open_at_onset"] = result.prefix_incident_open_at_onset
+    monitor_blob["post_onset_suppressed_alarms"] = result.post_onset_suppressed_alarms
     detected = result.detected()
+    suppressed = (
+        result.status == "completed"
+        and not detected
+        and result.prefix_incident_open_at_onset
+        and result.post_onset_suppressed_alarms > 0
+    )
     outcome = MonitorTierOutcome(
         status="interrupted" if result.status == "interrupted" else "completed",
-        reason=None,
+        reason="post_onset_alarm_suppressed_by_prefix_incident" if suppressed else None,
         delay_episodes=result.post_onset_delay_episodes,
         miss=bool(result.status == "completed" and harmful and not detected),
         false_alarm=bool(result.status == "completed" and not harmful and detected),

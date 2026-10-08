@@ -792,6 +792,48 @@ class ServiceLifecycleTests(unittest.TestCase):
             any(item.decision == "promote" for item in decisions)
         )
 
+    def test_post_promotion_production_episodes_feed_the_monitor(self) -> None:
+        from llm_behavior_ci.lifecycle.monitoring import ProductionMonitor
+
+        fed: list[tuple[str, str, str]] = []
+        original = ProductionMonitor.update
+
+        def spy(monitor, observation, **kwargs):
+            fed.append(
+                (
+                    observation.run.configuration_hash,
+                    monitor.reference.configuration_hash,
+                    monitor.period_id,
+                )
+            )
+            return original(monitor, observation, **kwargs)
+
+        client, app = self._client(self._dependencies(horizon_episodes=1, harm_margin=0.1))
+        state = app.state.service
+        previous_hash = run_configuration_hash(self.production)
+        candidate_hash = run_configuration_hash(self.candidate)
+        self.assertEqual(client.post("/candidates", json=self._gate_body()).status_code, 200)
+        with patch.object(ProductionMonitor, "update", spy):
+            promote = client.post(
+                "/episodes",
+                json={"task_id": "task-promote", "mode": "execute", "assignment_key": "canary-promote"},
+            )
+            self.assertEqual(promote.status_code, 200)
+            self.assertEqual(client.get("/deployment").json()["state"], "PROMOTED")
+            before = len(fed)
+            for index in range(3):
+                served = client.post(
+                    "/episodes", json={"task_id": f"task-served-{index}", "mode": "execute"}
+                )
+                self.assertEqual(served.status_code, 200)
+                self.assertEqual(served.json()["role"], "production")
+        after = fed[before:]
+        self.assertEqual(len(after), 3 * len(state.dependencies.monitor.signals))
+        self.assertEqual(
+            {item for item in after},
+            {(candidate_hash, previous_hash, state.monitor_period_id)},
+        )
+
     def test_one_persisted_alert_per_incident(self) -> None:
         def factory(config: RunConfiguration) -> RuntimeDependencies:
             return self._execute_runtime(success=False)

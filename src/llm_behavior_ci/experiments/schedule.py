@@ -292,6 +292,8 @@ class ScheduledMonitorResult:
     post_onset_delay_episodes: int | None
     counters: StreamCounters
     alerts: tuple[dict[str, object], ...] = field(default_factory=tuple)
+    prefix_incident_open_at_onset: bool = False
+    post_onset_suppressed_alarms: int = 0
 
     def detected(self) -> bool:
         return self.first_post_onset_alert_index is not None
@@ -316,6 +318,9 @@ class _Detectors:
         self.monitor = monitor
         self.tool = distributional.get("tool_selection")
         self.mix = distributional.get("task_mix")
+
+    def suppressed(self) -> dict[str, int]:
+        return self.monitor.suppressed_alarms
 
     def feed(self, item: Mapping[str, Any]) -> list[Alert]:
         alerts: list[Alert] = []
@@ -419,8 +424,22 @@ def run_scheduled_monitor(
     counters = StreamCounters()
     detectors = _Detectors(monitor, distributional)
     alerts: list[dict[str, object]] = []
+    suppressed_post_onset = [0]
+    prefix_signals: set[str] = set()
 
-    def account(item: Mapping[str, Any], fired: Sequence[Alert]) -> None:
+    def suppressed_by_prefix(before: Mapping[str, int], index: int) -> None:
+        if index < schedule.onset_index:
+            return
+        after = detectors.suppressed()
+        suppressed_post_onset[0] += sum(
+            after.get(signal, 0) - before.get(signal, 0) for signal in prefix_signals
+        )
+
+    def account(item: Mapping[str, Any], fired: Sequence[Alert], before: Mapping[str, int]) -> None:
+        index = int(item["index"])
+        suppressed_by_prefix(before, index)
+        if index < schedule.onset_index:
+            prefix_signals.update(alert.signal for alert in fired)
         counters.arrivals += 1
         if item["exposure"] == "healthy":
             counters.healthy_exposures += 1
@@ -439,11 +458,15 @@ def run_scheduled_monitor(
             if stored.get("decision") != arrival.decision_dict():
                 raise ScheduleError("checkpoint decisions disagree with the schedule")
             clock.advance_to(arrival.simulated_at)
-            account(stored, detectors.feed(stored))
+            before = detectors.suppressed()
+            fired = detectors.feed(stored)
+            account(stored, fired, before)
             continue
         if should_interrupt is not None and should_interrupt(arrival.index):
             persist()
-            return _monitor_result("interrupted", schedule, alerts, counters)
+            return _monitor_result(
+                "interrupted", schedule, alerts, counters, suppressed_post_onset[0]
+            )
         clock.advance_to(arrival.simulated_at)
         configuration = healthy if arrival.exposure == "healthy" else faulted
         episode = run_episode(
@@ -471,16 +494,19 @@ def run_scheduled_monitor(
                 task_mix=None if difficulty is None else f"difficulty:{difficulty}",
             ),
         }
+        before = detectors.suppressed()
         fired = detectors.feed(item)
         items.append(item)
         by_index[arrival.index] = item
-        account(item, fired)
+        account(item, fired, before)
         persist()
     if arrivals:
         clock.advance_by(monitor.outcome_delay_seconds)
+        before = detectors.suppressed()
         tail = monitor.release_due()
+        suppressed_by_prefix(before, arrivals[-1].index)
         alerts.extend(_alert_summary(alert, arrivals[-1].index) for alert in tail)
-    return _monitor_result("completed", schedule, alerts, counters)
+    return _monitor_result("completed", schedule, alerts, counters, suppressed_post_onset[0])
 
 
 def _monitor_result(
@@ -488,6 +514,7 @@ def _monitor_result(
     schedule: BenchmarkSchedule,
     alerts: Sequence[dict[str, object]],
     counters: StreamCounters,
+    suppressed_post_onset: int,
 ) -> ScheduledMonitorResult:
     onset = schedule.onset_index
     prefix = sum(1 for alert in alerts if int(alert["index"]) < onset)
@@ -500,4 +527,6 @@ def _monitor_result(
         post_onset_delay_episodes=None if first is None else first - onset + 1,
         counters=counters,
         alerts=tuple(alerts),
+        prefix_incident_open_at_onset=prefix > 0,
+        post_onset_suppressed_alarms=suppressed_post_onset,
     )

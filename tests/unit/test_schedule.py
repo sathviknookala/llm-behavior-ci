@@ -340,6 +340,30 @@ class ScheduleTests(unittest.TestCase):
         onset_alerts = [alert for alert in result.alerts if alert["index"] < 6]
         self.assertEqual(len(onset_alerts), result.healthy_prefix_alarms)
 
+    def test_prefix_incident_suppression_is_counted_and_not_reset_at_onset(self) -> None:
+        state: dict = {}
+        result = _run(
+            _schedule(self.task_set), self.task_set, self.healthy, self.faulted, state, healthy_success=False
+        )
+        self.assertTrue(result.prefix_incident_open_at_onset)
+        self.assertFalse(result.detected())
+        self.assertEqual(result.post_onset_suppressed_alarms, 10)
+        resumed = _run(
+            _schedule(self.task_set),
+            self.task_set,
+            self.healthy,
+            self.faulted,
+            json.loads(json.dumps(state)),
+            healthy_success=False,
+        )
+        self.assertEqual(resumed.post_onset_suppressed_alarms, 10)
+
+    def test_detection_without_prefix_incident_counts_no_suppression(self) -> None:
+        result = _run(_schedule(self.task_set), self.task_set, self.healthy, self.faulted, {})
+        self.assertFalse(result.prefix_incident_open_at_onset)
+        self.assertTrue(result.detected())
+        self.assertEqual(result.post_onset_suppressed_alarms, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

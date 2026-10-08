@@ -630,7 +630,10 @@ class ProductionMonitor:
     that names a different period is rejected. Within a period a signal
     alerts at most once; ``restore_open_incidents`` reloads the incidents a
     previous process already raised, and ``reset_for_promotion`` with a new
-    period starts fresh incidents.
+    period starts fresh incidents. ``suppressed_alarms`` counts, per signal,
+    aggregate alarms that arrived while that signal's incident was already
+    open, so an early false alarm's suppression of later detection stays
+    visible.
     """
 
     def __init__(
@@ -659,6 +662,7 @@ class ProductionMonitor:
         self._held: list[_HeldObservation] = []
         self._seen: set[tuple[str, str]] = set()
         self._open_incidents: dict[str, Alert] = {}
+        self._suppressed: dict[str, int] = {}
         self._alarmed_slices: dict[str, set[str]] = {}
         self._slice_detectors: dict[tuple[str, str], list[Detector]] = {}
         if reference.configuration_hash != settings.reference_configuration_hash:
@@ -676,6 +680,10 @@ class ProductionMonitor:
     @property
     def period_id(self) -> str:
         return self._period_id
+
+    @property
+    def suppressed_alarms(self) -> dict[str, int]:
+        return dict(self._suppressed)
 
     @property
     def open_incidents(self) -> tuple[Alert, ...]:
@@ -815,6 +823,7 @@ class ProductionMonitor:
         self._held.clear()
         self._seen.clear()
         self._open_incidents.clear()
+        self._suppressed.clear()
         self._alarmed_slices.clear()
         self._slice_detectors.clear()
 
@@ -911,7 +920,10 @@ class ProductionMonitor:
                 )[observation.signal]
             if self._first_alarm(self._slice_detectors[key], observation.value) is not None:
                 self._alarmed_slices.setdefault(observation.signal, set()).add(slice_name)
-        if evidence is None or observation.signal in self._open_incidents:
+        if evidence is None:
+            return []
+        if observation.signal in self._open_incidents:
+            self._suppressed[observation.signal] = self._suppressed.get(observation.signal, 0) + 1
             return []
         alert = Alert(
             configuration_hash=observation.run.configuration_hash,
