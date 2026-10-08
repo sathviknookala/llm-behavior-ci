@@ -142,6 +142,7 @@ class BareCliExitTests(unittest.TestCase):
             "scripts/evaluation/export_usage.py",
             "scripts/data/annotate_task_metadata.py",
             "scripts/data/plan_specs.py",
+            "scripts/benchmark/reconcile_attempts.py",
         ):
             with self.subTest(script=script):
                 completed = _bare(script)

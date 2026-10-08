@@ -43,6 +43,11 @@ from llm_behavior_ci.config import (
     new_run_identity,
     run_configuration_hash,
 )
+from llm_behavior_ci.experiments.attempts import (
+    AttemptLedger,
+    AttemptRequest,
+    attempt_state,
+)
 from llm_behavior_ci.lifecycle.canary import assign_canary
 from llm_behavior_ci.lifecycle.monitoring import (
     Alert,
@@ -397,6 +402,8 @@ def run_scheduled_monitor(
     persist: Callable[[], None],
     difficulty_for: Callable[[str], int | None] | None = None,
     should_interrupt: Callable[[int], bool] | None = None,
+    ledger: AttemptLedger | None = None,
+    attempt_scope: str = "monitor",
 ) -> ScheduledMonitorResult:
     """Serve the scheduled arrivals and feed every configured monitor.
 
@@ -404,7 +411,11 @@ def run_scheduled_monitor(
     ``monitor`` and ``distributional`` must use ``clock``. ``state`` is the
     checkpoint section for this stream; ``persist`` writes it after every
     arrival. A task-mix label is ``difficulty:<n>`` when ``difficulty_for``
-    knows the task.
+    knows the task. With ``ledger``, each arrival reserves and starts one
+    execute attempt under ``<attempt_scope>|<index>`` before it runs, and
+    the attempt's terminal state is persisted with its item. An arrival
+    whose scope already holds an attempt but has no item was interrupted;
+    it is recorded as ``interrupted`` and never run again.
     """
 
     digest = schedule_hash(schedule)
@@ -462,13 +473,45 @@ def run_scheduled_monitor(
             fired = detectors.feed(stored)
             account(stored, fired, before)
             continue
+        configuration = healthy if arrival.exposure == "healthy" else faulted
+        scope = f"{attempt_scope}|{arrival.index}"
+        if ledger is not None and ledger.scope_attempts(scope):
+            clock.advance_to(arrival.simulated_at)
+            item: dict[str, Any] = {
+                "index": arrival.index,
+                "decision": arrival.decision_dict(),
+                "exposure": arrival.exposure,
+                "configuration_hash": run_configuration_hash(configuration),
+                "episode_status": "interrupted",
+                "evaluator_outcome_present": False,
+            }
+            before = detectors.suppressed()
+            fired = detectors.feed(item)
+            items.append(item)
+            by_index[arrival.index] = item
+            account(item, fired, before)
+            persist()
+            continue
         if should_interrupt is not None and should_interrupt(arrival.index):
             persist()
             return _monitor_result(
                 "interrupted", schedule, alerts, counters, suppressed_post_onset[0]
             )
         clock.advance_to(arrival.simulated_at)
-        configuration = healthy if arrival.exposure == "healthy" else faulted
+        attempts: list[dict[str, Any]] = []
+        if ledger is not None:
+            attempts = ledger.reserve(
+                scope,
+                (
+                    AttemptRequest(
+                        role="production" if arrival.exposure == "healthy" else "candidate",
+                        mode="execute",
+                        configuration_hash=run_configuration_hash(configuration),
+                        task_id=arrival.task_id,
+                    ),
+                ),
+            )
+            ledger.start(attempts)
         episode = run_episode(
             arrival.task_id,
             configuration,
@@ -478,7 +521,7 @@ def run_scheduled_monitor(
             scenario_id=arrival.scenario_id,
         )
         difficulty = None if difficulty_for is None else difficulty_for(arrival.task_id)
-        item: dict[str, Any] = {
+        item = {
             "index": arrival.index,
             "decision": arrival.decision_dict(),
             "exposure": arrival.exposure,
@@ -499,6 +542,8 @@ def run_scheduled_monitor(
         items.append(item)
         by_index[arrival.index] = item
         account(item, fired, before)
+        if ledger is not None:
+            ledger.finish(attempts[0], attempt_state(episode))
         persist()
     if arrivals:
         clock.advance_by(monitor.outcome_delay_seconds)

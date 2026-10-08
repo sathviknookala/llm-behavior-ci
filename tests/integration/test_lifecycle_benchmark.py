@@ -4,8 +4,11 @@ import importlib.util
 import json
 import tempfile
 import unittest
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
+from unittest import mock
 
 from llm_behavior_ci.config import (
     CanarySettings,
@@ -17,9 +20,11 @@ from llm_behavior_ci.config import (
     run_configuration_hash,
 )
 from llm_behavior_ci.experiments import benchmark as benchmark_module
+from llm_behavior_ci.experiments.attempts import AttemptBudget, AttemptLedger
 from llm_behavior_ci.experiments.benchmark import (
     BenchmarkError,
     BenchmarkProgress,
+    reconcile_checkpoint,
     run_lifecycle_benchmark,
 )
 from llm_behavior_ci.experiments.faults import FaultPatch, FaultSpec, HarmLabel, load_fault
@@ -754,7 +759,19 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                 agent=BenchmarkAgent(clock, block_on_temperature=False),
                 clock=clock,
             )
-            with self.assertRaises(BenchmarkError):
+            with self.assertRaisesRegex(BenchmarkError, "attempt caps"):
+                run_lifecycle_benchmark(
+                    lock,
+                    (_temperature_fault(),),
+                    runtime=runtime,
+                    train_tasks=train_tasks,
+                    test_normal_tasks=test_tasks,
+                    reference_baselines=baselines,
+                    plan_evidence=_plan_evidence(),
+                    admission_mode="release",
+                    checkpoint_path=root / "uncapped.json",
+                )
+            with self.assertRaisesRegex(BenchmarkError, "synthetic_fixture"):
                 run_lifecycle_benchmark(
                     lock,
                     (_temperature_fault(),),
@@ -765,6 +782,7 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
                     plan_evidence=_plan_evidence(),
                     admission_mode="release",
                     checkpoint_path=root / "checkpoint.json",
+                    attempt_budget=AttemptBudget(plan_generations=120, executions=98),
                 )
 
     def test_promote_then_monitor_alert(self) -> None:
@@ -1093,6 +1111,236 @@ class LifecycleBenchmarkIntegrationTests(unittest.TestCase):
         self.assertIn("quantization", replicate.gate.reason)
         self.assertEqual(replicate.canary.status, "unavailable")
         self.assertEqual(replicate.monitor.status, "unavailable")
+
+
+class Crash(BaseException):
+    """Stands in for a process kill: no ``except Exception`` handler sees it."""
+
+
+class CrashingAgent(BenchmarkAgent):
+    def __init__(self, clock: Clock, *, crash_on_turn: int) -> None:
+        super().__init__(clock)
+        self._crash_on_turn = crash_on_turn
+        self.turns = 0
+
+    def next_turn(self, *, tool_output: str | None) -> AgentTurn:
+        self.turns += 1
+        if self.turns == self._crash_on_turn:
+            raise Crash()
+        return super().next_turn(tool_output=tool_output)
+
+
+def _crash_ledger(method: str, predicate: Callable[[Any], bool]):
+    original = getattr(AttemptLedger, method)
+
+    def wrapped(self, subject, *args, **kwargs):
+        if predicate(subject):
+            raise Crash()
+        return original(self, subject, *args, **kwargs)
+
+    return mock.patch.object(AttemptLedger, method, wrapped)
+
+
+def _in_tier(tier: str) -> Callable[[Any], bool]:
+    def matches(subject: Any) -> bool:
+        attempts = [subject] if isinstance(subject, dict) else list(subject)
+        return any(f"|{tier}|" in attempt["scope"] for attempt in attempts)
+
+    return matches
+
+
+_GATE_PLAN_TURNS = 12
+
+
+class AttemptAccountingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self._temporary.name)
+        self.train_tasks, dev_tasks, self.test_tasks = _sets()
+        self.lock, self.baselines = _build_lock(
+            self.root,
+            train_tasks=self.train_tasks,
+            dev_tasks=dev_tasks,
+            test_normal_tasks=self.test_tasks,
+            harmful=True,
+            canary_horizon=3,
+            canary_alpha=0.5,
+            monitor_horizon=8,
+            with_replacement=True,
+        )
+        self.schedule = BenchmarkSchedule(
+            stream=StreamSettings.from_dict(self.lock.payload["stream"]),
+            healthy_prefix_episodes=2,
+            onset_mode="abrupt",
+            ramp_episodes=0,
+            analysis_horizon_episodes=8,
+            canary_fraction=1.0,
+            canary_assignment_seed=3,
+            clock_start=_START,
+        )
+        self.checkpoint = self.root / "checkpoint.json"
+
+    def tearDown(self) -> None:
+        self._temporary.cleanup()
+
+    def _run(self, crash_on_turn: int | None = None, budget: AttemptBudget | None = None):
+        clock = Clock()
+        runtime = RuntimeDependencies(
+            session_factory=lambda task_id: World(task_id, success=True),
+            agent=(
+                BenchmarkAgent(clock)
+                if crash_on_turn is None
+                else CrashingAgent(clock, crash_on_turn=crash_on_turn)
+            ),
+            clock=clock,
+        )
+        return run_lifecycle_benchmark(
+            self.lock,
+            (_temperature_fault(),),
+            runtime=runtime,
+            train_tasks=self.train_tasks,
+            test_normal_tasks=self.test_tasks,
+            reference_baselines=self.baselines,
+            plan_evidence=_plan_evidence(),
+            admission_mode="test",
+            checkpoint_path=self.checkpoint,
+            schedule=self.schedule,
+            attempt_budget=budget,
+        )
+
+    def _records(self, tier: str | None = None) -> list[dict[str, Any]]:
+        records = json.loads(self.checkpoint.read_text(encoding="utf-8"))["attempts"]["records"]
+        if tier is None:
+            return records
+        return [record for record in records if f"|{tier}|" in str(record["scope"])]
+
+    def test_uninterrupted_run_accounts_every_plan_generation_and_execution(self) -> None:
+        result = self._run(budget=AttemptBudget(plan_generations=12, executions=14))
+        replicate = result.replicates[0]
+        self.assertEqual(replicate.canary.status, "promoted")
+        self.assertEqual(replicate.monitor.status, "completed")
+        self.assertEqual(result.attempts["plan"]["consumed"], 12)
+        self.assertEqual(result.attempts["plan"]["completed"], 12)
+        self.assertEqual(result.attempts["execute"]["consumed"], 14)
+        self.assertEqual(result.attempts["execute"]["completed"], 14)
+        self.assertEqual(result.attempts["execute"]["remaining"], 0)
+        for record in self._records():
+            self.assertIsNotNone(record["started_at"])
+            self.assertIsNotNone(record["finished_at"])
+            self.assertGreaterEqual(record["duration_seconds"], 0.0)
+            self.assertNotEqual(str(record["reserved_at"])[:10], "2023-05-18")
+
+    def test_crash_between_reservation_and_start_spends_the_slot_without_a_start(self) -> None:
+        with _crash_ledger("start", _in_tier("canary")):
+            with self.assertRaises(Crash):
+                self._run()
+        self.assertEqual(
+            [record["state"] for record in self._records("canary")], ["reserved", "reserved"]
+        )
+        result = self._run()
+        canary = self._records("canary")
+        scopes = [record["scope"] for record in canary]
+        self.assertEqual(len(set(scopes)), 3)
+        self.assertEqual([record["state"] for record in canary[:2]], ["interrupted"] * 2)
+        self.assertEqual(scopes.count(canary[0]["scope"]), 2)
+        self.assertEqual(result.replicates[0].canary.status, "horizon_exhausted")
+        self.assertEqual(result.replicates[0].canary.candidate_episodes_served, 2)
+        self.assertEqual(result.replicates[0].monitor.reason, "canary_horizon_exhausted")
+        self.assertEqual(result.attempts["execute"]["interrupted_before_start"], 2)
+        self.assertEqual(result.attempts["execute"]["known_starts"], 4)
+        self.assertEqual(result.attempts["execute"]["consumed"], 6)
+
+    def test_crash_during_provider_dispatch_is_never_rerun_and_counts_against_the_pair_horizon(
+        self,
+    ) -> None:
+        with self.assertRaises(Crash):
+            self._run(crash_on_turn=_GATE_PLAN_TURNS + 1)
+        self.assertEqual(
+            [record["state"] for record in self._records("canary")], ["started", "started"]
+        )
+        summary = reconcile_checkpoint(self.checkpoint)
+        self.assertEqual(summary.reconciled, 2)
+        self.assertEqual(summary.attempts["execute"]["known_starts"], 2)
+        self.assertEqual(reconcile_checkpoint(self.checkpoint).reconciled, 0)
+        result = self._run()
+        canary = self._records("canary")
+        self.assertEqual(len({record["scope"] for record in canary}), 3)
+        self.assertEqual(result.replicates[0].canary.status, "horizon_exhausted")
+        self.assertEqual(result.replicates[0].canary.candidate_episodes_served, 2)
+        self.assertEqual(result.attempts["execute"]["interrupted"], 2)
+        self.assertEqual(result.attempts["execute"]["known_starts"], 6)
+        self.assertEqual(result.attempts["execute"]["consumed"], 6)
+
+    def test_crash_before_completion_is_persisted_spends_the_slot_and_is_not_repeated(self) -> None:
+        with _crash_ledger("finish", _in_tier("canary")):
+            with self.assertRaises(Crash):
+                self._run()
+        checkpoint = json.loads(self.checkpoint.read_text(encoding="utf-8"))
+        replicate = next(iter(checkpoint["replicates"].values()))
+        self.assertEqual(replicate["canary"].get("items", []), [])
+        first = self._run()
+        second = self._run()
+        self.assertEqual(first.attempts, second.attempts)
+        self.assertEqual(first.attempts["execute"]["interrupted"], 2)
+        self.assertEqual(first.attempts["execute"]["known_starts"], 6)
+        self.assertEqual(len(self._records()), 18)
+
+    def test_scheduled_monitor_crash_records_the_arrival_as_interrupted(self) -> None:
+        with _crash_ledger("finish", _in_tier("monitor")):
+            with self.assertRaises(Crash):
+                self._run()
+        result = self._run()
+        monitor = self._records("monitor")
+        self.assertEqual(len({record["scope"] for record in monitor}), 8)
+        self.assertEqual(monitor[0]["state"], "interrupted")
+        self.assertEqual(result.replicates[0].monitor.status, "completed")
+        checkpoint = json.loads(self.checkpoint.read_text(encoding="utf-8"))
+        replicate = next(iter(checkpoint["replicates"].values()))
+        statuses = [item["episode_status"] for item in replicate["monitor"]["items"]]
+        self.assertEqual(statuses[0], "interrupted")
+        self.assertEqual(len(statuses), 8)
+
+    def test_gate_crash_ends_the_gate_without_new_plan_generations(self) -> None:
+        def third_pair(subject: Any) -> bool:
+            return any(str(attempt["scope"]).endswith("|gate|2") for attempt in subject)
+
+        with _crash_ledger("start", third_pair):
+            with self.assertRaises(Crash):
+                self._run()
+        result = self._run()
+        replicate = result.replicates[0]
+        self.assertEqual(replicate.gate.status, "execution_failed")
+        self.assertEqual(replicate.canary.reason, "gate_execution_failed")
+        self.assertEqual(result.attempts["plan"]["consumed"], 6)
+        self.assertEqual(result.attempts["plan"]["known_starts"], 4)
+        self.assertEqual(result.attempts["plan"]["interrupted_before_start"], 2)
+        self.assertEqual(result.attempts["execute"]["consumed"], 0)
+
+    def test_execution_cap_refuses_the_pair_that_would_exceed_it(self) -> None:
+        budget = AttemptBudget(plan_generations=12, executions=3)
+        with self.assertRaisesRegex(BenchmarkError, "execute cap reached"):
+            self._run(budget=budget)
+        self.assertEqual(len(self._records("canary")), 2)
+        with self.assertRaisesRegex(BenchmarkError, "execute cap reached"):
+            self._run(budget=budget)
+        self.assertEqual(len(self._records("canary")), 2)
+
+    def test_plan_cap_refuses_the_gate_before_any_generation(self) -> None:
+        with self.assertRaisesRegex(BenchmarkError, "plan cap reached"):
+            self._run(budget=AttemptBudget(plan_generations=11, executions=98))
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_resume_keeps_the_original_caps(self) -> None:
+        with self.assertRaises(Crash):
+            self._run(
+                crash_on_turn=_GATE_PLAN_TURNS + 1,
+                budget=AttemptBudget(plan_generations=120, executions=98),
+            )
+        with self.assertRaisesRegex(BenchmarkError, "original caps"):
+            self._run(budget=AttemptBudget(plan_generations=120, executions=100))
+        result = self._run()
+        self.assertEqual(result.attempts["execute"]["cap"], 98)
+        self.assertEqual(result.attempts["execute"]["remaining"], 98 - 6)
 
 
 if __name__ == "__main__":

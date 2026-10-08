@@ -240,6 +240,8 @@ The lock stays local (plan evidence and task selections can name tasks). The com
 
 Not run until `EVAL_PROTOCOL.md` is pre-registered and every method's null check has passed.
 
+Every plan generation and execute episode is an attempt in the checkpoint's ledger (`experiments/attempts.py`). Its identity (scope, role, mode, configuration hash, task) is persisted as `reserved`, then `started`, before the call that can reach the provider; `completed` or `failed` (a recorded `runtime_error`) is written by the same atomic checkpoint replace that stores its result. The caps are recorded on first use and a resume must repeat them or omit both. After a crash, `reconcile_attempts.py` (or the resume itself) marks every open attempt `interrupted`: the slot stays consumed, `known_starts` counts only attempts whose start was persisted, and the scope is never dispatched again. An interrupted canary pair counts against the pair horizon; an interrupted monitor arrival is recorded and skipped; a gate with spent attempts and no decision ends `execution_failed`. A reservation that would exceed either cap is refused before anything is written. Resume with the original command and the same `--checkpoint`.
+
 ```bash
 py scripts/benchmark/run_lifecycle_benchmark.py --live-runtime \
   --protocol data/processed/protocol.lock.json \
@@ -250,7 +252,10 @@ py scripts/benchmark/run_lifecycle_benchmark.py --live-runtime \
   --plan-evidence data/processed/plan_evidence_hosted.json \
   --schedule data/processed/schedules/benchmark.json \
   --checkpoint data/processed/benchmark/checkpoint.json \
-  --export data/processed/benchmark/public.json
+  --export data/processed/benchmark/public.json \
+  --max-plan-generations 120 --max-executions 98
+py scripts/benchmark/reconcile_attempts.py \
+  --checkpoint data/processed/benchmark/checkpoint.json
 py scripts/replay/replay_detectors.py --observations <frozen observations> \
   --schedule <replay schedule> --factories <detector factories> --output <public output>
 ```

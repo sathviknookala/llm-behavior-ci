@@ -10,7 +10,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 from itertools import takewhile
@@ -26,6 +26,13 @@ from llm_behavior_ci.config import (
     StreamSettings,
     new_run_identity,
     run_configuration_hash,
+)
+from llm_behavior_ci.experiments.attempts import (
+    AttemptBudget,
+    AttemptError,
+    AttemptLedger,
+    AttemptRequest,
+    attempt_state,
 )
 from llm_behavior_ci.experiments.faults import (
     FaultError,
@@ -193,6 +200,7 @@ class BenchmarkResult:
     gpu_memory_mib: float | None
     gpu_hours: float | None
     admission_mode: str
+    attempts: Mapping[str, Mapping[str, int | None]] = field(default_factory=dict)
 
 
 def _under_results(path: Path) -> bool:
@@ -454,6 +462,21 @@ def _not_reached_monitor(reason: str) -> MonitorTierOutcome:
     )
 
 
+def _execution_failed_gate(reason: str) -> GateTierOutcome:
+    return GateTierOutcome(
+        status="execution_failed",
+        reason=reason,
+        outcome=None,
+        classification=None,
+        compute_seconds=None,
+        agent_execution_seconds=None,
+        detector_compute_seconds=None,
+        public_decision=None,
+        statistics=(),
+        validation_provenance=None,
+    )
+
+
 def _gate_classification(outcome: str, harmful: bool) -> str | None:
     if outcome != "BLOCK":
         return None
@@ -632,6 +655,48 @@ def _write_checkpoint(path: Path, document: Mapping[str, object]) -> None:
         if temporary.exists():
             temporary.unlink(missing_ok=True)
         raise BenchmarkError("checkpoint write failed") from error
+
+
+def _attempt_ledger(
+    document: dict[str, Any],
+    budget: AttemptBudget | None,
+    persist: Callable[[], None],
+) -> AttemptLedger:
+    if "attempts" not in document and document.get("replicates"):
+        raise BenchmarkError(
+            "checkpoint predates attempt accounting; reconcile its spent attempts by hand"
+        )
+    section = document.setdefault("attempts", {})
+    if not isinstance(section, dict):
+        raise BenchmarkError("checkpoint attempts section is invalid")
+    try:
+        return AttemptLedger(section, budget=budget, persist=persist)
+    except AttemptError as error:
+        raise BenchmarkError(str(error)) from error
+
+
+@dataclass(frozen=True)
+class ReconcileSummary:
+    reconciled: int
+    attempts: Mapping[str, Mapping[str, int | None]]
+
+
+def reconcile_checkpoint(path: Path) -> ReconcileSummary:
+    """Mark a checkpoint's open attempts interrupted and return the ledger summary.
+
+    Spends nothing and runs nothing. The caps stay those first recorded.
+    """
+
+    checkpoint = Path(path)
+    _refuse_results_path(checkpoint, "checkpoint_path")
+    if not checkpoint.exists():
+        raise BenchmarkError("checkpoint does not exist")
+    document = _load_checkpoint(checkpoint)
+    ledger = _attempt_ledger(
+        document, None, lambda: _write_checkpoint(checkpoint, document)
+    )
+    interrupted = ledger.reconcile()
+    return ReconcileSummary(reconciled=interrupted, attempts=ledger.summary())
 
 
 def _replicate_key(fault_version: str, seed: int) -> str:
@@ -864,6 +929,7 @@ def _aggregate(
     gpu_memory_mib: float | None,
     gpu_hours: float | None,
     admission_mode: str,
+    attempts: Mapping[str, Mapping[str, int | None]] | None = None,
 ) -> BenchmarkResult:
     scored = [item for item in replicates if _is_complete_replicate(item)]
     gate_catch = 0
@@ -938,6 +1004,7 @@ def _aggregate(
         gpu_memory_mib=gpu_memory_mib,
         gpu_hours=gpu_hours,
         admission_mode=admission_mode,
+        attempts={} if attempts is None else dict(attempts),
     )
 
 
@@ -1283,6 +1350,7 @@ def run_lifecycle_benchmark(
     runtime_factory: RuntimeFactory | None = None,
     schedule: BenchmarkSchedule | None = None,
     difficulty_for: Callable[[str], int | None] | None = None,
+    attempt_budget: AttemptBudget | None = None,
 ) -> BenchmarkResult:
     """Run the three-tier lifecycle benchmark for each fault and lock seed.
 
@@ -1294,6 +1362,16 @@ def run_lifecycle_benchmark(
     simulated clock; the schedule hash is part of the checkpoint identity.
     Without it, the legacy path runs every arrival as a pair and serves the
     faulted configuration from the first arrival.
+
+    Every plan generation and execute episode is an attempt in the
+    checkpoint's ledger (``experiments/attempts.py``), reserved and started
+    before dispatch. ``attempt_budget`` caps plan generations and
+    executions across the whole run; the caps are recorded on first use and
+    a resume must supply the same caps or none. Release admission requires
+    caps. A resume first marks open attempts interrupted; an interrupted or
+    failed attempt keeps its slot and is never replaced, a gate with spent
+    attempts but no decision ends as ``execution_failed``, and an
+    interrupted canary pair counts against the pair horizon.
     """
 
     if not isinstance(protocol, ProtocolLock):
@@ -1376,7 +1454,13 @@ def run_lifecycle_benchmark(
         except ScheduleError as error:
             raise BenchmarkError(str(error)) from error
     _validate_checkpoint_identity(document, identity)
+    ledger = _attempt_ledger(
+        document, attempt_budget, lambda: _write_checkpoint(checkpoint, document)
+    )
+    if admission_mode == "release" and ledger.caps is None:
+        raise BenchmarkError("release admission requires attempt caps")
     document["identity"] = identity
+    ledger.reconcile()
     replicates_doc: dict[str, Any] = document.setdefault("replicates", {})
     outcomes: list[ReplicateOutcome] = []
     interrupted = False
@@ -1463,20 +1547,23 @@ def run_lifecycle_benchmark(
                 stored=stored,
                 checkpoint=checkpoint,
                 document=document,
+                ledger=ledger,
+                attempt_scope=f"{key}|gate",
             )
             _write_checkpoint(checkpoint, document)
             if should_interrupt is not None and should_interrupt(progress):
                 interrupted = True
                 break
 
-            if gate_decision.outcome != "PASS":
+            if gate_decision is None or gate_decision.outcome != "PASS":
+                not_reached = "gate_block" if gate_decision is not None else "gate_execution_failed"
                 replicate = ReplicateOutcome(
                     fault_version=fault.fault_version,
                     replicate_seed=seed,
                     harmful=label.harmful,
                     gate=gate_outcome,
-                    canary=_not_reached_canary("gate_block"),
-                    monitor=_not_reached_monitor("gate_block"),
+                    canary=_not_reached_canary(not_reached),
+                    monitor=_not_reached_monitor(not_reached),
                 )
                 outcomes.append(replicate)
                 stored["outcome"] = _serialize_replicate(replicate)
@@ -1513,6 +1600,8 @@ def run_lifecycle_benchmark(
                 should_interrupt=should_interrupt,
                 fault_version=fault.fault_version,
                 admission_mode=admission_mode,
+                ledger=ledger,
+                attempt_scope=f"{key}|canary",
             )
             if canary_result["interrupted"]:
                 interrupted = True
@@ -1614,6 +1703,8 @@ def run_lifecycle_benchmark(
                 document=document,
                 should_interrupt=should_interrupt,
                 fault_version=fault.fault_version,
+                ledger=ledger,
+                attempt_scope=f"{key}|monitor",
             )
             if monitor_result["interrupted"]:
                 interrupted = True
@@ -1650,6 +1741,7 @@ def run_lifecycle_benchmark(
         gpu_memory_mib=gpu_memory_mib,
         gpu_hours=gpu_hours,
         admission_mode=admission_mode,
+        attempts=ledger.summary(),
     )
     if status == "completed" and export_path is not None:
         try:
@@ -1707,6 +1799,8 @@ def _run_or_resume_scheduled_monitor(
     document: dict[str, Any],
     should_interrupt: Callable[[BenchmarkProgress], bool] | None,
     fault_version: str,
+    ledger: AttemptLedger,
+    attempt_scope: str,
 ) -> dict[str, Any]:
     """The monitor tier on the explicit schedule: healthy prefix, then onset.
 
@@ -1777,8 +1871,10 @@ def _run_or_resume_scheduled_monitor(
             persist=lambda: _write_checkpoint(checkpoint, document),
             difficulty_for=difficulty_for,
             should_interrupt=interrupt,
+            ledger=ledger,
+            attempt_scope=attempt_scope,
         )
-    except (ScheduleError, EpisodeRejected) as error:
+    except (ScheduleError, EpisodeRejected, AttemptError) as error:
         raise BenchmarkError(str(error)) from error
     compute_seconds = float(monitor_blob.get("compute_seconds", 0.0)) + (
         time.perf_counter() - started
@@ -1837,7 +1933,9 @@ def _run_or_resume_gate(
     stored: dict[str, Any],
     checkpoint: Path,
     document: dict[str, Any],
-) -> tuple[GateTierOutcome, GateDecision]:
+    ledger: AttemptLedger,
+    attempt_scope: str,
+) -> tuple[GateTierOutcome, GateDecision | None]:
     gate_blob = stored.get("gate")
     if isinstance(gate_blob, dict) and "decision" in gate_blob:
         decision = _gate_decision_from_dict(
@@ -1862,12 +1960,43 @@ def _run_or_resume_gate(
             ),
             decision,
         )
+    if isinstance(gate_blob, dict) and "execution_error" in gate_blob:
+        return _execution_failed_gate(str(gate_blob["execution_error"])), None
+    if ledger.scopes(f"{attempt_scope}|"):
+        reason = "gate attempts were interrupted before a decision"
+        stored["gate"] = {"execution_error": reason}
+        _write_checkpoint(checkpoint, document)
+        return _execution_failed_gate(reason), None
 
     try:
         reference = bind_protocol(train_template, protocol)
         candidate = apply_fault(reference, fault)
     except (ProtocolError, FaultError) as error:
         raise BenchmarkError(str(error)) from error
+    reference_hash = run_configuration_hash(reference)
+    candidate_hash = run_configuration_hash(candidate)
+    try:
+        ledger.require("plan", 2 * len(train_tasks.task_ids))
+    except AttemptError as error:
+        raise BenchmarkError(str(error)) from error
+
+    def reserve_pair(index: int, task_id: str) -> None:
+        attempts = ledger.reserve(
+            f"{attempt_scope}|{index}",
+            tuple(
+                AttemptRequest(
+                    role=role,
+                    mode="plan",
+                    configuration_hash=configuration_hash,
+                    task_id=task_id,
+                )
+                for role, configuration_hash in (
+                    ("reference", reference_hash),
+                    ("candidate", candidate_hash),
+                )
+            ),
+        )
+        ledger.start(attempts)
 
     started = time.perf_counter()
     try:
@@ -1882,18 +2011,24 @@ def _run_or_resume_gate(
             runtime=reference_runtime,
             plan_evidence=plan_evidence,
             candidate_runtime=candidate_runtime,
+            before_pair=reserve_pair,
         )
     except GateExecutionError as error:
+        if ledger.scopes(f"{attempt_scope}|"):
+            ledger.finish_scopes(f"{attempt_scope}|", "failed")
+            stored["gate"] = {"execution_error": str(error)}
+            _write_checkpoint(checkpoint, document)
         raise BenchmarkError(str(error)) from error
     compute_seconds = time.perf_counter() - started
+    ledger.finish_scopes(f"{attempt_scope}|", "completed")
     stored["gate"] = {
         "decision": _gate_decision_to_dict(decision),
         "compute_seconds": compute_seconds,
         "agent_execution_seconds": compute_seconds,
         "detector_compute_seconds": 0.0,
         "fault_version": fault.fault_version,
-        "reference_configuration_hash": run_configuration_hash(reference),
-        "candidate_configuration_hash": run_configuration_hash(candidate),
+        "reference_configuration_hash": reference_hash,
+        "candidate_configuration_hash": candidate_hash,
     }
     _write_checkpoint(checkpoint, document)
     return (
@@ -1928,6 +2063,8 @@ def _run_or_resume_canary(
     should_interrupt: Callable[[BenchmarkProgress], bool] | None,
     fault_version: str,
     admission_mode: Literal["release", "test"],
+    ledger: AttemptLedger,
+    attempt_scope: str,
 ) -> dict[str, Any]:
     reference, candidate = _authorize_faulted_test_normal(
         protocol, test_normal_template, test_normal_tasks, fault
@@ -2052,12 +2189,17 @@ def _run_or_resume_canary(
         horizon = len(scheduled_arrivals)
         arrivals_iter = iter(scheduled_arrivals)
     pair_budget = canary_settings.stopping_rule.horizon_episodes
-    pairs_run = len(stored_indexes)
+    spent_indexes = {
+        int(scope.rsplit("|", 1)[1]) for scope in ledger.scopes(f"{attempt_scope}|")
+    }
+    pairs_run = len(stored_indexes | spent_indexes)
+    reference_hash = run_configuration_hash(reference)
+    candidate_hash = run_configuration_hash(candidate)
 
     for arrival in arrivals_iter:
         if arrival.index >= horizon:
             break
-        if arrival.index in stored_indexes:
+        if arrival.index in stored_indexes or arrival.index in spent_indexes:
             continue
         if scheduled_arrivals is not None and pairs_run >= pair_budget:
             break
@@ -2104,6 +2246,25 @@ def _run_or_resume_canary(
 
         if scheduled_arrivals is not None and callable(getattr(clock, "advance_to", None)):
             clock.advance_to(arrival.simulated_at)
+        try:
+            attempts = ledger.reserve(
+                f"{attempt_scope}|{arrival.index}",
+                tuple(
+                    AttemptRequest(
+                        role=role,
+                        mode="execute",
+                        configuration_hash=configuration_hash,
+                        task_id=arrival.task_id,
+                    )
+                    for role, configuration_hash in (
+                        ("reference", reference_hash),
+                        ("candidate", candidate_hash),
+                    )
+                ),
+            )
+        except AttemptError as error:
+            raise BenchmarkError(str(error)) from error
+        ledger.start(attempts)
         controller.begin_candidate_episode()
         agent_started = time.perf_counter()
         pair = run_pair(
@@ -2140,6 +2301,8 @@ def _run_or_resume_canary(
                 "action": decision.action,
             }
         )
+        ledger.finish(attempts[0], attempt_state(pair.reference))
+        ledger.finish(attempts[1], attempt_state(pair.candidate))
         compute_seconds = compute_base + (time.perf_counter() - started)
         canary_blob["compute_seconds"] = compute_seconds
         canary_blob["agent_execution_seconds"] = agent_base + agent_delta
@@ -2196,6 +2359,8 @@ def _run_or_resume_monitor(
     document: dict[str, Any],
     should_interrupt: Callable[[BenchmarkProgress], bool] | None,
     fault_version: str,
+    ledger: AttemptLedger,
+    attempt_scope: str,
 ) -> dict[str, Any]:
     _reference, candidate = _authorize_faulted_test_normal(
         protocol, test_normal_template, test_normal_tasks, fault
@@ -2297,11 +2462,14 @@ def _run_or_resume_monitor(
 
     stream = _stream_for_seed(stream_settings, seed)
     horizon = _monitor_horizon(monitor_settings)
+    candidate_hash = run_configuration_hash(candidate)
 
     for arrival in generate_stream(test_normal_tasks, stream):
         if arrival.index >= horizon:
             break
         if arrival.index in stored_indexes:
+            continue
+        if ledger.scope_attempts(f"{attempt_scope}|{arrival.index}"):
             continue
         progress = BenchmarkProgress(
             fault_version=fault_version,
@@ -2335,6 +2503,21 @@ def _run_or_resume_monitor(
                 ),
             }
 
+        try:
+            attempts = ledger.reserve(
+                f"{attempt_scope}|{arrival.index}",
+                (
+                    AttemptRequest(
+                        role="candidate",
+                        mode="execute",
+                        configuration_hash=candidate_hash,
+                        task_id=arrival.task_id,
+                    ),
+                ),
+            )
+        except AttemptError as error:
+            raise BenchmarkError(str(error)) from error
+        ledger.start(attempts)
         agent_started = time.perf_counter()
         episode = run_episode(
             arrival.task_id,
@@ -2388,6 +2571,7 @@ def _run_or_resume_monitor(
                 "tool_selection": tool_selection_payload,
             }
         )
+        ledger.finish(attempts[0], attempt_state(episode))
         if first_alert_index is not None:
             monitor_blob["first_alert_index"] = first_alert_index
         compute_seconds = compute_base + (time.perf_counter() - started)

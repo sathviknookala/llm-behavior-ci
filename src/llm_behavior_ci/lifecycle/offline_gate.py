@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Mapping, Sequence
@@ -625,6 +626,7 @@ def run_offline_gate(
     runtime: RuntimeDependencies,
     plan_evidence: PlanEvidenceInputs,
     candidate_runtime: RuntimeDependencies | None = None,
+    before_pair: Callable[[int, str], None] | None = None,
 ) -> GateDecision:
     """Score a plan-only offline gate on a train task set.
 
@@ -639,6 +641,9 @@ def run_offline_gate(
     including a provider or runtime failure inside a plan episode, raise
     ``GateExecutionError`` and are not BLOCK decisions. An empty plan is a
     model behavior and still blocks as ``plan_run_failed``.
+    ``before_pair``, when supplied, is called with the task index and id
+    before each plan pair opens its worlds; an exception from it stops the
+    gate as an execution problem.
     """
 
     _require_train_inputs(reference, candidate, task_set, settings, plan_evidence)
@@ -695,6 +700,8 @@ def run_offline_gate(
     try:
         for index, task_id in enumerate(task_set.task_ids):
             scenario_id = task_set.scenario_ids[index]
+            if before_pair is not None:
+                before_pair(index, task_id)
             pair = run_pair(
                 task_id,
                 reference,

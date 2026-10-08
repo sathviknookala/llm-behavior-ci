@@ -7,8 +7,13 @@ onset, canary fraction, simulated clock); --task-metadata supplies local
 difficulty labels for the task-mix monitor. --live-runtime builds every
 runtime through the shared factory (vLLM roles need their endpoints,
 hosted roles read their keys from the environment); without it,
-LLM_BEHAVIOR_CI_RUNTIME injects one runtime for CPU tests. Bare
-invocation exits 2.
+LLM_BEHAVIOR_CI_RUNTIME injects one runtime for CPU tests.
+--max-plan-generations and --max-executions cap paid attempts across the
+whole run; they are required for validated (release) plan evidence, are
+recorded in the checkpoint on first use, and a resume must repeat them or
+omit both. Resuming the same command with the same --checkpoint first
+marks open attempts interrupted and never reruns them. Bare invocation
+exits 2.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from llm_behavior_ci.config import ConfigError
+from llm_behavior_ci.experiments.attempts import AttemptBudget, AttemptError
 from llm_behavior_ci.experiments.benchmark import (
     BenchmarkError,
     run_lifecycle_benchmark,
@@ -181,6 +187,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--live-runtime", action="store_true")
     parser.add_argument("--reference-endpoint", default=None)
     parser.add_argument("--candidate-endpoint", default=None)
+    parser.add_argument("--max-plan-generations", type=int, default=None)
+    parser.add_argument("--max-executions", type=int, default=None)
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
     except SystemExit as error:
@@ -223,6 +231,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise BenchmarkError(
                 "plan evidence validation_provenance must be synthetic_fixture or validated"
             )
+        if (args.max_plan_generations is None) != (args.max_executions is None):
+            raise BenchmarkError(
+                "pass both --max-plan-generations and --max-executions, or neither"
+            )
+        attempt_budget = (
+            None
+            if args.max_plan_generations is None
+            else AttemptBudget(
+                plan_generations=args.max_plan_generations,
+                executions=args.max_executions,
+            )
+        )
         schedule = None
         if args.schedule is not None:
             schedule = BenchmarkSchedule.from_dict(_load_json(Path(args.schedule)))
@@ -255,6 +275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan_evidence=plan_evidence,
             admission_mode=admission_mode,
             export_path=export_path,
+            attempt_budget=attempt_budget,
         )
     except SystemExit as error:
         code = error.code
@@ -272,6 +293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ScheduleError,
         RunConfigError,
         EpisodeRejected,
+        AttemptError,
     ) as error:
         print(str(error) or "lifecycle benchmark failed", file=sys.stderr)
         return 1
@@ -288,6 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "wall_seconds": result.wall_seconds,
                 "gpu_memory_mib": result.gpu_memory_mib,
                 "gpu_hours": result.gpu_hours,
+                "attempts": result.attempts,
             },
             sort_keys=True,
         )
