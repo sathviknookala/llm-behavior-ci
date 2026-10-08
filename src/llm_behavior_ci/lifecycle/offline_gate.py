@@ -489,6 +489,224 @@ def _plan_representation(
     )
 
 
+def plan_quality_score(
+    episode: EpisodeResult,
+    plan_evidence: PlanEvidenceInputs,
+) -> float:
+    """The gate's weighted plan-quality score for one plan episode."""
+
+    return _plan_quality_score(episode, plan_evidence, _spec_index(plan_evidence))
+
+
+def plan_representation(
+    episode: EpisodeResult,
+    plan_evidence: PlanEvidenceInputs,
+) -> tuple[float, ...]:
+    """The gate's MMD feature vector for one plan episode."""
+
+    return _plan_representation(episode, plan_evidence, _spec_index(plan_evidence))
+
+
+def _spec_index(plan_evidence: PlanEvidenceInputs) -> dict[str, TaskPlanSpec]:
+    return {spec.task_id: spec for spec in plan_evidence.task_plan_specs}
+
+
+def _plan_quality_evidence(
+    pairs: Sequence[tuple[EpisodeResult, EpisodeResult]],
+    clusters: Sequence[str],
+    *,
+    settings: GateSettings,
+    plan_evidence: PlanEvidenceInputs,
+    task_plan_specs: Mapping[str, TaskPlanSpec],
+    reference_hash: str,
+    candidate_hash: str,
+    seed: int,
+) -> tuple[StatisticalEvidence, str | None]:
+    reference_scores = tuple(
+        _plan_quality_score(reference_episode, plan_evidence, task_plan_specs)
+        for reference_episode, _candidate in pairs
+    )
+    candidate_scores = tuple(
+        _plan_quality_score(candidate_episode, plan_evidence, task_plan_specs)
+        for _reference, candidate_episode in pairs
+    )
+    bootstrap = clustered_paired_bootstrap(
+        candidate_scores,
+        reference_scores,
+        clusters,
+        confidence_level=settings.confidence_level,
+        resamples=settings.bootstrap_resamples,
+        seed=seed,
+    )
+    evidence = _evidence(
+        method="plan_quality_bootstrap",
+        estimate=bootstrap.mean_difference,
+        unit="score_delta",
+        sample_size=len(pairs),
+        reference_hash=reference_hash,
+        candidate_hash=candidate_hash,
+        threshold=settings.score_margin,
+        seed=seed,
+        confidence_low=bootstrap.confidence_low,
+        confidence_high=bootstrap.confidence_high,
+        confidence_level=bootstrap.confidence_level,
+    )
+    reason = (
+        "plan_quality_margin"
+        if bootstrap.confidence_low < settings.score_margin
+        else None
+    )
+    return evidence, reason
+
+
+def _plan_mmd_evidence(
+    pairs: Sequence[tuple[EpisodeResult, EpisodeResult]],
+    clusters: Sequence[str],
+    *,
+    settings: GateSettings,
+    plan_evidence: PlanEvidenceInputs,
+    task_plan_specs: Mapping[str, TaskPlanSpec],
+    reference_hash: str,
+    candidate_hash: str,
+    seed: int,
+) -> tuple[StatisticalEvidence, str | None]:
+    reference_points = tuple(
+        _plan_representation(reference_episode, plan_evidence, task_plan_specs)
+        for reference_episode, _candidate in pairs
+    )
+    candidate_points = tuple(
+        _plan_representation(candidate_episode, plan_evidence, task_plan_specs)
+        for _reference, candidate_episode in pairs
+    )
+    try:
+        mmd = mmd_permutation_test(
+            production=reference_points,
+            candidate=candidate_points,
+            bandwidth=settings.mmd_bandwidth,
+            permutations=settings.mmd_permutations,
+            seed=seed,
+            clusters=clusters,
+        )
+    except MMDError as error:
+        raise GateExecutionError(str(error)) from error
+    evidence = _evidence(
+        method="plan_mmd",
+        estimate=mmd.mmd_squared,
+        unit="mmd_squared",
+        sample_size=len(pairs),
+        reference_hash=reference_hash,
+        candidate_hash=candidate_hash,
+        threshold=settings.mmd_alpha,
+        seed=seed,
+        p_value=mmd.p_value,
+    )
+    reason = "mmd_rejected" if mmd.p_value <= settings.mmd_alpha else None
+    return evidence, reason
+
+
+@dataclass(frozen=True)
+class PlanGateReplay:
+    """The gate's plan-quality and MMD decision recomputed on stored plan pairs."""
+
+    outcome: str
+    reason_codes: tuple[str, ...]
+    statistics: tuple[StatisticalEvidence, ...]
+    seed: int | None
+
+
+def replay_plan_gate(
+    reference: RunConfiguration,
+    candidate: RunConfiguration,
+    task_set: TaskSet,
+    pairs: Sequence[tuple[EpisodeResult, EpisodeResult]],
+    *,
+    settings: GateSettings,
+    plan_evidence: PlanEvidenceInputs,
+) -> PlanGateReplay:
+    """Apply ``run_offline_gate``'s plan decision to plan pairs already run.
+
+    Opens no world and calls no model. ``pairs`` follow the task-set order,
+    one ``(reference, candidate)`` pair of plan episodes per task. The
+    checks, scores, feature vectors, clusters, and seed are the gate's own.
+    Teacher-forced KL needs live scoring and is refused.
+    """
+
+    _require_train_inputs(reference, candidate, task_set, settings, plan_evidence)
+    if "kl" in plan_evidence.required_statistics:
+        raise GateExecutionError("a replayed gate cannot score teacher-forced KL")
+    if "mmd" in plan_evidence.required_statistics:
+        require_mmd_resolution(task_set, settings)
+    requested: list[str] = []
+    if "plan_quality" in plan_evidence.required_statistics:
+        requested.extend(plan_evidence.plan_quality_features)
+    if "mmd" in plan_evidence.required_statistics:
+        requested.extend(plan_evidence.mmd_features)
+    try:
+        require_semantic_coverage(task_set.task_ids, _spec_index(plan_evidence), requested)
+    except PlanFeatureError as error:
+        raise GateExecutionError(str(error)) from error
+    if len(pairs) != task_set.task_count:
+        raise GateExecutionError("a replayed gate needs one plan pair per task")
+    reference_hash = run_configuration_hash(reference)
+    candidate_hash = run_configuration_hash(candidate)
+    for task_id, (reference_episode, candidate_episode) in zip(
+        task_set.task_ids, pairs, strict=True
+    ):
+        for episode, expected in (
+            (reference_episode, reference_hash),
+            (candidate_episode, candidate_hash),
+        ):
+            if episode.task.task_id != task_id:
+                raise GateExecutionError("plan pairs must follow the task-set order")
+            if episode.mode != "plan":
+                raise GateExecutionError("paired episodes must be plan mode")
+            if episode.run.configuration_hash != expected:
+                raise GateExecutionError("plan episode configuration hash does not match")
+        _raise_on_runtime_failure(reference_episode, "reference")
+        _raise_on_runtime_failure(candidate_episode, "candidate")
+        if reference_episode.tool_steps or candidate_episode.tool_steps:
+            return PlanGateReplay("BLOCK", ("tool_execution",), (), None)
+        if not _plan_succeeded(reference_episode) or not _plan_succeeded(
+            candidate_episode
+        ):
+            return PlanGateReplay("BLOCK", ("plan_run_failed",), (), None)
+    seed = _decision_seed(
+        reference_hash,
+        candidate_hash,
+        task_set.task_set_hash,
+        settings.plan_format_version,
+    )
+    clusters = tuple(
+        _cluster_label(task_id, scenario_id)
+        for task_id, scenario_id in zip(task_set.task_ids, task_set.scenario_ids, strict=True)
+    )
+    specs = _spec_index(plan_evidence)
+    statistics: list[StatisticalEvidence] = []
+    reasons: list[str] = []
+    for name, compute in (
+        ("plan_quality", _plan_quality_evidence),
+        ("mmd", _plan_mmd_evidence),
+    ):
+        if name not in plan_evidence.required_statistics:
+            continue
+        evidence, reason = compute(
+            tuple(pairs),
+            clusters,
+            settings=settings,
+            plan_evidence=plan_evidence,
+            task_plan_specs=specs,
+            reference_hash=reference_hash,
+            candidate_hash=candidate_hash,
+            seed=seed,
+        )
+        statistics.append(evidence)
+        if reason is not None:
+            reasons.append(reason)
+    return PlanGateReplay(
+        "PASS" if not reasons else "BLOCK", tuple(reasons), tuple(statistics), seed
+    )
+
+
 def _scored_positions(
     positions: Sequence[Sequence[TokenLogprob]],
 ) -> tuple[ScoredPosition, ...] | None:
@@ -770,40 +988,24 @@ def run_offline_gate(
     reason_codes: list[str] = []
     scoring_contract_hashes: list[str] = []
 
+    episode_pairs = tuple(
+        (reference_episode, candidate_episode)
+        for reference_episode, candidate_episode, _label, _task_id in pairs
+    )
     if "plan_quality" in required:
-        reference_scores = tuple(
-            _plan_quality_score(reference_episode, plan_evidence, task_plan_specs)
-            for reference_episode, _candidate, _label, _task_id in pairs
-        )
-        candidate_scores = tuple(
-            _plan_quality_score(candidate_episode, plan_evidence, task_plan_specs)
-            for _reference, candidate_episode, _label, _task_id in pairs
-        )
-        bootstrap = clustered_paired_bootstrap(
-            candidate_scores,
-            reference_scores,
+        quality, quality_reason = _plan_quality_evidence(
+            episode_pairs,
             clusters,
-            confidence_level=settings.confidence_level,
-            resamples=settings.bootstrap_resamples,
+            settings=settings,
+            plan_evidence=plan_evidence,
+            task_plan_specs=task_plan_specs,
+            reference_hash=reference_hash,
+            candidate_hash=candidate_hash,
             seed=seed,
         )
-        statistics.append(
-            _evidence(
-                method="plan_quality_bootstrap",
-                estimate=bootstrap.mean_difference,
-                unit="score_delta",
-                sample_size=sample_size,
-                reference_hash=reference_hash,
-                candidate_hash=candidate_hash,
-                threshold=settings.score_margin,
-                seed=seed,
-                confidence_low=bootstrap.confidence_low,
-                confidence_high=bootstrap.confidence_high,
-                confidence_level=bootstrap.confidence_level,
-            )
-        )
-        if bootstrap.confidence_low < settings.score_margin:
-            reason_codes.append("plan_quality_margin")
+        statistics.append(quality)
+        if quality_reason is not None:
+            reason_codes.append(quality_reason)
 
     if "kl" in required:
         tokenizers_match = (
@@ -908,40 +1110,19 @@ def run_offline_gate(
                     reason_codes.append("kl_limit")
 
     if "mmd" in required:
-        reference_points = tuple(
-            _plan_representation(reference_episode, plan_evidence, task_plan_specs)
-            for reference_episode, _candidate, _label, _task_id in pairs
+        mmd, mmd_reason = _plan_mmd_evidence(
+            episode_pairs,
+            clusters,
+            settings=settings,
+            plan_evidence=plan_evidence,
+            task_plan_specs=task_plan_specs,
+            reference_hash=reference_hash,
+            candidate_hash=candidate_hash,
+            seed=seed,
         )
-        candidate_points = tuple(
-            _plan_representation(candidate_episode, plan_evidence, task_plan_specs)
-            for _reference, candidate_episode, _label, _task_id in pairs
-        )
-        try:
-            mmd = mmd_permutation_test(
-                production=reference_points,
-                candidate=candidate_points,
-                bandwidth=settings.mmd_bandwidth,
-                permutations=settings.mmd_permutations,
-                seed=seed,
-                clusters=clusters,
-            )
-        except MMDError as error:
-            raise GateExecutionError(str(error)) from error
-        statistics.append(
-            _evidence(
-                method="plan_mmd",
-                estimate=mmd.mmd_squared,
-                unit="mmd_squared",
-                sample_size=sample_size,
-                reference_hash=reference_hash,
-                candidate_hash=candidate_hash,
-                threshold=settings.mmd_alpha,
-                seed=seed,
-                p_value=mmd.p_value,
-            )
-        )
-        if mmd.p_value <= settings.mmd_alpha:
-            reason_codes.append("mmd_rejected")
+        statistics.append(mmd)
+        if mmd_reason is not None:
+            reason_codes.append(mmd_reason)
 
     decided_at = runtime.clock()
     outcome = "PASS" if not reason_codes else "BLOCK"

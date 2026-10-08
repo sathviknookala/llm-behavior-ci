@@ -856,8 +856,7 @@ def measure_harm(
     candidate_run = new_run_identity(candidate)
     candidate_scores: list[float] = []
     base_scores: list[float] = []
-    clusters: list[str] = []
-    lone_index = 0
+    clusters = list(harm_cluster_labels(task_set))
     try:
         for index, task_id in enumerate(task_set.task_ids):
             scenario_id = task_set.scenario_ids[index]
@@ -883,20 +882,120 @@ def measure_harm(
                 raise FaultError("missing evaluator outcome")
             candidate_scores.append(float(candidate_outcome.success))
             base_scores.append(float(reference_outcome.success))
-            if scenario_id is not None:
-                clusters.append(f"scenario:{scenario_id}")
-            else:
-                clusters.append(f"lone:{lone_index}")
-                lone_index += 1
     except EpisodeRejected as error:
         raise FaultError(str(error)) from error
+    return _harm_label(
+        base,
+        candidate,
+        task_set,
+        fault=fault,
+        base_scores=base_scores,
+        candidate_scores=candidate_scores,
+        clusters=clusters,
+        margin=margin_value,
+        confidence_level=confidence_value,
+        resamples=resample_count,
+        seed=seed_value,
+    )
+
+
+def harm_cluster_labels(task_set: TaskSet) -> tuple[str, ...]:
+    """``measure_harm``'s bootstrap clusters for a task set, in task order."""
+
+    labels: list[str] = []
+    lone_index = 0
+    for scenario_id in task_set.scenario_ids:
+        if scenario_id is not None:
+            labels.append(f"scenario:{scenario_id}")
+        else:
+            labels.append(f"lone:{lone_index}")
+            lone_index += 1
+    return tuple(labels)
+
+
+def harm_label_from_outcomes(
+    base: RunConfiguration,
+    candidate: RunConfiguration,
+    task_set: TaskSet,
+    *,
+    fault: FaultSpec,
+    base_successes: Sequence[bool | None],
+    candidate_successes: Sequence[bool | None],
+    margin: float,
+    confidence_level: float,
+    resamples: int,
+    seed: int,
+) -> HarmLabel:
+    """``measure_harm``'s label from evaluator outcomes already recorded.
+
+    One base and one candidate outcome per task, in task-set order, from
+    paired episodes on the declared configurations. A missing outcome
+    (``None``) raises, as it does in ``measure_harm``: the label is then
+    unmeasurable, never scored as a failure. Runs no episode.
+    """
+
+    if not isinstance(task_set, TaskSet):
+        raise FaultError("harm label requires a task set")
+    if task_set.split != "dev":
+        raise FaultError("measure_harm requires a dev task set")
+    if not isinstance(fault, FaultSpec):
+        raise FaultError("measure_harm requires a fault spec")
+    if not fault.representable:
+        raise FaultError(str(fault.schema_request))
+    if not isinstance(base, RunConfiguration) or not isinstance(
+        candidate, RunConfiguration
+    ):
+        raise FaultError("measure_harm requires run configurations")
+    if apply_fault(base, fault) != candidate:
+        raise FaultError("candidate is not the declared fault")
+    try:
+        verify_task_set(base.task, task_set)
+        verify_task_set(candidate.task, task_set)
+    except SelectionError as error:
+        raise FaultError(str(error)) from error
+    if (
+        len(base_successes) != task_set.task_count
+        or len(candidate_successes) != task_set.task_count
+    ):
+        raise FaultError("harm outcomes must align with the task set")
+    if any(item is None for item in (*base_successes, *candidate_successes)):
+        raise FaultError("missing evaluator outcome")
+    return _harm_label(
+        base,
+        candidate,
+        task_set,
+        fault=fault,
+        base_scores=[float(bool(item)) for item in base_successes],
+        candidate_scores=[float(bool(item)) for item in candidate_successes],
+        clusters=list(harm_cluster_labels(task_set)),
+        margin=_require_margin(margin),
+        confidence_level=_require_confidence_level(confidence_level),
+        resamples=_require_resamples(resamples),
+        seed=_require_seed(seed),
+    )
+
+
+def _harm_label(
+    base: RunConfiguration,
+    candidate: RunConfiguration,
+    task_set: TaskSet,
+    *,
+    fault: FaultSpec,
+    base_scores: list[float],
+    candidate_scores: list[float],
+    clusters: list[str],
+    margin: float,
+    confidence_level: float,
+    resamples: int,
+    seed: int,
+) -> HarmLabel:
     bootstrap = clustered_paired_bootstrap(
         candidate_scores,
         base_scores,
         clusters,
-        confidence_level=confidence_value,
-        resamples=resample_count,
-        seed=seed_value,
+        confidence_level=confidence_level,
+        resamples=resamples,
+        seed=seed,
     )
     effect = bootstrap.mean_difference
     return HarmLabel(
@@ -907,12 +1006,12 @@ def measure_harm(
         effect_estimate=effect,
         interval_low=bootstrap.confidence_low,
         interval_high=bootstrap.confidence_high,
-        margin=margin_value,
-        harmful=(-effect) >= margin_value,
+        margin=margin,
+        harmful=(-effect) >= margin,
         split="dev",
-        confidence_level=confidence_value,
-        resamples=resample_count,
-        seed=seed_value,
+        confidence_level=confidence_level,
+        resamples=resamples,
+        seed=seed,
     )
 
 

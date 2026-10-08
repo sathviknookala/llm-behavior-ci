@@ -105,6 +105,43 @@ Hardware is `not_applicable` and `nvidia-smi` is never called; elapsed wall time
 
 `scripts/evaluation/calibrate_hosted.py` is the bounded path for steps 3 and 4. `--prepare` inventories stores and captures, fills empty slots only from the same configuration hash, and writes a checkpoint plus a public report. Episodes from another hash stay inventory. A same-hash execute pair fills one A/A slot. Its reference is a healthy production draw and can support a baseline success estimate; the report counts how many baseline slots those references would add and does not assign the episode to both. `--run` resumes the checkpoint and stops after `--max-model-episodes` model episodes. The repetition count in the examples below is a provisional execution budget, not a power-based sample target: that target needs repeated production draws on at least two scenarios, aligned do-nothing outcomes, and a caller-supplied harm margin and alpha. `test_normal` is refused.
 
+### 3b. Ledgered qualification batches
+
+`scripts/evaluation/run_qualification_batch.py` (`experiments/qualification_batch.py`) runs two fixed designs under the same attempt ledger as §12:
+
+- **`dev_four_arm`**: per dev task, in a seeded per-task order (`seeded_arm_orders`), one execute episode in a fresh world for each of four arms:
+  - H1, the healthy reference;
+  - H2, an independent healthy repeat;
+  - C0, the declared no-op;
+  - C1, the regression.
+
+  Each candidate must equal its fault applied to the healthy configuration. Each `(task, arm)` pair is its own ledger scope, so H1, H2 and C0 stay distinct even when they share a hash.
+- **`plan_aa`**: two healthy plan generations per train task, run as one plan pair the way the gate runs them.
+
+**Caps and resumption.**
+- `--prepare` binds the design and the caps to a new checkpoint and calls no provider.
+- A cap may not exceed the design's attempt count, and the design's other mode gets 0.
+- `--run` reconciles first, and never dispatches a scope already in the ledger, whatever its state.
+- A raised runtime error marks its started attempt `failed` and stops the batch.
+- `reconcile_attempts.py` works on this checkpoint.
+
+**`--evidence` output.** It reads only the checkpoint:
+
+| Output | Source |
+|---|---|
+| Per-arm outcomes | Missing outcomes stay `None` |
+| Execution A/A | H1 as repetition 0, H2 as repetition 1, as `task_success` observations; C0 never enters |
+| CUSUM scale rule | H1 and H2 |
+| No-op label (H1, C0) and regression label (H1, C1) | `harm_label_from_outcomes`, the math `measure_harm` uses. Both share the H1 column; a label with any missing outcome is `unmeasurable` |
+| Plan gate replay (`replay_plan_gate`) | The gate's own score, MMD vectors, clusters and seed, applied to the stored pairs |
+| Plan A/A series | See below |
+
+**Plan A/A series.**
+- The bootstrap reads the gate's weighted score, mapped affinely from its weight-implied range onto [0, 1].
+- MMD reads one series per coordinate of its representation, so it gets one A/A result per coordinate.
+- Both reach `validate_method` as `plan_quality_score` observations with task, scenario and repetition labels.
+- Plan A/A requires every quality and MMD feature to be a fraction.
+
 ### 4. Production and do-nothing baseline
 
 ```bash
