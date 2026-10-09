@@ -7,10 +7,13 @@ SQLite store. A BLOCK stops there. Admission is ``POST /candidates`` with
 that artifact id, so the service's release or test admission, its
 task-selection allowance, and its hash checks decide. Tier 2 sends dev
 arrivals to ``POST /episodes`` until the service's ``CanaryController``
-reaches PROMOTED or ROLLED_BACK. Tier 3 sends the remaining arrivals as
-ordinary traffic, which the service routes to whatever it now serves and
-feeds to its production monitor. The summary is read back from the store
-and ``GET /deployment``, never from the runner's own bookkeeping.
+reaches PROMOTED or ROLLED_BACK, and closes it through ``POST
+/deployment/rollback`` when the arrivals run out first. After PROMOTED the
+remaining arrivals are Tier 3: ordinary traffic the service routes to the
+promoted configuration and feeds to its production monitor. After
+ROLLED_BACK the same arrivals only verify that the known-good
+configuration still serves. The summary is read back from the store and
+``GET /deployment``, never from the runner's own bookkeeping.
 """
 
 from __future__ import annotations
@@ -264,6 +267,46 @@ def _evidence(store_path: Path, artifact_id: str) -> dict[str, object]:
     }
 
 
+def _roll_back_incomplete_canary(
+    service: ServiceClient,
+    production_hash: str,
+) -> dict[str, object]:
+    """Close a canary that ran out of arrivals before its rule decided.
+
+    Uses the service's ``POST /deployment/rollback``, which records a
+    ``manual_rollback`` decision, and refuses to report success unless the
+    service confirms the candidate is closed and the known-good
+    configuration serves.
+    """
+
+    response = service.post("/deployment/rollback", json={})
+    if response.status_code != 200:
+        raise ConnectedLifecycleError(
+            f"canary cleanup rollback returned {response.status_code}: {_detail(response)}"
+        )
+    deployment = response.json()
+    if not isinstance(deployment, dict):
+        raise ConnectedLifecycleError("canary cleanup rollback did not return an object")
+    confirmed = (
+        deployment.get("state") == "ROLLED_BACK"
+        and deployment.get("admission") == "rollback_requested"
+        and deployment.get("serving_configuration_hash") == production_hash
+        and deployment.get("production_configuration_hash") == production_hash
+        and deployment.get("promoted_configuration_hash") is None
+    )
+    if not confirmed:
+        raise ConnectedLifecycleError(
+            "canary cleanup rollback was not confirmed; the candidate may still serve"
+        )
+    return {
+        "rollback": "manual_rollback",
+        "reason": "canary_arrivals_exhausted",
+        "state": deployment["state"],
+        "admission": deployment["admission"],
+        "serving_configuration_hash": deployment["serving_configuration_hash"],
+    }
+
+
 def run_three_tier_dev(
     gate: GateInputs,
     traffic: DevTraffic,
@@ -276,7 +319,12 @@ def run_three_tier_dev(
     ``service`` is an HTTP client bound to a service whose store is
     ``store_path``: a ``TestClient`` in process, or an ``httpx.Client`` on
     a running ``serve.py``. Status is ``blocked``, ``admission_refused``,
-    ``canary_incomplete``, ``promoted``, or ``rolled_back``. Gate execution
+    ``canary_incomplete``, ``promoted``, or ``rolled_back``. A canary whose
+    arrivals run out before its rule decides is rolled back through the
+    service and reported as ``canary_incomplete`` with a ``cleanup`` entry;
+    an unconfirmed cleanup raises. Arrivals after PROMOTED are ``tier3``;
+    after ROLLED_BACK they are ``fallback_verification``, and either raises
+    when the service routed one to the wrong configuration. Gate execution
     errors and capability refusals propagate before anything is persisted.
     """
 
@@ -330,7 +378,9 @@ def run_three_tier_dev(
         canary.append(_episode(service, task_id, f"canary:{index}:{task_id}"))
         state = _json(service.get("/deployment"), "GET /deployment").get("state")
     summary["tier2"] = {**_receipts(canary), "state": state}
+    production_hash = run_configuration_hash(traffic.production)
     if state not in _TERMINAL:
+        summary["cleanup"] = _roll_back_incomplete_canary(service, production_hash)
         summary["status"] = "canary_incomplete"
         summary["deployment"] = _deployment_view(
             _json(service.get("/deployment"), "GET /deployment")
@@ -339,11 +389,21 @@ def run_three_tier_dev(
         assert_public_payload(summary)
         return summary
 
+    expected_hash = (
+        run_configuration_hash(traffic.candidate) if state == "PROMOTED" else production_hash
+    )
     production = [
         _episode(service, task_id, f"production:{index}:{task_id}")
         for index, task_id in enumerate(traffic.production_task_ids)
     ]
-    summary["tier3"] = _receipts(production)
+    misrouted = [item for item in production if item["configuration_hash"] != expected_hash]
+    if misrouted:
+        raise ConnectedLifecycleError(
+            f"{len(misrouted)} production arrivals after {state} were not served by "
+            "the expected configuration"
+        )
+    stage = "tier3" if state == "PROMOTED" else "fallback_verification"
+    summary[stage] = _receipts(production)
     summary["status"] = _STATUS[str(state)]
     summary["deployment"] = _deployment_view(
         _json(service.get("/deployment"), "GET /deployment")

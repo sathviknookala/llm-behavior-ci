@@ -12,7 +12,8 @@ worlds, a lazily opened store, and test admission, because the artifact is
 ``live`` runs the same function against a ``serve.py`` already listening
 on --service-url with --store, and builds plan runtimes with the
 ``LiveRuntimeFactory``. It refuses a dirty tree, a non-train gate, a
-non-dev service, and a store under results/. Bare invocation exits 2.
+non-dev service, and a store under results/. Exit codes are in ``main``.
+Bare invocation exits 2.
 """
 
 from __future__ import annotations
@@ -49,10 +50,9 @@ from llm_behavior_ci.lifecycle.connected import (
 from llm_behavior_ci.lifecycle.offline_gate import GateExecutionError
 from llm_behavior_ci.runtime.agent import AgentTurn
 from llm_behavior_ci.runtime.appworld import EvaluationResult, TaskContext, ToolResult
-from llm_behavior_ci.runtime.episode import EpisodeRejected, RuntimeDependencies
+from llm_behavior_ci.runtime.episode import RuntimeDependencies
 from llm_behavior_ci.runtime.factory import StaticRuntimeFactory
 from llm_behavior_ci.service import ServiceDependencies
-from llm_behavior_ci.storage import StorageError
 from llm_behavior_ci.tasks.selection import (
     TaskSet,
     canonical_task_set_bytes,
@@ -362,14 +362,19 @@ def _load_configuration(raw: str) -> RunConfiguration:
     return RunConfiguration.from_dict(json.loads(Path(raw).read_text(encoding="utf-8")))
 
 
-def _run_live(args: argparse.Namespace) -> dict[str, object]:
-    import httpx
+def live_inputs(args: argparse.Namespace) -> tuple[GateInputs, DevTraffic]:
+    """Load and check every live input; any error here is an invalid invocation."""
 
     from llm_behavior_ci.experiments.run_config import load_local_task_manifest
-    from llm_behavior_ci.lifecycle.offline_gate import plan_evidence_from_dict
+    from llm_behavior_ci.lifecycle.offline_gate import (
+        plan_evidence_from_dict,
+        require_gate_capabilities,
+    )
     from llm_behavior_ci.runtime.factory import LiveRuntimeFactory
     from llm_behavior_ci.runtime.provenance import enforce_committed_provenance
 
+    if _under_results(Path(args.store)):
+        raise ConfigError("store must not be under results/")
     gate_reference = _load_configuration(args.gate_reference)
     gate_candidate = _load_configuration(args.gate_candidate)
     production = _load_configuration(args.production_config)
@@ -385,6 +390,12 @@ def _run_live(args: argparse.Namespace) -> dict[str, object]:
         raise ConfigError("arrival counts must be positive")
     if canary_count + production_count > len(dev.task_ids):
         raise ConfigError("arrival counts exceed the dev task set")
+    plan_evidence = plan_evidence_from_dict(
+        json.loads(Path(args.plan_evidence).read_text(encoding="utf-8"))
+    )
+    require_gate_capabilities(
+        gate_reference, gate_candidate, plan_evidence.required_statistics
+    )
     gate = GateInputs(
         reference=gate_reference,
         candidate=gate_candidate,
@@ -392,9 +403,7 @@ def _run_live(args: argparse.Namespace) -> dict[str, object]:
         settings=GateSettings.from_dict(
             json.loads(Path(args.gate_settings).read_text(encoding="utf-8"))
         ),
-        plan_evidence=plan_evidence_from_dict(
-            json.loads(Path(args.plan_evidence).read_text(encoding="utf-8"))
-        ),
+        plan_evidence=plan_evidence,
         runtime_factory=LiveRuntimeFactory.from_endpoints(
             reference=args.reference_endpoint,
             candidate=args.candidate_endpoint,
@@ -408,16 +417,96 @@ def _run_live(args: argparse.Namespace) -> dict[str, object]:
             dev.task_ids[canary_count : canary_count + production_count]
         ),
     )
-    with httpx.Client(base_url=args.service_url, timeout=None) as client:
-        return run_three_tier_dev(
-            gate, traffic, store_path=Path(args.store), service=client
+    return gate, traffic
+
+
+def run_live(
+    gate: GateInputs,
+    traffic: DevTraffic,
+    *,
+    store_path: Path,
+    service_url: str,
+) -> dict[str, object]:
+    import httpx
+
+    with httpx.Client(base_url=service_url, timeout=None) as client:
+        return run_three_tier_dev(gate, traffic, store_path=store_path, service=client)
+
+
+LIVE_EXIT_CODES = {
+    "promoted": 0,
+    "blocked": 1,
+    "rolled_back": 1,
+    "admission_refused": 1,
+    "canary_incomplete": 3,
+}
+EXPECTED_SYNTHETIC_STATUS = {
+    "blocked": "blocked",
+    "healthy": "promoted",
+    "regression": "rolled_back",
+}
+EXIT_INVALID = 2
+EXIT_FAILURE = 4
+
+
+def _fail(error: BaseException, code: int) -> int:
+    print(str(error) or type(error).__name__, file=sys.stderr)
+    return code
+
+
+def _main_synthetic(scenario: str) -> int:
+    try:
+        with TemporaryDirectory() as temporary:
+            summary = run_synthetic(scenario, Path(temporary))
+    except Exception as error:
+        return _fail(error, EXIT_FAILURE)
+    expected = EXPECTED_SYNTHETIC_STATUS[scenario]
+    verified = summary.get("status") == expected
+    print(
+        json.dumps(
+            {**summary, "expected_status": expected, "verified": verified},
+            sort_keys=True,
         )
+    )
+    return 0 if verified else 1
+
+
+def _main_live(args: argparse.Namespace) -> int:
+    try:
+        gate, traffic = live_inputs(args)
+    except (
+        ConfigError,
+        ConnectedLifecycleError,
+        GateExecutionError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as error:
+        return _fail(error, EXIT_INVALID)
+    try:
+        summary = run_live(
+            gate, traffic, store_path=Path(args.store), service_url=args.service_url
+        )
+    except Exception as error:
+        return _fail(error, EXIT_FAILURE)
+    code = LIVE_EXIT_CODES.get(str(summary.get("status")))
+    if code is None:
+        return _fail(RuntimeError(f"unknown lifecycle status {summary.get('status')}"), EXIT_FAILURE)
+    print(json.dumps(summary, sort_keys=True))
+    return code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Exit codes: synthetic 0 when the scenario's expected outcome is verified,
+    1 when it is not; live 0 promoted, 1 blocked, rolled back, or admission
+    refused, 3 canary incomplete after a confirmed cleanup rollback; 2 for an
+    invalid invocation or input; 4 for an execution or infrastructure failure.
+    """
+
     args_list = list(sys.argv[1:] if argv is None else argv)
     if not args_list:
-        return 2
+        return EXIT_INVALID
     parser = argparse.ArgumentParser(description="Run the connected three-tier dev lifecycle.")
     commands = parser.add_subparsers(dest="command", required=True)
     synthetic_parser = commands.add_parser("synthetic")
@@ -443,29 +532,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(args_list)
     except SystemExit as error:
-        return 2 if error.code is None else int(error.code)
-    try:
-        if args.command == "synthetic":
-            with TemporaryDirectory() as temporary:
-                summary = run_synthetic(args.scenario, Path(temporary))
-        else:
-            if _under_results(Path(args.store)):
-                print("store must not be under results/", file=sys.stderr)
-                return 2
-            summary = _run_live(args)
-    except (
-        ConnectedLifecycleError,
-        ConfigError,
-        GateExecutionError,
-        EpisodeRejected,
-        StorageError,
-        OSError,
-        ValueError,
-    ) as error:
-        print(str(error) or "three-tier lifecycle failed", file=sys.stderr)
-        return 1
-    print(json.dumps(summary, sort_keys=True))
-    return 0
+        return EXIT_INVALID if error.code is None else int(error.code)
+    if args.command == "synthetic":
+        return _main_synthetic(args.scenario)
+    return _main_live(args)
 
 
 if __name__ == "__main__":
