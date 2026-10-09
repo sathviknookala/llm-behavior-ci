@@ -142,6 +142,23 @@ Hardware is `not_applicable` and `nvidia-smi` is never called; elapsed wall time
 - Both reach `validate_method` as `plan_quality_score` observations with task, scenario and repetition labels.
 - Plan A/A requires every quality and MMD feature to be a fraction.
 
+**Provenance.** Every result records whether its runtime was live (`is_live_runtime`). An A/A series is `local_runtime` only when every episode in it was live; otherwise it is `synthetic`, which `validate_method` never accepts. Fake-runtime outcomes therefore cannot qualify a configuration.
+
+**Lock reports.** Repeated `--lock-inputs` files (`{"spec", "null_seed_blocks", "reference_cases"}`) add one assembled `ValidationReport` per method and its status (`validated`, `failed`, `pending_live_aa`, `unavailable`):
+
+| Batch | Method | A/A components |
+|---|---|---|
+| `dev_four_arm` | `sequential_canary`, `cusum` | `task_success` (H1, H2) |
+| `plan_aa` | `clustered_paired_bootstrap` | `plan_quality` |
+| `plan_aa` | `mmd_permutation_test` | one `mmd:<feature>` per coordinate |
+
+- `assemble_validation_report` simulates each null seed block under the study budget, then runs the checks once over every replicate. The result equals one `validate_method` call on all the seeds.
+- The A/A check passes only when every declared series has a component and every component passed. A single series binds its component unchanged.
+- Components must share one provenance, split and configuration hash, and that hash must be the healthy arm's.
+- MMD's coordinate results describe the joint test's inputs. They do not replace the joint test, which stays in the gate replay, and they make no overall α statement.
+- Once the batch estimates the CUSUM scale, the CUSUM inputs must carry exactly that target, slack and threshold.
+- `lock_protocol.py` reloads a report with its seed blocks and components.
+
 ### 4. Production and do-nothing baseline
 
 ```bash

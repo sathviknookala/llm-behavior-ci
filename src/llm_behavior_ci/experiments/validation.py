@@ -696,6 +696,23 @@ class AADependenceReport:
 
 
 @dataclass(frozen=True)
+class AAComponent:
+    """One A/A series a method reads, measured by ``validate_method``.
+
+    A scalar method reads one series. ``mmd_permutation_test`` reads one
+    per coordinate of its representation. Coordinate results describe the
+    joint test's inputs; they do not replace the joint test and carry no
+    overall α statement.
+    """
+
+    series: str
+    input_hash: str
+    configuration_hashes: tuple[str, ...]
+    split: str | None
+    aa: AADependenceReport
+
+
+@dataclass(frozen=True)
 class ValidationReport:
     """One method after a validation run.
 
@@ -707,6 +724,9 @@ class ValidationReport:
     alternative power is ``power``, measured only when the spec names an
     ``alternative_shift`` and never part of eligibility. ``gpu_floor_measured`` stays false:
     this runner does not record a live full-vocabulary floor.
+
+    An assembled report (``assemble_validation_report``) also keeps the
+    size of each null seed block and every A/A component it bound.
     """
 
     method: str
@@ -738,6 +758,8 @@ class ValidationReport:
     gpu_floor_measured: bool
     split: str | None
     power: CheckResult | None = None
+    null_seed_blocks: tuple[int, ...] = ()
+    aa_components: tuple[AAComponent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1189,21 +1211,9 @@ def validate_method(
     required = set(method.required_checks)
     if method.study == "gpu":
         required.add("gpu_evidence")
-    checks: list[CheckResult] = []
-    agreements: list[CaseAgreement] = []
-    if "null_false_alarm" in contract.checks:
-        checks.append(_null_check(method, contract, seeds, replicates, included, required))
-    if "coverage" in contract.checks:
-        checks.append(
-            _coverage_check(method, contract, seeds, included, required)
-        )
-    if "stopping" in contract.checks:
-        checks.append(_stopping_check(method, contract, seeds, included, required))
-    if "repeated_look" in contract.checks:
-        checks.append(_repeated_check(method, seeds, included, required))
-    if "reference" in contract.checks:
-        reference_check, agreements = _reference_check(method, cases, required)
-        checks.append(reference_check)
+    checks, agreements = _simulation_checks(
+        method, contract, seeds, replicates, cases, required
+    )
     aa_report = _aa_report(
         method,
         contract,
@@ -1278,6 +1288,276 @@ def validate_method(
             **{item.name: getattr(report, item.name) for item in fields(report)},
             "input_hash": digest,
         }
+    )
+
+
+def aa_component(
+    method: MethodSpec,
+    series: str,
+    observations: Sequence[MonitorObservation],
+    context: AAContext,
+    *,
+    split: str | None = None,
+) -> AAComponent:
+    """``validate_method``'s A/A result for one scalar series of a method."""
+
+    if not isinstance(series, str) or series.strip() == "":
+        raise ValidationError("A/A series name is required")
+    report = validate_method(
+        method,
+        null_seeds=(),
+        reference_cases=(),
+        aa_observations=tuple(observations),
+        split=split,
+        aa_context=context,
+    )
+    return AAComponent(
+        series=series,
+        input_hash=report.input_hash,
+        configuration_hashes=report.configuration_hashes,
+        split=report.split,
+        aa=report.aa,
+    )
+
+
+def assemble_validation_report(
+    method: MethodSpec,
+    *,
+    null_seed_blocks: Sequence[Sequence[int]],
+    reference_cases: Sequence[ReferenceCase],
+    aa_series: Sequence[str],
+    aa_components: Sequence[AAComponent],
+    configuration_hash: str | None = None,
+) -> ValidationReport:
+    """One report from null seed blocks, reference cases, and A/A components.
+
+    Each block is simulated under the study budget on its own; the checks
+    then run once over every replicate, so the result equals one
+    ``validate_method`` call on all the seeds. The A/A check passes only
+    when every series in ``aa_series`` has a component and every component
+    passed. One series binds its component's result unchanged. Components
+    must share one provenance, split, and configuration hash, and that
+    hash must equal ``configuration_hash`` when it is given. No components
+    leaves the A/A check unavailable, so the report is not validated.
+    """
+
+    if not isinstance(method, MethodSpec):
+        raise ValidationError("method spec is required")
+    contract = _lookup(method.name)
+    if method.study == "gpu":
+        raise ValidationError("an assembled report does not take GPU evidence")
+    if "kl_approximation" in contract.checks:
+        raise ValidationError("an assembled report does not take a KL comparison")
+    if method.alternative_shift is not None:
+        raise ValidationError("an assembled report does not measure power")
+    if contract.kind == "score" and null_seed_blocks:
+        raise ValidationError("a score method does not take null seeds")
+    blocks = _seed_blocks(null_seed_blocks)
+    seeds = _seeds([seed for block in blocks for seed in block])
+    simulated: dict[int, _Replicate] = {}
+    for block in blocks:
+        _enforce_budget(method, len(block))
+        for seed, replicate in zip(block, _simulate(method, block), strict=True):
+            simulated[seed] = replicate
+    replicates = tuple(simulated[seed] for seed in seeds)
+    included = tuple(item for item in replicates if not item.excluded)
+    cases = _cases(reference_cases, contract)
+    series = _series_names(aa_series)
+    components = _components(aa_components, series, configuration_hash)
+    required = set(method.required_checks)
+    checks, agreements = _simulation_checks(
+        method, contract, seeds, replicates, cases, required
+    )
+    aa_report = _combined_aa(components, series)
+    if "aa_dependence" in contract.checks:
+        checks.append(_aa_check(aa_report, method, required))
+    omitted = tuple(name for name in contract.checks if name not in required)
+    eligible = _eligible(omitted, required, checks)
+    split = components[0].split if components else None
+    hashes = components[0].configuration_hashes if components else ()
+    inputs = _validation_inputs(
+        method, seeds, cases, (), None, None, split, None, None, None, None
+    )
+    digest = _hash_document(
+        {
+            "assembly": inputs,
+            "null_seed_blocks": [len(block) for block in blocks],
+            "aa_series": list(series),
+            "aa_components": [
+                {"series": item.series, "input_hash": item.input_hash}
+                for item in components
+            ],
+            "configuration_hash": configuration_hash,
+        }
+    )
+    return ValidationReport(
+        method=method.name,
+        implemented=True,
+        validated=eligible,
+        benchmark_eligible=eligible,
+        calibration=_calibration(contract, checks),
+        study=method.study,
+        null_claim=contract.null_claim,
+        null_draw=method.null_draw,
+        input_hash=digest,
+        seeds=seeds,
+        sample_count=len(included),
+        null_sample_size=method.null_sample_size,
+        uncertainty_level=method.uncertainty_level,
+        alpha=method.alpha,
+        horizon=method.horizon,
+        false_alarm_tolerance=method.false_alarm_tolerance,
+        coverage_tolerance=method.coverage_tolerance,
+        parameters=_canonical_parameters(method),
+        required_checks=method.required_checks,
+        omitted_checks=omitted,
+        checks=tuple(checks),
+        reference_agreements=tuple(agreements),
+        aa=aa_report,
+        libraries=reference_library_status(),
+        configuration_hashes=hashes,
+        gpu_evidence=False,
+        gpu_floor_measured=False,
+        split=split,
+        null_seed_blocks=tuple(len(block) for block in blocks),
+        aa_components=components,
+    )
+
+
+def _simulation_checks(
+    method: MethodSpec,
+    contract: _Contract,
+    seeds: Sequence[int],
+    replicates: Sequence[_Replicate],
+    cases: Sequence[ReferenceCase],
+    required: set[str],
+) -> tuple[list[CheckResult], list[CaseAgreement]]:
+    included = tuple(item for item in replicates if not item.excluded)
+    checks: list[CheckResult] = []
+    agreements: list[CaseAgreement] = []
+    if "null_false_alarm" in contract.checks:
+        checks.append(_null_check(method, contract, seeds, replicates, included, required))
+    if "coverage" in contract.checks:
+        checks.append(_coverage_check(method, contract, seeds, included, required))
+    if "stopping" in contract.checks:
+        checks.append(_stopping_check(method, contract, seeds, included, required))
+    if "repeated_look" in contract.checks:
+        checks.append(_repeated_check(method, seeds, included, required))
+    if "reference" in contract.checks:
+        reference_check, agreements = _reference_check(method, cases, required)
+        checks.append(reference_check)
+    return checks, agreements
+
+
+def _seed_blocks(values: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValidationError("null_seed_blocks must be a sequence of seed lists")
+    blocks = tuple(_seeds(block) for block in values)
+    if any(not block for block in blocks):
+        raise ValidationError("a null seed block is empty")
+    return blocks
+
+
+def _series_names(values: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValidationError("aa_series must be a sequence of names")
+    names = tuple(values)
+    if not names:
+        raise ValidationError("aa_series names no series")
+    for name in names:
+        if not isinstance(name, str) or name.strip() == "":
+            raise ValidationError("A/A series name is required")
+    if len(set(names)) != len(names):
+        raise ValidationError("aa_series repeats a series")
+    return names
+
+
+def _components(
+    values: Sequence[AAComponent],
+    series: Sequence[str],
+    configuration_hash: str | None,
+) -> tuple[AAComponent, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValidationError("aa_components must be a sequence")
+    components = tuple(values)
+    for item in components:
+        if not isinstance(item, AAComponent):
+            raise ValidationError("A/A component is required")
+        if item.series not in series:
+            raise ValidationError(f"A/A component {item.series} is not a declared series")
+    if len({item.series for item in components}) != len(components):
+        raise ValidationError("A/A components repeat a series")
+    if not components:
+        return ()
+    order = {name: index for index, name in enumerate(series)}
+    components = tuple(sorted(components, key=lambda item: order[item.series]))
+    if len({item.aa.provenance for item in components}) > 1:
+        raise ValidationError("A/A components mix provenance")
+    if len({item.split for item in components}) > 1:
+        raise ValidationError("A/A components mix splits")
+    hashes = {item.configuration_hashes for item in components}
+    if len(hashes) > 1:
+        raise ValidationError("A/A components mix configuration hashes")
+    if configuration_hash is not None and components[0].configuration_hashes not in (
+        (),
+        (configuration_hash,),
+    ):
+        raise ValidationError("A/A evidence is bound to another configuration")
+    return components
+
+
+def _combined_aa(
+    components: Sequence[AAComponent],
+    series: Sequence[str],
+) -> AADependenceReport:
+    if not components:
+        return _blank_aa(
+            "unavailable",
+            False,
+            0,
+            0,
+            None,
+            None,
+            "A/A records were not supplied",
+            accepted=False,
+        )
+    present = {item.series for item in components}
+    missing = [name for name in series if name not in present]
+    if len(series) == 1 and not missing:
+        return components[0].aa
+    failing = [item for item in components if item.aa.status != "passed"]
+    if missing or failing:
+        failed = any(item.aa.status == "failed" for item in failing)
+        status = "failed" if failed else "unavailable"
+        reason = "; ".join(
+            [f"{name}: not supplied" for name in missing]
+            + [f"{item.series}: {item.aa.reason}" for item in failing]
+        )
+    else:
+        status = "passed"
+        reason = f"all {len(series)} components passed: " + ", ".join(series)
+    first = components[0].aa
+    return AADependenceReport(
+        status=status,
+        evidence_accepted=all(item.aa.evidence_accepted for item in components),
+        provenance=first.provenance,
+        hardware_observed=all(item.aa.hardware_observed for item in components),
+        observation_count=min(item.aa.observation_count for item in components),
+        pair_count=min(item.aa.pair_count for item in components),
+        repeated_task_effect=None,
+        scenario_clustering_effect=None,
+        inference_variation=None,
+        inference_source=None,
+        inference_low=None,
+        inference_high=None,
+        trajectory_divergence_rate=None,
+        interval_width_ratio=None,
+        concurrency_effect=None,
+        concurrency_levels=(),
+        series_alarm=None,
+        memory_used_mib=None,
+        wall_seconds=None,
+        reason=reason,
     )
 
 

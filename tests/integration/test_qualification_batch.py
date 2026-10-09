@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -20,29 +22,44 @@ from llm_behavior_ci.experiments.faults import (
     harm_label_from_outcomes,
     measure_harm,
 )
+from llm_behavior_ci.experiments.protocol import ProtocolError, _payload_reports_validated
 from llm_behavior_ci.experiments.qualification_batch import (
     DEV_ARMS,
     PLAN_ARMS,
+    LockReportInputs,
     QualificationBatchError,
+    cusum_lock_spec,
     cusum_scale,
     dev_four_arm_design,
     dev_harm_labels,
     dev_outcome_table,
     execution_aa_inputs,
     execution_aa_reports,
+    execution_lock_reports,
     load_batch_checkpoint,
+    lock_report_inputs_from_dict,
+    lock_report_status,
     open_batch,
     plan_aa_design,
     plan_aa_gate_replay,
     plan_aa_reports,
     plan_aa_series,
+    plan_lock_reports,
     plan_pairs,
     run_qualification_batch,
     scope_for,
     seeded_arm_orders,
 )
 from llm_behavior_ci.experiments.benchmark import reconcile_checkpoint
-from llm_behavior_ci.experiments.validation import method_spec
+from llm_behavior_ci.experiments.validation import (
+    AAComponent,
+    ValidationError,
+    assemble_validation_report,
+    method_spec,
+    public_validation_summary,
+    reference_case,
+    validate_method,
+)
 from llm_behavior_ci.lifecycle import offline_gate as gate_module
 from llm_behavior_ci.lifecycle.offline_gate import (
     PlanEvidenceInputs,
@@ -286,6 +303,14 @@ class RecordingFactory(RuntimeFactory):
         )
 
 
+def _mark_live(path: Path) -> None:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    for result in document["results"].values():
+        if "error" not in result:
+            result["live_runtime"] = True
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
 def _always(success: bool | None):
     return lambda _index, _configuration, _task_id: success
 
@@ -428,6 +453,7 @@ class DevBatchTests(unittest.TestCase):
             return task_id.endswith(("_0", "_1")) or index % 2 == 0
 
         self._run(RecordingFactory(outcome))
+        _mark_live(self.checkpoint)
         document = load_batch_checkpoint(self.checkpoint)
         specs = [
             method_spec(
@@ -768,6 +794,7 @@ class PlanAATests(unittest.TestCase):
 
     def test_both_gate_methods_receive_measurable_aa_evidence(self) -> None:
         self._run(RecordingFactory(_always(True), plans=_plan_text))
+        _mark_live(self.checkpoint)
         document = load_batch_checkpoint(self.checkpoint)
         specs = [
             method_spec(
@@ -861,3 +888,440 @@ class HarmLabelReuseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_REPO = Path(__file__).resolve().parents[2]
+
+
+def _lock_script():
+    spec = importlib.util.spec_from_file_location(
+        "lock_protocol_script", _REPO / "scripts" / "evaluation" / "lock_protocol.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _blocks(count: int, size: int) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(range(start, start + size)) for start in range(1, count * size + 1, size))
+
+
+def _canary_inputs() -> LockReportInputs:
+    ties = {"pairs": [[1.0, 1.0]] * 12}
+    harm = {"pairs": [[0.0, 1.0]] * 11}
+    return LockReportInputs(
+        spec=method_spec(
+            "sequential_canary",
+            {"alpha": 0.05, "harm_margin": 0.2, "horizon_episodes": 12, "null_probability": 0.5},
+            required_checks=("null_false_alarm", "stopping", "reference", "aa_dependence"),
+            study="simulation",
+            null_sample_size=12,
+            uncertainty_level=0.95,
+            null_draw="bernoulli",
+            alpha=0.05,
+            horizon=12,
+            false_alarm_tolerance=0.0,
+        ),
+        null_seed_blocks=_blocks(2, 20),
+        reference_cases=(
+            reference_case("ties_ever_alarmed", "ever_alarmed", 0.0, 0.0, "closed_form", ties),
+            reference_case("harm_estimate", "estimate", -1.0, 1e-12, "closed_form", harm),
+        ),
+    )
+
+
+def _cusum_inputs(spec_parameters: dict[str, float | str]) -> LockReportInputs:
+    ones = {"observations": [1.0] * 25}
+    return LockReportInputs(
+        spec=method_spec(
+            "cusum",
+            spec_parameters,
+            required_checks=("null_false_alarm", "stopping", "reference", "aa_dependence"),
+            study="simulation",
+            null_sample_size=25,
+            uncertainty_level=0.95,
+            null_draw="constant",
+            alpha=0.05,
+            horizon=25,
+        ),
+        null_seed_blocks=_blocks(2, 10),
+        reference_cases=(
+            reference_case("ones_ever_alarmed", "ever_alarmed", 0.0, 0.0, "closed_form", ones),
+            reference_case("ones_estimate", "estimate", 0.0, 1e-12, "closed_form", ones),
+        ),
+    )
+
+
+def _bootstrap_inputs() -> LockReportInputs:
+    constant = {
+        "candidate": [0.5] * 6,
+        "production": [0.75] * 6,
+        "clusters": [f"c{index}" for index in range(6)],
+        "seed": 17,
+    }
+    return LockReportInputs(
+        spec=method_spec(
+            "clustered_paired_bootstrap",
+            {"confidence_level": 0.9, "resamples": 40, "null_mean": 0.0, "null_scale": 1.0, "cluster_size": 1},
+            required_checks=("null_false_alarm", "coverage", "repeated_look", "reference", "aa_dependence"),
+            study="simulation",
+            null_sample_size=6,
+            uncertainty_level=0.95,
+            null_draw="gaussian",
+            alpha=0.1,
+            false_alarm_tolerance=0.5,
+            coverage_tolerance=0.5,
+            repeated_look_stride=3,
+        ),
+        null_seed_blocks=_blocks(2, 10),
+        reference_cases=(
+            reference_case("constant_mean", "mean_difference", -0.25, 1e-12, "closed_form", constant),
+        ),
+    )
+
+
+def _mmd_inputs(dimension: int = 5) -> LockReportInputs:
+    origin = [0.0] * dimension
+    identical = {
+        "production": [origin] * 6,
+        "candidate": [origin] * 6,
+        "clusters": [f"c{index}" for index in range(6)],
+        "seed": 17,
+    }
+    return LockReportInputs(
+        spec=method_spec(
+            "mmd_permutation_test",
+            {"bandwidth": 1.0, "permutations": 19, "dimension": dimension, "null_mean": 0.0, "null_scale": 1.0},
+            required_checks=("null_false_alarm", "repeated_look", "reference", "aa_dependence"),
+            study="simulation",
+            null_sample_size=6,
+            uncertainty_level=0.95,
+            null_draw="gaussian",
+            alpha=0.05,
+            false_alarm_tolerance=0.5,
+            repeated_look_stride=3,
+        ),
+        null_seed_blocks=_blocks(2, 10),
+        reference_cases=(
+            reference_case("identical_mmd", "mmd_squared", 0.0, 1e-12, "closed_form", identical),
+        ),
+    )
+
+
+def _cusum_parameters(scale: dict[str, object] | None = None) -> dict[str, float | str]:
+    if scale is None:
+        return {"target": 0.5833, "slack": 0.2575, "threshold": 2.5745, "direction": "decrease"}
+    return {
+        "target": float(scale["target"]),
+        "slack": float(scale["slack"]),
+        "threshold": float(scale["threshold"]),
+        "direction": "decrease",
+    }
+
+
+class LockReportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self._temporary.name)
+        dev = _task_set("dev", 4)
+        healthy = _configuration(dev)
+        self.dev = dev_four_arm_design(
+            dev,
+            healthy=healthy,
+            noop=apply_fault(healthy, _noop_fault()),
+            noop_fault=_noop_fault(),
+            regression=apply_fault(healthy, _regression_fault()),
+            regression_fault=_regression_fault(),
+            arm_orders=seeded_arm_orders(4, 17),
+        )
+        self.dev_checkpoint = self.root / "dev.json"
+        train = _task_set("train", 7)
+        self.plan = plan_aa_design(train, healthy=_configuration(train))
+        self.plan_checkpoint = self.root / "plan.json"
+        self.evidence = _plan_evidence(train)
+
+    def tearDown(self) -> None:
+        self._temporary.cleanup()
+
+    def _run_dev(self) -> None:
+        def outcome(index, configuration, task_id):
+            del configuration
+            return task_id.endswith(("_0", "_1")) or index % 2 == 0
+
+        run_qualification_batch(
+            self.dev,
+            runtime_factory=RecordingFactory(outcome),
+            checkpoint_path=self.dev_checkpoint,
+            budget=AttemptBudget(plan_generations=0, executions=16),
+        )
+
+    def _run_plan(self) -> None:
+        run_qualification_batch(
+            self.plan,
+            runtime_factory=RecordingFactory(_always(True), plans=_plan_text),
+            checkpoint_path=self.plan_checkpoint,
+            budget=AttemptBudget(plan_generations=14, executions=0),
+        )
+
+    def _execution_reports(self):
+        document = load_batch_checkpoint(self.dev_checkpoint)
+        scale = cusum_scale(self.dev, document)
+        parameters = _cusum_parameters(scale if scale["status"] == "estimated" else None)
+        inputs = {"sequential_canary": _canary_inputs(), "cusum": _cusum_inputs(parameters)}
+        return execution_lock_reports(self.dev, document, inputs)
+
+    def _plan_reports(self):
+        document = load_batch_checkpoint(self.plan_checkpoint)
+        inputs = {
+            "clustered_paired_bootstrap": _bootstrap_inputs(),
+            "mmd_permutation_test": _mmd_inputs(),
+        }
+        return plan_lock_reports(self.plan, document, self.evidence, inputs)
+
+    def test_reports_before_the_batch_runs_are_pending(self) -> None:
+        open_batch(self.dev, self.dev_checkpoint, budget=AttemptBudget(plan_generations=0, executions=16))
+        open_batch(self.plan, self.plan_checkpoint, budget=AttemptBudget(plan_generations=14, executions=0))
+        reports = {**self._execution_reports(), **self._plan_reports()}
+        for name, report in reports.items():
+            self.assertEqual(lock_report_status(report), "pending_live_aa", name)
+            self.assertFalse(report.validated)
+            self.assertEqual(report.aa.reason, "A/A records were not supplied")
+            self.assertEqual(report.aa_components, ())
+            checks = {check.name: check.status for check in report.checks}
+            self.assertEqual(checks["reference"], "passed", name)
+            self.assertEqual(checks["null_false_alarm"], "passed", name)
+            self.assertEqual(checks["aa_dependence"], "unavailable", name)
+
+    def test_fake_runtime_outcomes_cannot_qualify_a_configuration(self) -> None:
+        self._run_dev()
+        self._run_plan()
+        observations, context = execution_aa_inputs(self.dev, load_batch_checkpoint(self.dev_checkpoint))
+        self.assertEqual(len(observations), 8)
+        self.assertEqual(context.provenance, "synthetic")
+        reports = {**self._execution_reports(), **self._plan_reports()}
+        for name, report in reports.items():
+            self.assertEqual(lock_report_status(report), "pending_live_aa", name)
+            self.assertFalse(report.aa.evidence_accepted)
+            self.assertEqual(report.aa.provenance, "synthetic")
+            self.assertTrue(report.aa_components)
+
+    def test_one_result_from_a_fake_runtime_taints_the_whole_series(self) -> None:
+        self._run_dev()
+        _mark_live(self.dev_checkpoint)
+        document = json.loads(self.dev_checkpoint.read_text(encoding="utf-8"))
+        document["results"][scope_for(self.dev, 2, DEV_ARMS[1])]["live_runtime"] = False
+        self.dev_checkpoint.write_text(json.dumps(document), encoding="utf-8")
+        _observations, context = execution_aa_inputs(self.dev, load_batch_checkpoint(self.dev_checkpoint))
+        self.assertEqual(context.provenance, "synthetic")
+
+    def test_live_execution_reports_validate_and_bind_the_healthy_hash(self) -> None:
+        self._run_dev()
+        _mark_live(self.dev_checkpoint)
+        reports = self._execution_reports()
+        healthy = self.dev.arm(DEV_ARMS[0]).configuration_hash
+        document = load_batch_checkpoint(self.dev_checkpoint)
+        observations, context = execution_aa_inputs(self.dev, document)
+        for name, report in reports.items():
+            self.assertEqual(lock_report_status(report), "validated", name)
+            self.assertEqual(report.configuration_hashes, (healthy,))
+            self.assertEqual([item.series for item in report.aa_components], ["task_success"])
+            alone = validate_method(
+                report_spec(report, name),
+                null_seeds=(),
+                reference_cases=(),
+                aa_observations=observations,
+                aa_context=context,
+            )
+            self.assertEqual(report.aa, alone.aa)
+        scale = cusum_scale(self.dev, document)
+        self.assertEqual(
+            dict(reports["cusum"].parameters)["target"], str(scale["target"])
+        )
+
+    def test_cusum_inputs_must_carry_the_batch_scale(self) -> None:
+        self._run_dev()
+        document = load_batch_checkpoint(self.dev_checkpoint)
+        inputs = {"sequential_canary": _canary_inputs(), "cusum": _cusum_inputs(_cusum_parameters())}
+        with self.assertRaisesRegex(QualificationBatchError, "batch scale"):
+            execution_lock_reports(self.dev, document, inputs)
+        scale = cusum_scale(self.dev, document)
+        rebuilt = cusum_lock_spec(_cusum_inputs(_cusum_parameters()).spec, scale)
+        self.assertEqual(rebuilt.parameter_map()["threshold"], scale["threshold"])
+        with self.assertRaisesRegex(QualificationBatchError, "not estimated"):
+            cusum_lock_spec(rebuilt, {"status": "unavailable"})
+
+    def test_mmd_binds_five_coordinates_in_one_report(self) -> None:
+        self._run_plan()
+        _mark_live(self.plan_checkpoint)
+        reports = self._plan_reports()
+        mmd = reports["mmd_permutation_test"]
+        self.assertEqual(lock_report_status(mmd), "validated")
+        self.assertEqual(
+            [item.series for item in mmd.aa_components],
+            [f"mmd:{feature}" for feature in self.evidence.mmd_features],
+        )
+        self.assertEqual(mmd.aa.status, "passed")
+        self.assertIn("all 5 components passed", mmd.aa.reason)
+        self.assertEqual(mmd.null_seed_blocks, (10, 10))
+        bootstrap = reports["clustered_paired_bootstrap"]
+        self.assertEqual(lock_report_status(bootstrap), "validated")
+        self.assertEqual([item.series for item in bootstrap.aa_components], ["plan_quality"])
+        self.assertEqual(bootstrap.aa, bootstrap.aa_components[0].aa)
+        replay = plan_aa_gate_replay(
+            self.plan, load_batch_checkpoint(self.plan_checkpoint), settings=_SETTINGS, plan_evidence=self.evidence
+        )
+        self.assertIn("plan_mmd", {item["method"] for item in replay["statistics"]})
+
+    def test_a_failing_or_missing_coordinate_fails_the_mmd_aa(self) -> None:
+        self._run_plan()
+        _mark_live(self.plan_checkpoint)
+        components = self._plan_reports()["mmd_permutation_test"].aa_components
+        inputs = _mmd_inputs()
+        series = [item.series for item in components]
+
+        def assemble(chosen):
+            return assemble_validation_report(
+                inputs.spec,
+                null_seed_blocks=inputs.null_seed_blocks,
+                reference_cases=inputs.reference_cases,
+                aa_series=series,
+                aa_components=chosen,
+            )
+
+        unavailable = replace(
+            components[2], aa=replace(components[2].aa, status="unavailable", reason="missing within-task repetition")
+        )
+        report = assemble(components[:2] + (unavailable,) + components[3:])
+        self.assertEqual(report.aa.status, "unavailable")
+        self.assertIn(f"{series[2]}: missing within-task repetition", report.aa.reason)
+        self.assertFalse(report.validated)
+        self.assertEqual(lock_report_status(report), "unavailable")
+        failed = replace(components[4], aa=replace(components[4].aa, status="failed", reason="spread"))
+        report = assemble(components[:4] + (failed,))
+        self.assertEqual(report.aa.status, "failed")
+        self.assertEqual(lock_report_status(report), "failed")
+        report = assemble(components[:4])
+        self.assertEqual(report.aa.status, "unavailable")
+        self.assertIn(f"{series[4]}: not supplied", report.aa.reason)
+        self.assertFalse(report.validated)
+        self.assertEqual(len(report.aa_components), 4)
+
+    def test_mismatched_provenance_configuration_or_series_is_refused(self) -> None:
+        self._run_plan()
+        _mark_live(self.plan_checkpoint)
+        components = self._plan_reports()["mmd_permutation_test"].aa_components
+        inputs = _mmd_inputs()
+        series = [item.series for item in components]
+
+        def assemble(chosen, configuration_hash=None, names=series):
+            return assemble_validation_report(
+                inputs.spec,
+                null_seed_blocks=inputs.null_seed_blocks,
+                reference_cases=inputs.reference_cases,
+                aa_series=names,
+                aa_components=chosen,
+                configuration_hash=configuration_hash,
+            )
+
+        synthetic = replace(components[1], aa=replace(components[1].aa, provenance="synthetic"))
+        with self.assertRaisesRegex(ValidationError, "mix provenance"):
+            assemble(components[:1] + (synthetic,) + components[2:])
+        other = replace(components[3], configuration_hashes=("f" * 64,))
+        with self.assertRaisesRegex(ValidationError, "mix configuration hashes"):
+            assemble(components[:3] + (other,) + components[4:])
+        with self.assertRaisesRegex(ValidationError, "another configuration"):
+            assemble(components, configuration_hash="f" * 64)
+        with self.assertRaisesRegex(ValidationError, "not a declared series"):
+            assemble(components, names=series[:4])
+        with self.assertRaisesRegex(ValidationError, "repeat a series"):
+            assemble(components + (components[0],))
+        with self.assertRaisesRegex(QualificationBatchError, "dimension"):
+            plan_lock_reports(
+                self.plan,
+                load_batch_checkpoint(self.plan_checkpoint),
+                self.evidence,
+                {"clustered_paired_bootstrap": _bootstrap_inputs(), "mmd_permutation_test": _mmd_inputs(4)},
+            )
+
+    def test_assembled_null_checks_equal_one_validate_method_call(self) -> None:
+        for inputs in (_canary_inputs(), _bootstrap_inputs(), _mmd_inputs()):
+            seeds = [seed for block in inputs.null_seed_blocks for seed in block]
+            single = validate_method(
+                inputs.spec, null_seeds=seeds, reference_cases=inputs.reference_cases, aa_observations=()
+            )
+            assembled = assemble_validation_report(
+                inputs.spec,
+                null_seed_blocks=inputs.null_seed_blocks,
+                reference_cases=inputs.reference_cases,
+                aa_series=("series",),
+                aa_components=(),
+            )
+            self.assertEqual(single.checks, assembled.checks, inputs.spec.name)
+            self.assertEqual(single.reference_agreements, assembled.reference_agreements)
+            self.assertEqual(single.seeds, assembled.seeds)
+
+    def test_reports_meet_the_lock_contract_and_reload_without_loss(self) -> None:
+        self._run_dev()
+        self._run_plan()
+        _mark_live(self.dev_checkpoint)
+        _mark_live(self.plan_checkpoint)
+        reports = {**self._execution_reports(), **self._plan_reports()}
+        summaries = [public_validation_summary(report) for report in reports.values()]
+        _payload_reports_validated(summaries)
+        loader = _lock_script()
+        for name, report in reports.items():
+            reloaded = loader._validation_report(json.loads(json.dumps(public_validation_summary(report))))
+            self.assertEqual(reloaded, report, name)
+        with self.assertRaisesRegex(ProtocolError, "duplicate validation method"):
+            _payload_reports_validated(summaries + summaries[:1])
+        pending = execution_lock_reports(
+            self.dev,
+            {**load_batch_checkpoint(self.dev_checkpoint), "results": {}},
+            {"sequential_canary": _canary_inputs(), "cusum": _cusum_inputs(_cusum_parameters())},
+        )
+        with self.assertRaisesRegex(ProtocolError, "must all be validated"):
+            _payload_reports_validated([public_validation_summary(pending["cusum"])])
+
+    def test_lock_inputs_load_from_their_file_shape(self) -> None:
+        inputs = _bootstrap_inputs()
+        payload = {
+            "spec": {
+                "name": inputs.spec.name,
+                "parameters": inputs.spec.parameter_map(),
+                "required_checks": list(inputs.spec.required_checks),
+                "study": inputs.spec.study,
+                "null_sample_size": inputs.spec.null_sample_size,
+                "uncertainty_level": inputs.spec.uncertainty_level,
+                "null_draw": inputs.spec.null_draw,
+                "alpha": inputs.spec.alpha,
+                "false_alarm_tolerance": inputs.spec.false_alarm_tolerance,
+                "coverage_tolerance": inputs.spec.coverage_tolerance,
+                "repeated_look_stride": inputs.spec.repeated_look_stride,
+            },
+            "null_seed_blocks": [list(block) for block in inputs.null_seed_blocks],
+            "reference_cases": [
+                {
+                    "case_id": case.case_id,
+                    "statistic": case.statistic,
+                    "expected": case.expected,
+                    "tolerance": case.tolerance,
+                    "source": case.source,
+                    "payload": case.payload(),
+                }
+                for case in inputs.reference_cases
+            ],
+        }
+        self.assertEqual(lock_report_inputs_from_dict(json.loads(json.dumps(payload))), inputs)
+        with self.assertRaisesRegex(QualificationBatchError, "exactly"):
+            lock_report_inputs_from_dict({**payload, "seeds": [1]})
+
+
+def report_spec(report, name):
+    inputs = {
+        "sequential_canary": _canary_inputs(),
+        "clustered_paired_bootstrap": _bootstrap_inputs(),
+        "mmd_permutation_test": _mmd_inputs(),
+    }
+    if name in inputs:
+        return inputs[name].spec
+    return _cusum_inputs({key: float(value) if key != "direction" else value for key, value in report.parameters}).spec

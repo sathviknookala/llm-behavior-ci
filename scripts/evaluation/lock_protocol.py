@@ -17,8 +17,9 @@ Settings JSON fields:
   may be an empty list
 
 Full ValidationReport JSON mirrors ValidationReport fields. Nested
-CheckResult, CaseAgreement, and AADependenceReport objects use the same
-field names; tuple fields are JSON arrays of values or pairs. The public
+CheckResult, CaseAgreement, AADependenceReport, and AAComponent objects use
+the same field names; an assembled report's ``null_seed_blocks`` and
+``aa_components`` and a measured ``power`` are carried, not dropped; tuple fields are JSON arrays of values or pairs. The public
 summary shape is that tree plus \"visibility\": \"public\". Thresholds are
 not defaulted.
 
@@ -54,6 +55,7 @@ from llm_behavior_ci.experiments.protocol import (
     require_protocol_lock,
 )
 from llm_behavior_ci.experiments.validation import (
+    AAComponent,
     AADependenceReport,
     CaseAgreement,
     CheckResult,
@@ -198,9 +200,40 @@ def _validation_report(payload: object) -> ValidationReport:
             gpu_evidence=bool(mapping["gpu_evidence"]),
             gpu_floor_measured=bool(mapping["gpu_floor_measured"]),
             split=mapping["split"],
+            power=_optional_check(mapping.get("power")),
+            null_seed_blocks=tuple(int(item) for item in mapping.get("null_seed_blocks", [])),
+            aa_components=tuple(
+                _aa_component(item) for item in _list(mapping.get("aa_components", []))
+            ),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ProtocolError("validation report fields are incomplete") from error
+
+
+def _optional_check(payload: object) -> CheckResult | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ProtocolError("power must be an object")
+    return _check_result(payload)
+
+
+def _list(value: object) -> list[object]:
+    if not isinstance(value, list):
+        raise ProtocolError("aa_components must be a list")
+    return value
+
+
+def _aa_component(payload: object) -> AAComponent:
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("aa"), Mapping):
+        raise ProtocolError("A/A component must be an object")
+    return AAComponent(
+        series=str(payload["series"]),
+        input_hash=str(payload["input_hash"]),
+        configuration_hashes=tuple(str(item) for item in payload["configuration_hashes"]),
+        split=payload["split"],
+        aa=_aa_report(payload["aa"]),
+    )
 
 
 def _harm_label(payload: object) -> HarmLabel:

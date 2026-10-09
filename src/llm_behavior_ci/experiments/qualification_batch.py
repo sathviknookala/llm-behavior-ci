@@ -13,7 +13,14 @@ with one configuration hash stay distinct. An attempt that failed or was
 interrupted keeps its slot and its scope is never dispatched again. The
 evidence functions read only what the checkpoint recorded: they call no
 model, never replace a missing outcome, and reuse ``measure_harm``'s and
-the gate's own scoring.
+the gate's own scoring. Each result records whether its runtime was live;
+A/A evidence from any other runtime is ``synthetic`` and never accepted.
+
+The lock-report builders assemble one ``ValidationReport`` per method in
+``LOCK_REPORT_METHODS`` from CPU null seeds and reference cases plus the
+batch's A/A components (``assemble_validation_report``). MMD binds one
+component per coordinate of its representation and passes A/A only when
+all of them pass; the joint MMD test stays in the gate replay.
 """
 
 from __future__ import annotations
@@ -52,9 +59,18 @@ from llm_behavior_ci.experiments.faults import (
     harm_label_from_outcomes,
 )
 from llm_behavior_ci.experiments.validation import (
+    AAComponent,
     AAContext,
     AADependenceReport,
     MethodSpec,
+    ReferenceCase,
+    ValidationError,
+    ValidationReport,
+    aa_component,
+    assemble_validation_report,
+    method_spec,
+    method_spec_from_dict,
+    reference_case_from_dict,
     validate_method,
 )
 from llm_behavior_ci.lifecycle.offline_gate import (
@@ -421,7 +437,7 @@ def run_qualification_batch(
     batch; a crash leaves the attempt open for ``reconcile``.
     """
 
-    from llm_behavior_ci.runtime.episode import run_episode, run_pair
+    from llm_behavior_ci.runtime.episode import is_live_runtime, run_episode, run_pair
 
     document, ledger = open_batch(design, checkpoint_path, budget=budget)
     results = document.setdefault("results", {})
@@ -450,18 +466,21 @@ def run_qualification_batch(
             ledger.start(attempts)
             writer = _StoreWriter(store, task_id)
             try:
+                reference_runtime = runtime_factory(
+                    reference.configuration, mode="plan", role=_ARM_ROLES[reference.name]
+                )
+                candidate_runtime = runtime_factory(
+                    candidate.configuration, mode="plan", role=_ARM_ROLES[candidate.name]
+                )
+                live = is_live_runtime(reference_runtime) and is_live_runtime(candidate_runtime)
                 pair = run_pair(
                     task_id,
                     reference.configuration,
                     candidate.configuration,
                     reference_run=reference_run,
                     candidate_run=candidate_run,
-                    runtime=runtime_factory(
-                        reference.configuration, mode="plan", role=_ARM_ROLES[reference.name]
-                    ),
-                    candidate_runtime=runtime_factory(
-                        candidate.configuration, mode="plan", role=_ARM_ROLES[candidate.name]
-                    ),
+                    runtime=reference_runtime,
+                    candidate_runtime=candidate_runtime,
                     mode="plan",
                     scenario_id=scenario_id,
                     on_start=writer.on_start,
@@ -482,6 +501,7 @@ def run_qualification_batch(
             results[scope] = {
                 "reference": pair.reference.to_dict(),
                 "candidate": pair.candidate.to_dict(),
+                "live_runtime": live,
             }
             persist()
             dispatched += 1
@@ -500,14 +520,15 @@ def run_qualification_batch(
             ledger.start([attempt])
             writer = _StoreWriter(store, task_id)
             try:
+                runtime = runtime_factory(
+                    arm.configuration, mode="execute", role=_ARM_ROLES[arm.name]
+                )
                 episode = run_episode(
                     task_id,
                     arm.configuration,
                     "execute",
                     run=run,
-                    runtime=runtime_factory(
-                        arm.configuration, mode="execute", role=_ARM_ROLES[arm.name]
-                    ),
+                    runtime=runtime,
                     scenario_id=scenario_id,
                     on_start=writer.on_start,
                     on_step=writer.on_step,
@@ -521,7 +542,10 @@ def run_qualification_batch(
                 ) from error
             writer.finish(episode)
             ledger.finish(attempt, attempt_state(episode))
-            results[scope] = _execute_summary(episode)
+            results[scope] = {
+                **_execute_summary(episode),
+                "live_runtime": is_live_runtime(runtime),
+            }
             persist()
             dispatched += 1
     return BatchRunSummary(dispatched=dispatched, skipped=skipped, attempts=ledger.summary())
@@ -578,7 +602,9 @@ def execution_aa_inputs(
 
     Only scored episodes enter; a task whose arm has no evaluator outcome
     contributes nothing for that arm. ``C0`` never enters, although it
-    shares the healthy hash.
+    shares the healthy hash. Provenance is ``local_runtime`` only when every
+    entering episode ran on a live runtime (``is_live_runtime``); otherwise
+    it is ``synthetic``, which ``validate_method`` never accepts.
     """
 
     _require_design(design, document, DEV_FOUR_ARM)
@@ -587,11 +613,13 @@ def execution_aa_inputs(
     task_ids: list[str] = []
     scenario_ids: list[str | None] = []
     repetitions: list[int] = []
+    live = True
     for index, task_id in enumerate(design.task_set.task_ids):
         for repetition, arm in enumerate(DEV_ARMS[:2]):
             result = results.get(scope_for(design, index, arm))
             if not isinstance(result, Mapping) or not isinstance(result.get("success"), bool):
                 continue
+            live = live and result.get("live_runtime") is True
             observations.append(
                 MonitorObservation(
                     episode=EpisodeIdentity.from_dict(result["episode"]),
@@ -606,13 +634,28 @@ def execution_aa_inputs(
             scenario_ids.append(design.task_set.scenario_ids[index])
             repetitions.append(repetition)
     context = AAContext(
-        provenance="local_runtime",
+        provenance=_provenance(live),
         hardware_observed=False,
         scenario_ids=tuple(scenario_ids),
         task_ids=tuple(task_ids),
         repetitions=tuple(repetitions),
     )
     return tuple(observations), context
+
+
+def _provenance(live: bool) -> str:
+    return "local_runtime" if live else "synthetic"
+
+
+def _plan_live(design: BatchDesign, document: Mapping[str, Any]) -> bool:
+    results = document.get("results", {})
+    recorded = [
+        result
+        for index in range(design.task_set.task_count)
+        if isinstance(result := results.get(scope_for(design, index)), Mapping)
+        and "reference" in result
+    ]
+    return all(result.get("live_runtime") is True for result in recorded)
 
 
 def cusum_scale(design: BatchDesign, document: Mapping[str, Any]) -> dict[str, Any]:
@@ -797,7 +840,8 @@ def plan_aa_series(
     is one series per coordinate of the MMD representation, which feeds
     ``mmd_permutation_test``. Scores and vectors are the gate's own
     (``plan_quality_score``, ``plan_representation``). A plan that did not
-    complete as a plan enters no series.
+    complete as a plan enters no series. Provenance is ``local_runtime``
+    only when every recorded pair ran on live runtimes.
     """
 
     low, high = plan_quality_bounds(plan_evidence)
@@ -808,6 +852,7 @@ def plan_aa_series(
     for feature in plan_evidence.mmd_features:
         collected[f"mmd:{feature}"] = []
     pairs = plan_pairs(design, document)
+    provenance = _provenance(_plan_live(design, document))
     for index, pair in enumerate(pairs):
         if pair is None:
             continue
@@ -845,7 +890,7 @@ def plan_aa_series(
                 name=name,
                 observations=observations,
                 context=AAContext(
-                    provenance="local_runtime",
+                    provenance=provenance,
                     hardware_observed=False,
                     scenario_ids=tuple(item[2] for item in items),
                     task_ids=tuple(item[1] for item in items),
@@ -963,3 +1008,199 @@ def plan_aa_reports(
         ]
     return reports
 
+
+
+LOCK_REPORT_METHODS = (
+    "sequential_canary",
+    "cusum",
+    "clustered_paired_bootstrap",
+    "mmd_permutation_test",
+)
+EXECUTION_SERIES = "task_success"
+
+
+@dataclass(frozen=True)
+class LockReportInputs:
+    """The CPU half of one method's lock report.
+
+    The full method spec, the null seed blocks (each run under the study
+    budget), and the supplied reference cases. The A/A half comes from a
+    batch checkpoint.
+    """
+
+    spec: MethodSpec
+    null_seed_blocks: tuple[tuple[int, ...], ...]
+    reference_cases: tuple[ReferenceCase, ...]
+
+
+def lock_report_inputs_from_dict(payload: object) -> LockReportInputs:
+    """``{"spec": ..., "null_seed_blocks": [[...]], "reference_cases": [...]}``."""
+
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "spec",
+        "null_seed_blocks",
+        "reference_cases",
+    }:
+        raise QualificationBatchError(
+            "lock report inputs need exactly spec, null_seed_blocks and reference_cases"
+        )
+    blocks = payload["null_seed_blocks"]
+    cases = payload["reference_cases"]
+    if not isinstance(blocks, list) or not all(isinstance(block, list) for block in blocks):
+        raise QualificationBatchError("null_seed_blocks must be a list of seed lists")
+    if not isinstance(cases, list):
+        raise QualificationBatchError("reference_cases must be a list")
+    try:
+        return LockReportInputs(
+            spec=method_spec_from_dict(dict(payload["spec"])),
+            null_seed_blocks=tuple(tuple(block) for block in blocks),
+            reference_cases=tuple(reference_case_from_dict(item) for item in cases),
+        )
+    except (ValidationError, TypeError, ValueError) as error:
+        raise QualificationBatchError(f"lock report inputs are invalid: {error}") from error
+
+
+def cusum_lock_spec(spec: MethodSpec, scale: Mapping[str, Any]) -> MethodSpec:
+    """``spec`` with target, slack and threshold taken from ``cusum_scale``."""
+
+    if spec.name != "cusum":
+        raise QualificationBatchError("cusum_lock_spec takes a cusum spec")
+    if scale.get("status") != "estimated":
+        raise QualificationBatchError("the CUSUM scale was not estimated")
+    parameters = {
+        **spec.parameter_map(),
+        "target": float(scale["target"]),
+        "slack": float(scale["slack"]),
+        "threshold": float(scale["threshold"]),
+    }
+    return method_spec(
+        spec.name,
+        parameters,
+        required_checks=spec.required_checks,
+        study=spec.study,
+        null_sample_size=spec.null_sample_size,
+        uncertainty_level=spec.uncertainty_level,
+        null_draw=spec.null_draw,
+        alpha=spec.alpha,
+        horizon=spec.horizon,
+        false_alarm_tolerance=spec.false_alarm_tolerance,
+        coverage_tolerance=spec.coverage_tolerance,
+        repeated_look_stride=spec.repeated_look_stride,
+        alternative_shift=spec.alternative_shift,
+    )
+
+
+def lock_report_status(report: ValidationReport) -> str:
+    """``validated``, ``failed``, ``pending_live_aa``, or ``unavailable``.
+
+    ``pending_live_aa`` means no accepted A/A evidence was bound: the batch
+    has not run, or its outcomes came from a runtime that was not live.
+    """
+
+    if report.validated:
+        return "validated"
+    if any(check.status == "failed" for check in report.checks):
+        return "failed"
+    if not report.aa.evidence_accepted:
+        return "pending_live_aa"
+    return "unavailable"
+
+
+def _lock_report(
+    inputs: LockReportInputs,
+    series: Sequence[str],
+    components: Sequence[AAComponent],
+    configuration_hash: str,
+) -> ValidationReport:
+    try:
+        return assemble_validation_report(
+            inputs.spec,
+            null_seed_blocks=inputs.null_seed_blocks,
+            reference_cases=inputs.reference_cases,
+            aa_series=series,
+            aa_components=components,
+            configuration_hash=configuration_hash,
+        )
+    except ValidationError as error:
+        raise QualificationBatchError(f"{inputs.spec.name}: {error}") from error
+
+
+def _require_inputs(
+    inputs: Mapping[str, LockReportInputs], names: Sequence[str]
+) -> None:
+    for name in names:
+        item = inputs.get(name)
+        if item is None:
+            raise QualificationBatchError(f"lock report inputs for {name} are missing")
+        if item.spec.name != name:
+            raise QualificationBatchError(f"lock report inputs for {name} name another method")
+
+
+def execution_lock_reports(
+    design: BatchDesign,
+    document: Mapping[str, Any],
+    inputs: Mapping[str, LockReportInputs],
+) -> dict[str, ValidationReport]:
+    """``sequential_canary`` and ``cusum`` reports bound to the healthy H1/H2 A/A.
+
+    Once the batch has estimated the CUSUM scale, the CUSUM inputs must
+    carry exactly that target, slack and threshold.
+    """
+
+    names = ("sequential_canary", "cusum")
+    _require_inputs(inputs, names)
+    scale = cusum_scale(design, document)
+    if scale["status"] == "estimated":
+        declared = inputs["cusum"].spec.parameter_map()
+        for key in ("target", "slack", "threshold"):
+            if float(declared[key]) != float(scale[key]):
+                raise QualificationBatchError("CUSUM lock inputs do not carry the batch scale")
+    observations, context = execution_aa_inputs(design, document)
+    healthy = design.arm(DEV_ARMS[0]).configuration_hash
+    reports: dict[str, ValidationReport] = {}
+    for name in names:
+        spec = inputs[name].spec
+        components = (
+            (aa_component(spec, EXECUTION_SERIES, observations, context),)
+            if observations
+            else ()
+        )
+        reports[name] = _lock_report(inputs[name], (EXECUTION_SERIES,), components, healthy)
+    return reports
+
+
+def plan_lock_reports(
+    design: BatchDesign,
+    document: Mapping[str, Any],
+    plan_evidence: PlanEvidenceInputs,
+    inputs: Mapping[str, LockReportInputs],
+) -> dict[str, ValidationReport]:
+    """``clustered_paired_bootstrap`` on the gate score and MMD on its coordinates.
+
+    MMD's spec dimension must equal the number of MMD features, and its
+    A/A passes only if every coordinate passes.
+    """
+
+    names = ("clustered_paired_bootstrap", "mmd_permutation_test")
+    _require_inputs(inputs, names)
+    dimension = inputs["mmd_permutation_test"].spec.parameter_map()["dimension"]
+    if int(dimension) != len(plan_evidence.mmd_features):
+        raise QualificationBatchError("MMD dimension differs from the MMD features")
+    series = {item.name: item for item in plan_aa_series(design, document, plan_evidence)}
+    healthy = design.arm(PLAN_ARMS[0]).configuration_hash
+    reports: dict[str, ValidationReport] = {}
+    for name in names:
+        prefix = PLAN_AA_METHODS[name]
+        wanted = (
+            tuple(f"{prefix}{feature}" for feature in plan_evidence.mmd_features)
+            if prefix.endswith(":")
+            else (prefix,)
+        )
+        spec = inputs[name].spec
+        components = tuple(
+            aa_component(spec, label, series[label].observations, series[label].context)
+            for label in wanted
+            if series[label].observations
+        )
+        reports[name] = _lock_report(inputs[name], wanted, components, healthy)
+    return reports

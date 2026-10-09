@@ -14,8 +14,12 @@ ledger. Caps cannot exceed the design and are fixed at first use.
 --evidence reads the checkpoint and writes --output: the dev batch needs
 --margin, --confidence-level, --resamples, and --seed for the harm
 labels; the plan batch needs --gate-settings and --plan-evidence. Repeated
---method-spec adds each method's A/A dependence result. test_normal is
-refused. Bare invocation exits 2.
+--method-spec adds each method's A/A dependence result. Repeated
+--lock-inputs (one file per method of the design: canary and CUSUM for the
+dev batch, bootstrap and MMD for the plan batch) adds each method's
+assembled lock report and its status; a report stays ``pending_live_aa``
+until live A/A outcomes exist. test_normal is refused. Bare invocation
+exits 2.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from llm_behavior_ci.config import ConfigError, GateSettings
@@ -34,24 +38,34 @@ from llm_behavior_ci.experiments.qualification_batch import (
     DEV_FOUR_ARM,
     PLAN_AA,
     BatchDesign,
+    LockReportInputs,
     QualificationBatchError,
     cusum_scale,
     dev_four_arm_design,
     dev_harm_labels,
     dev_outcome_table,
     execution_aa_reports,
+    execution_lock_reports,
     load_batch_checkpoint,
     load_configuration,
+    lock_report_inputs_from_dict,
+    lock_report_status,
     open_batch,
     plan_aa_design,
     plan_aa_gate_replay,
     plan_aa_reports,
     plan_aa_series,
+    plan_lock_reports,
     run_qualification_batch,
     seeded_arm_orders,
 )
 from llm_behavior_ci.experiments.run_config import RunConfigError, load_local_task_manifest
-from llm_behavior_ci.experiments.validation import ValidationError, method_spec_from_dict
+from llm_behavior_ci.experiments.validation import (
+    ValidationError,
+    ValidationReport,
+    method_spec_from_dict,
+    public_validation_summary,
+)
 from llm_behavior_ci.lifecycle.offline_gate import GateExecutionError, plan_evidence_from_dict
 from llm_behavior_ci.records import RecordError
 from llm_behavior_ci.runtime.provenance import ProvenanceError, enforce_committed_provenance
@@ -89,6 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--gate-settings")
     parser.add_argument("--plan-evidence")
     parser.add_argument("--method-spec", action="append", default=[])
+    parser.add_argument("--lock-inputs", action="append", default=[])
     try:
         args = parser.parse_args(args_list)
     except SystemExit as error:
@@ -254,6 +269,12 @@ def _evidence(
             for key in ("seeds", "reference_cases", "split"):
                 payload.pop(key, None)
         specs.append(method_spec_from_dict(payload))
+    lock_inputs: dict[str, LockReportInputs] = {}
+    for path in args.lock_inputs:
+        inputs = lock_report_inputs_from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+        if inputs.spec.name in lock_inputs:
+            raise QualificationBatchError(f"lock inputs repeat {inputs.spec.name}")
+        lock_inputs[inputs.spec.name] = inputs
     evidence: dict[str, object] = {
         "record": "qualification_batch_evidence",
         "design": design.kind,
@@ -287,6 +308,10 @@ def _evidence(
             seed=args.seed,
         )
         evidence["execution_aa"] = execution_aa_reports(design, document, specs)
+        if lock_inputs:
+            evidence["lock_reports"] = _lock_documents(
+                execution_lock_reports(design, document, lock_inputs)
+            )
     else:
         if args.gate_settings is None or args.plan_evidence is None:
             raise QualificationBatchError("plan evidence needs --gate-settings and --plan-evidence")
@@ -302,9 +327,20 @@ def _evidence(
         series = plan_aa_series(design, document, plan_evidence)
         evidence["plan_series"] = {item.name: len(item.observations) for item in series}
         evidence["plan_aa"] = plan_aa_reports(series, specs)
+        if lock_inputs:
+            evidence["lock_reports"] = _lock_documents(
+                plan_lock_reports(design, document, plan_evidence, lock_inputs)
+            )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(evidence, sort_keys=True, indent=1, default=str) + "\n", encoding="utf-8")
     return {"action": "evidence", "design": design.kind, "output": str(output)}
+
+
+def _lock_documents(reports: Mapping[str, ValidationReport]) -> dict[str, object]:
+    return {
+        name: {"status": lock_report_status(report), "report": public_validation_summary(report)}
+        for name, report in reports.items()
+    }
 
 
 if __name__ == "__main__":

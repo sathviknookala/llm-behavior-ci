@@ -43,8 +43,12 @@ from llm_behavior_ci.experiments.protocol import (
     verify_runtime_bindings,
 )
 from llm_behavior_ci.experiments.validation import (
+    AAComponent,
     AADependenceReport,
     ValidationReport,
+    assemble_validation_report,
+    method_spec,
+    reference_case,
 )
 from llm_behavior_ci.lifecycle.offline_gate import PlanEvidenceInputs
 from llm_behavior_ci.lifecycle.validation_artifact import (
@@ -396,7 +400,67 @@ def _write_lock_bytes(path: Path, digest: str, payload: dict[str, object]) -> No
     path.write_bytes(document)
 
 
+def _assembled_mmd_report() -> ValidationReport:
+    passed = replace(
+        _aa(reason="measured"),
+        status="passed",
+        evidence_accepted=True,
+        provenance="local_runtime",
+        observation_count=12,
+    )
+    series = tuple(f"mmd:feature_{index}_fraction" for index in range(5))
+    origin = [0.0] * 5
+    identical = {"production": [origin] * 6, "candidate": [origin] * 6, "seed": 17}
+    return assemble_validation_report(
+        method_spec(
+            "mmd_permutation_test",
+            {"bandwidth": 1.0, "permutations": 19, "dimension": 5, "null_mean": 0.0, "null_scale": 1.0},
+            required_checks=("null_false_alarm", "repeated_look", "reference", "aa_dependence"),
+            study="simulation",
+            null_sample_size=6,
+            uncertainty_level=0.95,
+            null_draw="gaussian",
+            alpha=0.05,
+            false_alarm_tolerance=0.5,
+            repeated_look_stride=3,
+        ),
+        null_seed_blocks=((1, 2, 3), (4, 5, 6)),
+        reference_cases=(
+            reference_case("identical_mmd", "mmd_squared", 0.0, 1e-12, "closed_form", identical),
+        ),
+        aa_series=series,
+        aa_components=tuple(
+            AAComponent(
+                series=name,
+                input_hash=_HASH_B,
+                configuration_hashes=(_HASH_A,),
+                split="train",
+                aa=passed,
+            )
+            for name in series
+        ),
+        configuration_hash=_HASH_A,
+    )
+
+
 class ProtocolLockTests(unittest.TestCase):
+    def test_an_assembled_report_locks_with_its_components(self) -> None:
+        report = _assembled_mmd_report()
+        self.assertTrue(report.validated)
+        settings = _settings(validation_reports=(report,))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "assembled.lock.json"
+            lock_protocol(settings, path)
+            required = require_protocol_lock(path)
+        (stored,) = required.payload["validation_reports"]
+        self.assertEqual(required.method_names, ("mmd_permutation_test",))
+        self.assertEqual(stored["null_seed_blocks"], [3, 3])
+        self.assertEqual(
+            [item["series"] for item in stored["aa_components"]],
+            [f"mmd:feature_{index}_fraction" for index in range(5)],
+        )
+        self.assertEqual(stored["aa"]["status"], "passed")
+
     def test_deterministic_digest_and_bytes(self) -> None:
         settings = _settings()
         with tempfile.TemporaryDirectory() as temporary:
