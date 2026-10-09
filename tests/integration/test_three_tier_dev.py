@@ -28,6 +28,7 @@ from llm_behavior_ci.lifecycle.connected import (
 )
 from llm_behavior_ci.lifecycle.monitoring import monitoring_period_id
 from llm_behavior_ci.lifecycle.offline_gate import GateCapabilityError
+from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 from llm_behavior_ci.service import create_app
 from llm_behavior_ci.storage import EpisodeStore
 
@@ -111,8 +112,7 @@ class ThreeTierDevLifecycleTests(unittest.TestCase):
         counting = CountingFactory(lifecycle.dependencies.runtime_factory)
         dependencies = replace(
             lifecycle.dependencies,
-            runtime_factory=counting,
-            **changes.pop("dependencies", {}),
+            **{"runtime_factory": counting, **changes.pop("dependencies", {})},
         )
         traffic = changes.pop("traffic", lifecycle.traffic)
         gate = changes.pop("gate", lifecycle.gate)
@@ -325,6 +325,35 @@ class ThreeTierDevLifecycleTests(unittest.TestCase):
         self.assertEqual(routed.status_code, 200)
         self.assertEqual(routed.json()["role"], "production")
         self.assertEqual(routed.json()["configuration_hash"], self.production_hash)
+
+    def test_a_canary_execution_failure_rolls_back_then_fails(self) -> None:
+        world = demo.build_synthetic("healthy", self.root).dependencies.runtime_factory
+        calls = {"n": 0}
+
+        def failing(configuration):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise RuntimeUnavailable("injected canary failure")
+            return world(configuration)
+
+        with self.assertRaises(ConnectedLifecycleError) as caught:
+            self._run("healthy", dependencies={"runtime_factory": failing})
+        self.assertIn("injected canary failure", str(caught.exception))
+        self.assertNotIn("cleanup rollback failed", str(caught.exception))
+
+        decisions = self._store().load_deployment_decisions()
+        self.assertEqual([item.decision for item in decisions], ["admit", "rollback"])
+        self.assertEqual(decisions[1].method, "manual_rollback")
+        deployment = self.client.get("/deployment").json()
+        self.assertEqual(deployment["state"], "ROLLED_BACK")
+        self.assertEqual(deployment["admission"], "rollback_requested")
+        self.assertEqual(deployment["serving_configuration_hash"], self.production_hash)
+        self.assertIsNone(deployment["promoted_configuration_hash"])
+        closed = self.client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-1", "mode": "execute", "role": "candidate"},
+        )
+        self.assertEqual(closed.status_code, 409)
 
     def test_a_failed_cleanup_rollback_is_an_error_not_a_safe_completion(self) -> None:
         cases = {

@@ -372,13 +372,27 @@ def run_three_tier_dev(
 
     canary: list[dict[str, object]] = []
     state = admitted.get("state")
-    for index, task_id in enumerate(traffic.canary_task_ids):
-        if state in _TERMINAL:
-            break
-        canary.append(_episode(service, task_id, f"canary:{index}:{task_id}"))
-        state = _json(service.get("/deployment"), "GET /deployment").get("state")
-    summary["tier2"] = {**_receipts(canary), "state": state}
     production_hash = run_configuration_hash(traffic.production)
+    try:
+        for index, task_id in enumerate(traffic.canary_task_ids):
+            if state in _TERMINAL:
+                break
+            canary.append(_episode(service, task_id, f"canary:{index}:{task_id}"))
+            state = _json(service.get("/deployment"), "GET /deployment").get("state")
+    except Exception as failure:
+        try:
+            current = _json(service.get("/deployment"), "GET /deployment").get("state")
+        except Exception:
+            current = None
+        if current not in _TERMINAL:
+            try:
+                _roll_back_incomplete_canary(service, production_hash)
+            except Exception as cleanup:
+                raise ConnectedLifecycleError(
+                    f"canary failed ({failure}) and cleanup rollback failed ({cleanup})"
+                ) from failure
+        raise
+    summary["tier2"] = {**_receipts(canary), "state": state}
     if state not in _TERMINAL:
         summary["cleanup"] = _roll_back_incomplete_canary(service, production_hash)
         summary["status"] = "canary_incomplete"
