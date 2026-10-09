@@ -255,6 +255,29 @@ Admission (`POST /candidates`, HTTP 409 on refusal) accepts only a stored `gate_
 
 Hosted roles take no `--*-base-url`. Endpoints route by configuration hash, so a promoted candidate keeps serving from its own route while the monitor compares it with the previous production reference.
 
+### 8a. Connected three-tier dev run (documented, not run)
+
+`scripts/demo/run_three_tier_dev.py live` replaces step 7 and the manual `curl` in step 8 with one command. Start `serve.py` exactly as in step 8, on a fresh `--store`. Then run:
+
+```bash
+py scripts/demo/run_three_tier_dev.py live \
+  --gate-reference data/processed/configs/glm_general_train.json \
+  --gate-candidate data/processed/configs/glm_general_train_reasoning_disabled.json \
+  --task-set data/processed/train_gate.json \
+  --gate-settings data/processed/gate_settings.json \
+  --plan-evidence data/processed/plan_evidence_hosted.json \
+  --production-config data/processed/configs/glm_general_dev.json \
+  --candidate-config data/processed/configs/glm_general_dev_reasoning_disabled.json \
+  --dev-task-set data/processed/dev_calibration.json \
+  --canary-arrivals 10 --production-arrivals 10 \
+  --service-url http://127.0.0.1:8000 \
+  --store data/processed/three_tier_dev.sqlite
+```
+
+The command has no model-specific logic. A vLLM gate takes `--reference-endpoint` and `--candidate-endpoint`, a hosted gate takes neither, and `serve.py` takes the matching `--*-base-url`. Before the gate runs, it refuses a dirty tree or a configuration not built at HEAD. It also refuses a store that already holds decisions or episodes, a service whose registered hashes differ from the dev files, and a `kl` requirement on a hosted configuration. The gate artifact goes into `--store`. A BLOCK stops before admission. A PASS is admitted only by the service's release admission and allowance. The canary arrivals run until the controller promotes or rolls back. The production arrivals then go to whatever the service serves, and the service's monitor scores them. The command prints one JSON summary: the gate result, the admission status, receipts by role and hash, the deployment state, and the stored decisions, alerts, and episode counts. A `canary_incomplete` status means the canary arrivals ran out before the canary horizon.
+
+Every episode costs provider spend or GPU time. The canary, monitor, and frozen-reference files are still local DRAFT settings. `synthetic --scenario blocked|healthy|regression` runs the same function on injected runtimes, with `serve.py`'s own dependency builder and test admission.
+
 ### 9. Dev stream rehearsal
 
 ```bash
