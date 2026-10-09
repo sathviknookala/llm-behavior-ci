@@ -13,7 +13,9 @@ attempts first, and never dispatches a (task, arm) scope already in the
 ledger. Caps cannot exceed the design and are fixed at first use.
 --evidence reads the checkpoint and writes --output: the dev batch needs
 --margin, --confidence-level, --resamples, and --seed for the harm
-labels; the plan batch needs --gate-settings and --plan-evidence. Repeated
+labels; the plan batch needs --gate-settings and --plan-evidence. Both
+write ``criteria``: the approved qualification criteria
+(``qualification-criteria-v1``) and the failure rule. Repeated
 --method-spec adds each method's A/A dependence result. Repeated
 --lock-inputs (one file per method of the design: canary and CUSUM for the
 dev batch, bootstrap and MMD for the plan batch) adds each method's
@@ -52,12 +54,20 @@ from llm_behavior_ci.experiments.qualification_batch import (
     lock_report_status,
     open_batch,
     plan_aa_design,
+    plan_complete,
     plan_aa_gate_replay,
     plan_aa_reports,
     plan_aa_series,
     plan_lock_reports,
+    plan_pairs,
     run_qualification_batch,
     seeded_arm_orders,
+)
+from llm_behavior_ci.experiments.qualification_criteria import (
+    CRITERIA_VERSION,
+    execution_criteria,
+    failure_rule,
+    plan_criteria,
 )
 from llm_behavior_ci.experiments.run_config import RunConfigError, load_local_task_manifest
 from llm_behavior_ci.experiments.validation import (
@@ -298,8 +308,8 @@ def _evidence(
         evidence["outcomes"] = [
             {"task_index": index, **row} for index, row in enumerate(table)
         ]
-        evidence["cusum_scale"] = cusum_scale(design, document)
-        evidence["harm_labels"] = dev_harm_labels(
+        scale = cusum_scale(design, document)
+        labels = dev_harm_labels(
             design,
             document,
             margin=args.margin,
@@ -307,6 +317,24 @@ def _evidence(
             resamples=args.resamples,
             seed=args.seed,
         )
+        evidence["cusum_scale"] = scale
+        evidence["harm_labels"] = labels
+        criteria = execution_criteria(
+            table,
+            scale,
+            labels,
+            harm_parameters={
+                "margin": args.margin,
+                "confidence_level": args.confidence_level,
+                "resamples": args.resamples,
+                "seed": args.seed,
+            },
+        )
+        evidence["criteria"] = {
+            "version": CRITERIA_VERSION,
+            **criteria,
+            "failure_rule": failure_rule(criteria),
+        }
         evidence["execution_aa"] = execution_aa_reports(design, document, specs)
         if lock_inputs:
             evidence["lock_reports"] = _lock_documents(
@@ -321,9 +349,18 @@ def _evidence(
         plan_evidence = plan_evidence_from_dict(
             json.loads(Path(args.plan_evidence).read_text(encoding="utf-8"))
         )
-        evidence["gate_replay"] = plan_aa_gate_replay(
+        replay = plan_aa_gate_replay(
             design, document, settings=settings, plan_evidence=plan_evidence
         )
+        evidence["gate_replay"] = replay
+        criteria = plan_criteria(
+            plan_pairs(design, document), replay, plan_complete=plan_complete
+        )
+        evidence["criteria"] = {
+            "version": CRITERIA_VERSION,
+            **criteria,
+            "failure_rule": failure_rule(criteria),
+        }
         series = plan_aa_series(design, document, plan_evidence)
         evidence["plan_series"] = {item.name: len(item.observations) for item in series}
         evidence["plan_aa"] = plan_aa_reports(series, specs)

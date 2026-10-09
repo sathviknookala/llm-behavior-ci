@@ -116,6 +116,38 @@ These are code contracts. None of them fills a slot above.
 - **Alerts.** Each signal opens one aggregate incident per explicit monitoring period. Slices only attribute an incident (`attributed_slices`); they never open their own. The incident key is the period, the configuration hash, the signal and the slice. The store deduplicates on that key across restarts, and the service restores the open incidents from the store. `LocalAlertSink.deliver` returns only newly inserted alerts. A promotion starts a new period. Under this policy, an alarm in the healthy prefix suppresses post-onset alerts for the same signal in the same period.
 - **Usage cost.** For Z.AI, `prompt_tokens` already includes `cached_tokens`. Uncached input (prompt tokens minus cached tokens) is charged at the input rate, cached tokens once at the cache-read rate, and completion tokens once at the output rate. Reasoning tokens are part of the completion tokens and have no rate of their own. Anthropic input excludes cache reads and writes, so each of those is priced separately. A provider without declared usage semantics is refused.
 
+## Qualification criteria (DRAFT, approved 2026-10-08)
+
+`qualification-criteria-v1`. These criteria were proposed in `criteria_predeclaration` sha256 `78649615c37ac8eb35e88be3d104cf241c9368e686e05559e6729d27ee22c739` before any paid observation, and approved with the amendments below. `experiments/qualification_criteria.py` evaluates them from the saved batch outcomes, and `run_qualification_batch.py --evidence` writes them under `criteria`. They fill no slot above, and this file stays a draft. The existing requirements (A/A dependence, the null checks, one validated report per method, the harm label, the CUSUM scale rule and the gate rule) are unchanged.
+
+Execution A/A, on `dev_four_arm` (dev19, H1 against H2):
+
+- **P-AA-EXEC-3, completeness.** At least 17 of the 19 tasks have both H1 and H2 scored; otherwise inconclusive. No attempt is replaced.
+- **P-AA-EXEC-1, exchangeability.** When P-AA-EXEC-3 is met: the exact two-sided McNemar test (binomial, p = 0.5) on the discordant (H1, H2) pairs. It passes iff p ≥ 0.05. Zero discordant pairs are recorded as zero, with p = 1 by the exact convention, and pass. A pass reads "no detected directional imbalance"; it is not evidence of equivalence. When P-AA-EXEC-3 is missed, this criterion is inconclusive.
+- **P-AA-EXEC-2, canary A/A.** `sequential_canary` (α 0.05, margin 0.2, horizon 12) runs on the first 12 tasks in manifest order with both arms scored, with H2 as the candidate. It passes iff there is no rollback, and is inconclusive with fewer than 12 such tasks.
+
+Plan A/A, on `plan_aa` (`train_gate_30`):
+
+- **P-AA-PLAN-2, completeness.** All 30 tasks have two completed, non-empty plans; otherwise inconclusive.
+- **P-AA-PLAN-1, gate A/A.** The frozen gate (plan-features-v4, bootstrap B 1000 at 0.95, score margin −0.10, MMD 199 permutations at α 0.05), with repetition 0 as reference and repetition 1 as candidate, must PASS. A BLOCK is a recorded failure. An incomplete or `execution_failed` replay is inconclusive. The gate makes one statistical decision after all 30 pairs. The stride-10 repeated-look rates are diagnostics only and carry no sequential α claim.
+
+CUSUM (within the bounded empirical study above):
+
+- **P-CUSUM-1, sample.** The scale is estimated from scored H1 and H2 outcomes only; C0 is excluded although it shares the hash. The scale is final with at least 34 scored outcomes from at least 17 scenarios; otherwise it stays provisional.
+- **P-CUSUM-2, sensitivity.** Beside every monitor result, report the simulated 25-arrival null alarm rate of the decrease CUSUM at the estimated scale. The healthy rate is set to the estimate and to the 95% Wilson bounds of the pooled healthy rate, taking one draw per scenario (trials = the number of scored scenarios). Each rate uses 10,000 simulated streams, seeded with 17. This is a binomial-model sensitivity analysis. Up to 38 healthy outcomes come from 19 scenario clusters, so the bounds are not robust to scenario dependence. No false-alarm guarantee is claimed.
+
+Harm labels:
+
+- **P-HARM-2, parameters.** Margin 0.2 (the canary harm margin), confidence 0.95, 1,000 resamples, seed 17, clusters = scenario. Evidence computed with other values fails this criterion.
+- **P-HARM-1, diagnostic classification.** On the clustered bootstrap interval of the paired difference (candidate − reference):
+  - `confirmed_harmful` iff the upper bound ≤ −margin;
+  - `confirmed_not_harmful` iff the lower bound > −margin;
+  - otherwise `indeterminate`.
+
+  The classification is separate from label eligibility. An indeterminate interval does not invalidate a measured label, and the lock still carries the code's binary label. The lock still needs at least one measured dev label, and a label with any missing outcome stays unmeasurable. Neither case needs a conclusive class before freezing. Confirmed regression harm or detection sensitivity is claimed only for a confirmed class. The bootstrap is approximate. Its simulated coverage was 0.9351 against a nominal 0.95. With 19 scenario clusters and binary outcomes, it can undercover.
+
+- **Failure rule.** Any failed criterion keeps the protocol BLOCKED. No setting is re-tuned on these outcomes, and no attempt is added. Caps are 76 executions and 60 plan generations. Failed and interrupted attempts keep their slot.
+
 ## What each tier is allowed to use
 
 The library implements the full set in `STAGES.md` stage 2. The plan-only gate, the canary controller, and the production monitor are CPU decision paths. Their thresholds come from the caller and are not the open slots above. The A/A capture records paired outcomes and plan-scoring inputs and does not apply the decision rules below. Each consumer uses a subset:

@@ -135,6 +135,7 @@ Hardware is `not_applicable` and `nvidia-smi` is never called; elapsed wall time
 | No-op label (H1, C0) and regression label (H1, C1) | `harm_label_from_outcomes`, the math `measure_harm` uses. Both share the H1 column; a label with any missing outcome is `unmeasurable` |
 | Plan gate replay (`replay_plan_gate`) | The gate's own score, MMD vectors, clusters and seed, applied to the stored pairs |
 | Plan A/A series | See below |
+| `criteria` | The approved qualification criteria (`qualification-criteria-v1`, `experiments/qualification_criteria.py`; rules in `EVAL_PROTOCOL.md`) and the failure rule |
 
 **Plan A/A series.**
 - The bootstrap reads the gate's weighted score, mapped affinely from its weight-implied range onto [0, 1].

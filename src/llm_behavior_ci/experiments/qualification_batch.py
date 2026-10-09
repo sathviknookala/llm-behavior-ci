@@ -812,6 +812,12 @@ def _plan_succeeded(episode: EpisodeResult) -> bool:
     )
 
 
+def plan_complete(episode: EpisodeResult) -> bool:
+    """A completed plan episode with a non-empty plan (P-AA-PLAN-2)."""
+
+    return _plan_succeeded(episode) and bool((episode.plan_text or "").strip())
+
+
 @dataclass(frozen=True)
 class PlanAASeries:
     """One scalar A/A series: the gate's score, or one MMD coordinate.
