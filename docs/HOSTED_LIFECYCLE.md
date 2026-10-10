@@ -319,6 +319,7 @@ It holds no task id, trace, or store path.
 
 `scripts/demo/run_tier2_canary_test.py` runs the real canary, with real hosted agents and AppWorld dev worlds, without running Tier 1. It is an integration test of the downstream software, not a release. Its admission evidence is a PASS artifact labelled `synthetic_fixture`, which the harness builds itself; no gate produced it. Every summary says `test_only_admission: true` and `gate_executed: false`. A Tier 1 result from another run, such as a BLOCK, is not read, changed, or reinterpreted.
 
+- **Experiment contract:** `preflight` and `drive` each first require that `--canary-settings` equals `STEP2C_CANARY_SETTINGS` (`sequential_canary`, α 0.05, harm margin 0.2, horizon 12, fraction 1.0, outcome delay 0.0, `horizon_reached_without_harm`, `higher_is_better`) and that `--canary-arrivals` is 12. A mismatch exits `2` before any fixture, admission, or model call, even when the running service matches the same files.
 - **`preflight`** makes no provider call and starts no service.
   - It loads every input and checks provenance at HEAD.
   - It builds the service dependencies exactly as `serve` does, against a scratch store. That also checks that the provider key is set.
@@ -342,7 +343,7 @@ It holds no task id, trace, or store path.
   - `0`: integrity holds, pairs ran, and the stopping rule decided.
   - `3`: integrity holds and pairs ran, but statistical integration is incomplete.
   - `1`: an integrity check failed, admission was refused, or no pair ran.
-  - `2`: invalid input or a service identity mismatch.
+  - `2`: invalid input, an experiment contract mismatch, or a service identity mismatch.
   - `4`: execution failure.
 - A promoted test service keeps running with its store for Tier 3; stop it with Ctrl-C or SIGINT.
 

@@ -8,6 +8,14 @@ the isolated service runs with ``admission_mode="test"``
 release admission, and the release workflow are unchanged; the same
 artifact is refused by ``authorize_gated_candidate``.
 
+Both ``preflight`` and ``drive`` first require the Step 2C experiment
+contract: the canary settings file must equal ``STEP2C_CANARY_SETTINGS``
+(``sequential_canary``, alpha 0.05, harm margin 0.2, horizon 12, fraction
+1.0, delay 0.0, ``horizon_reached_without_harm``, ``higher_is_better``)
+and ``--canary-arrivals`` must be ``STEP2C_CANARY_ARRIVALS``. A mismatch
+exits 2 before any fixture, admission, or model call, even when the
+running service's identity matches the same wrong files.
+
 ``preflight`` loads and checks every input, builds the service
 dependencies exactly as ``serve`` does, and checks that their identity
 matches the intended files and that the fixture passes test admission
@@ -33,7 +41,8 @@ Exit codes: 0 every integrity check passed, pairs ran, and the stopping
 rule decided; 3 every integrity check passed and pairs ran, but the
 stopping rule did not decide (statistical integration incomplete); 1 an
 integrity check failed, admission was refused, or no pair ran; 2 invalid
-input or a service identity mismatch, before any model call; 4 an
+input, an experiment contract mismatch, or a service identity mismatch,
+before any model call; 4 an
 execution failure. Bare invocation exits 2.
 """
 
@@ -55,6 +64,7 @@ from llm_behavior_ci.config import (
     ConfigError,
     MonitorSettings,
     RunConfiguration,
+    StoppingRule,
     new_run_identity,
     run_configuration_hash,
 )
@@ -95,6 +105,15 @@ STOPPING_RULE_METHODS = frozenset({"stopping_rule", "stopping_rule_alarm"})
 EXIT_INVALID = 2
 EXIT_INCOMPLETE = 3
 EXIT_FAILURE = 4
+STEP2C_CANARY_SETTINGS = CanarySettings(
+    fraction=1.0,
+    outcome_delay_seconds=0.0,
+    harm_margin=0.2,
+    stopping_rule=StoppingRule(name="sequential_canary", alpha=0.05, horizon_episodes=12),
+    metric_orientation="higher_is_better",
+    promotion_policy="horizon_reached_without_harm",
+)
+STEP2C_CANARY_ARRIVALS = 12
 
 
 def _load_script(name: str, relative: str):
@@ -111,6 +130,10 @@ serve = _load_script("serve_for_tier2_canary_test", "scripts/service/serve.py")
 
 class ServiceIdentityError(ConnectedLifecycleError):
     """The running service is not the intended isolated test service."""
+
+
+class ExperimentContractError(ConfigError):
+    """The intended files do not describe the agreed Step 2C experiment."""
 
 
 @dataclass(frozen=True)
@@ -539,6 +562,34 @@ def load_inputs(args: argparse.Namespace, *, check_provenance: bool = True) -> T
     )
 
 
+def _leaves(payload: object, prefix: str = "") -> dict[str, object]:
+    if isinstance(payload, dict):
+        return {
+            key: value
+            for name, inner in payload.items()
+            for key, value in _leaves(inner, f"{prefix}{name}.").items()
+        }
+    return {prefix.rstrip("."): payload}
+
+
+def require_experiment_contract(args: argparse.Namespace, inputs: Tier2Inputs) -> CanarySettings:
+    """Refuse canary settings or an arrival count other than the Step 2C contract."""
+
+    settings = CanarySettings.from_dict(_json(args.canary_settings))
+    expected = _leaves(STEP2C_CANARY_SETTINGS.to_dict())
+    actual = _leaves(settings.to_dict())
+    mismatched = sorted(
+        key for key in set(expected) | set(actual) if expected.get(key) != actual.get(key)
+    )
+    if len(inputs.traffic.canary_task_ids) != STEP2C_CANARY_ARRIVALS:
+        mismatched.append("canary_arrivals")
+    if mismatched:
+        raise ExperimentContractError(
+            "settings differ from the Step 2C experiment contract: " + ", ".join(mismatched)
+        )
+    return settings
+
+
 def load_allowance(args: argparse.Namespace) -> TaskSelectionAllowance:
     return task_selection_allowance_from_dict(_json(args.task_selection_allowance))
 
@@ -615,6 +666,7 @@ def preflight(args: argparse.Namespace, *, check_provenance: bool = True) -> dic
     from tempfile import TemporaryDirectory
 
     inputs = load_inputs(args, check_provenance=check_provenance)
+    require_experiment_contract(args, inputs)
     require_isolated_target(Path(args.store), int(args.port))
     allowance = load_allowance(args)
     expected = intended_identity(args, inputs)
@@ -693,6 +745,7 @@ def _main_drive(args: argparse.Namespace) -> int:
     output = Path(args.summary)
     try:
         inputs = load_inputs(args)
+        require_experiment_contract(args, inputs)
         allowance = load_allowance(args)
         expected = intended_identity(args, inputs)
         store = Path(args.store)

@@ -21,11 +21,12 @@ The hosted lifecycle commands (runbook: `docs/HOSTED_LIFECYCLE.md`) each exit 2 
 
 `demo/run_tier2_canary_test.py` is a test-only Tier 2 integration run on real agents without Tier 1 (`docs/HOSTED_LIFECYCLE.md` step 8c).
 
+- `preflight` and `drive` refuse canary settings or an arrival count other than the Step 2C contract (`STEP2C_CANARY_SETTINGS`, 12 arrivals), with exit 2.
 - `preflight` makes no provider call and checks that the service it would build matches the intended settings.
 - `serve` runs an isolated localhost service with test admission on a new store. It adds two `/test-only/...` routes that `serve.py` does not have.
 - `drive` refuses a running service whose identity differs, admits a `synthetic_fixture` artifact through `POST /candidates`, and runs the canary.
 - Summaries carry `test_only_admission: true` and `gate_executed: false`, and keep admission verification, canary execution and integrity apart.
-- `drive` exits 0 complete, 3 statistically incomplete, 1 integrity failure or refused admission, 2 invalid input or identity mismatch, and 4 execution failure. With no arguments it exits 2.
+- `drive` exits 0 complete, 3 statistically incomplete, 1 integrity failure or refused admission, 2 invalid input, contract mismatch or identity mismatch, and 4 execution failure. With no arguments it exits 2.
 
 `ci/run_live_release.sh` is the live step of `.github/workflows/release-lifecycle.yml`. It runs `demo/run_three_tier_dev.py live` from `$LIFECYCLE_RELEASE_ROOT/$RELEASE_ID/`, keeps the command's stdout and stderr in that directory, and exits with the command's code, so only a promotion passes (`docs/HOSTED_LIFECYCLE.md` step 8b).
 

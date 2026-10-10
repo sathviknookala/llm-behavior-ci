@@ -7,11 +7,11 @@ import json
 import socket
 import sys
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 try:
     from fastapi.testclient import TestClient
@@ -20,7 +20,7 @@ except ImportError as error:
         "fastapi is required for tests.integration.test_tier2_canary_test"
     ) from error
 
-from llm_behavior_ci.config import ConfigError, run_configuration_hash
+from llm_behavior_ci.config import CanarySettings, ConfigError, run_configuration_hash
 from llm_behavior_ci.experiments.protocol import task_selection_allowance_from_dict
 from llm_behavior_ci.lifecycle.connected import ConnectedLifecycleError, run_three_tier_dev
 from llm_behavior_ci.records import RecordError, assert_public_payload
@@ -554,6 +554,8 @@ class Tier2CanaryTestIsolationTests(unittest.TestCase):
                 with patch.object(harness, "load_inputs", return_value=inputs), patch.object(
                     harness, "load_allowance", return_value=None
                 ), patch.object(
+                    harness, "require_experiment_contract"
+                ), patch.object(
                     harness, "intended_identity", return_value={}
                 ), patch.object(
                     harness, "run_tier2_test", **effect
@@ -564,7 +566,10 @@ class Tier2CanaryTestIsolationTests(unittest.TestCase):
                 self.assertEqual(exit_code, code)
 
     def test_preflight_builds_the_test_service_without_any_episode(self) -> None:
-        inputs = self._inputs()
+        inputs = _with_arrivals(self._inputs(), harness.STEP2C_CANARY_ARRIVALS)
+        (self.root / "canary.json").write_text(
+            json.dumps(harness.STEP2C_CANARY_SETTINGS.to_dict())
+        )
         args = argparse.Namespace(
             store=str(self.root / "fresh.sqlite"),
             port="0",
@@ -615,6 +620,154 @@ class Tier2CanaryTestIsolationTests(unittest.TestCase):
         self.assertEqual(harness.main([]), 2)
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
             self.assertEqual(harness.main(["drive"]), 2)
+
+
+def _with_arrivals(inputs, count: int):
+    ids = inputs.traffic.canary_task_ids
+    return replace(
+        inputs,
+        traffic=replace(
+            inputs.traffic, canary_task_ids=tuple(ids[index % len(ids)] for index in range(count))
+        ),
+    )
+
+
+def _contract_variant(**changes) -> dict[str, object]:
+    document = json.loads(json.dumps(harness.STEP2C_CANARY_SETTINGS.to_dict()))
+    rule = changes.pop("stopping_rule", {})
+    document["stopping_rule"].update(rule)
+    document.update(changes)
+    return document
+
+
+_WRONG_EXPERIMENTS = {
+    "stopping rule": ({"stopping_rule": {"name": "fixed_window"}}, 12),
+    "horizon": ({"stopping_rule": {"horizon_episodes": 11}}, 12),
+    "alpha": ({"stopping_rule": {"alpha": 0.1}}, 12),
+    "harm margin": ({"harm_margin": 0.1}, 12),
+    "fraction": ({"fraction": 0.5}, 12),
+    "outcome delay": ({"outcome_delay_seconds": 1.0}, 12),
+    "promotion policy": ({"promotion_policy": "manual_only"}, 12),
+    "metric orientation": ({"metric_orientation": "lower_is_better"}, 12),
+    "arrival count": ({}, 11),
+}
+
+
+class ExperimentContractTests(_HarnessCase):
+    def setUp(self) -> None:
+        super().setUp()
+        policies = patch(
+            "llm_behavior_ci.config.PROMOTION_POLICIES",
+            frozenset({"horizon_reached_without_harm", "manual_only"}),
+        )
+        policies.start()
+        self.addCleanup(policies.stop)
+
+    def _case(self, name: str, changes: dict[str, object], arrivals: int):
+        self.root = Path(self._tmpdir.name) / name.replace(" ", "_")
+        self.root.mkdir()
+        lifecycle = self._lifecycle("healthy")
+        canary_path = self.root / "canary.json"
+        canary_path.write_text(json.dumps(_contract_variant(**changes)))
+        factory = CountingFactory(lifecycle.dependencies.runtime_factory)
+        dependencies = replace(
+            lifecycle.dependencies,
+            canary_settings=CanarySettings.from_dict(json.loads(canary_path.read_text())),
+            runtime_factory=factory,
+        )
+        inputs = _with_arrivals(self.inputs, arrivals)
+        argv = ["drive"]
+        for flag, value in {
+            "--gate-reference": "x",
+            "--gate-candidate": "x",
+            "--production-config": str(self.root / "production.json"),
+            "--candidate-config": str(self.root / "candidate.json"),
+            "--dev-task-set": "x",
+            "--task-selection-allowance": str(self.root / "task_selection_allowance.json"),
+            "--canary-arrivals": str(arrivals),
+            "--canary-settings": str(canary_path),
+            "--monitor-settings": str(self.root / "monitor.json"),
+            "--frozen-reference": str(self.root / "frozen_reference.json"),
+            "--canary-assignment-seed": str(dependencies.canary_assignment_seed),
+            "--store": str(self.store_path),
+            "--port": "8031",
+            "--summary": str(self.root / "summary.json"),
+        }.items():
+            argv += [flag, value]
+        return dependencies, factory, inputs, argv
+
+    def _args(self, argv: list[str]) -> argparse.Namespace:
+        pairs = dict(zip(argv[1::2], argv[2::2]))
+        return argparse.Namespace(
+            **{flag.lstrip("-").replace("-", "_"): value for flag, value in pairs.items()}
+        )
+
+    def test_the_contract_is_the_agreed_step2c_experiment(self) -> None:
+        settings = harness.STEP2C_CANARY_SETTINGS
+        self.assertEqual(settings.stopping_rule.name, "sequential_canary")
+        self.assertEqual(settings.stopping_rule.alpha, 0.05)
+        self.assertEqual(settings.stopping_rule.horizon_episodes, 12)
+        self.assertIsNone(settings.stopping_rule.threshold)
+        self.assertEqual(settings.harm_margin, 0.2)
+        self.assertEqual(settings.fraction, 1.0)
+        self.assertEqual(settings.outcome_delay_seconds, 0.0)
+        self.assertEqual(settings.promotion_policy, "horizon_reached_without_harm")
+        self.assertEqual(settings.metric_orientation, "higher_is_better")
+        self.assertEqual(harness.STEP2C_CANARY_ARRIVALS, 12)
+
+    def test_drive_refuses_a_matching_service_running_the_wrong_experiment(self) -> None:
+        for name, (changes, arrivals) in _WRONG_EXPERIMENTS.items():
+            with self.subTest(case=name):
+                dependencies, factory, inputs, argv = self._case(name, changes, arrivals)
+                with TestClient(harness.isolated_app(dependencies)) as client:
+                    self.assertEqual(
+                        client.get(harness.IDENTITY_ROUTE).json(),
+                        harness.intended_identity(self._args(argv), inputs),
+                    )
+                    stderr = io.StringIO()
+                    with patch.object(harness, "load_inputs", return_value=inputs), patch(
+                        "httpx.Client", side_effect=lambda *a, **k: nullcontext(client)
+                    ), redirect_stderr(stderr), redirect_stdout(io.StringIO()):
+                        exit_code = harness.main(argv)
+                    self.assertEqual(exit_code, 2)
+                    self.assertIn("Step 2C experiment contract", stderr.getvalue())
+                    self.assertFalse(client.get(harness.CANARY_ROUTE).json()["admitted"])
+                self.assertEqual(factory.calls, 0)
+                self.assertEqual(self._rows(), ((), (), ()))
+                self.assertFalse((self.root / "summary.json").exists())
+
+    def test_drive_proceeds_when_the_files_match_the_contract(self) -> None:
+        dependencies, factory, inputs, argv = self._case("matching", {}, 12)
+        verdict = {
+            "integrity_verified": True,
+            "tier2_executed": True,
+            "canary_execution": {"statistical_integration": "complete"},
+        }
+        run = MagicMock(return_value=verdict)
+        with TestClient(harness.isolated_app(dependencies)) as client:
+            with patch.object(harness, "load_inputs", return_value=inputs), patch(
+                "httpx.Client", side_effect=lambda *a, **k: nullcontext(client)
+            ), patch.object(harness, "run_tier2_test", run), redirect_stdout(io.StringIO()):
+                self.assertEqual(harness.main(argv), 0)
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.kwargs["expected_identity"],
+            harness.identity_from_dependencies(dependencies),
+        )
+
+    def test_preflight_refuses_the_wrong_experiment_before_building_a_service(self) -> None:
+        for name, (changes, arrivals) in _WRONG_EXPERIMENTS.items():
+            with self.subTest(case=name):
+                _, factory, inputs, argv = self._case(name, changes, arrivals)
+                argv = ["preflight", *argv[1:-2]]
+                stderr = io.StringIO()
+                with patch.object(harness, "load_inputs", return_value=inputs), patch.object(
+                    harness, "isolated_service_dependencies"
+                ) as build, redirect_stderr(stderr), redirect_stdout(io.StringIO()):
+                    self.assertEqual(harness.main(argv), 2)
+                build.assert_not_called()
+                self.assertIn("Step 2C experiment contract", stderr.getvalue())
+                self.assertEqual(factory.calls, 0)
 
 
 if __name__ == "__main__":
