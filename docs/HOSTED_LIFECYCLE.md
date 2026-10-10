@@ -255,6 +255,8 @@ Admission (`POST /candidates`, HTTP 409 on refusal) accepts only a stored `gate_
 
 Hosted roles take no `--*-base-url`. Endpoints route by configuration hash, so a promoted candidate keeps serving from its own route while the monitor compares it with the previous production reference.
 
+On restart against the same `--store`, the service reads its last deployment decision back from SQLite before serving. A stored promotion must name the registered candidate as promoted over the registered production. The promoted candidate then serves again, compared against that production in the same monitoring period, so an open incident does not alert twice. A stored rollback keeps production and refuses the rolled-back candidate at `POST /candidates`. An admission with no promotion or rollback after it is closed with a persisted `restart_with_unfinished_canary` rollback, and candidate traffic does not resume. A stored decision whose hashes differ from the registered configurations stops startup. `GET /deployment` reports the recovered state with `recovered_from_store`.
+
 ### 8a. Connected three-tier dev run (documented, not run)
 
 `scripts/demo/run_three_tier_dev.py live` replaces step 7 and the manual `curl` in step 8 with one command. Start `serve.py` exactly as in step 8, on a fresh `--store`. Then run:
@@ -271,16 +273,47 @@ py scripts/demo/run_three_tier_dev.py live \
   --dev-task-set data/processed/dev_calibration.json \
   --canary-arrivals 10 --production-arrivals 10 \
   --service-url http://127.0.0.1:8000 \
-  --store data/processed/three_tier_dev.sqlite
+  --store data/processed/three_tier_dev.sqlite \
+  --release-summary data/processed/three_tier_dev_release.json
 ```
 
 For this dev run, set `fraction` to `1.0` in the local canary settings file passed to `serve.py --canary-settings`. Set `--canary-arrivals` to at least that file's `stopping_rule.horizon_episodes`. Each arrival is one request that the service routes. At a fraction below `1.0`, some canary arrivals go to production, so 10 arrivals at a fraction of `0.1` do not guarantee 10 candidate pairs. A canary that runs out of arrivals before its horizon ends as `canary_incomplete`. This applies only to the local dev settings; it changes no production default or threshold.
 
-The command has no model-specific logic. A vLLM gate takes `--reference-endpoint` and `--candidate-endpoint`, a hosted gate takes neither, and `serve.py` takes the matching `--*-base-url`. Before the gate runs, it refuses a dirty tree or a configuration not built at HEAD. It also refuses a store that already holds decisions or episodes, a service whose registered hashes differ from the dev files, and a `kl` requirement on a hosted configuration. The gate artifact goes into `--store`. A BLOCK stops before admission. A PASS is admitted only by the service's release admission and allowance. The canary arrivals run until the controller promotes or rolls back. After a promotion, the production arrivals are Tier 3: the service sends them to the promoted configuration, and its monitor compares them against the previous production configuration. After a rollback, the same arrivals are reported as `fallback_verification` and must all go to the known-good configuration. If the canary arrivals run out before the controller decides, the command calls `POST /deployment/rollback`, which records a `manual_rollback` decision, not a stopping-rule decision. It then checks that the candidate is closed and the known-good configuration serves, and reports `canary_incomplete` with a `cleanup` entry. If that check fails, the command reports an execution failure. The JSON summary holds the gate result, the admission status, receipts by role and hash, the deployment state, and the stored decisions, alerts, and episode counts.
+The command has no model-specific logic. A vLLM gate takes `--reference-endpoint` and `--candidate-endpoint`, a hosted gate takes neither, and `serve.py` takes the matching `--*-base-url`. Before the gate runs, it refuses a dirty tree or a configuration not built at HEAD. It also refuses a `--store` that does not exist yet (it must be the store the running service opened) or that already holds a validation artifact, decision, or episode, an existing `--release-summary` file, a service whose registered hashes differ from the dev files, and a `kl` requirement on a hosted configuration. The gate artifact goes into `--store`. A BLOCK stops before admission. A PASS is admitted only by the service's release admission and allowance. The canary arrivals run until the controller promotes or rolls back. After a promotion, the production arrivals are Tier 3: the service sends them to the promoted configuration, and its monitor compares them against the previous production configuration. After a rollback, the same arrivals are reported as `fallback_verification` and must all go to the known-good configuration. If the canary arrivals run out before the controller decides, the command calls `POST /deployment/rollback`, which records a `manual_rollback` decision, not a stopping-rule decision. It then checks that the candidate is closed and the known-good configuration serves, and reports `canary_incomplete` with a `cleanup` entry. If that check fails, the command reports an execution failure. The JSON summary holds the gate result, the admission status, receipts by role and hash, the deployment state, and the stored decisions, alerts, and episode counts.
 
-Exit codes: `0` promoted; `1` blocked, rolled back, or admission refused; `2` invalid invocation or input, before any model call; `3` `canary_incomplete` after a confirmed cleanup rollback; `4` execution or infrastructure failure, with no summary. The summary is printed for every completed status.
+Exit codes: `0` promoted; `1` blocked, rolled back, or admission refused; `2` invalid invocation or input, including a broken release lineage, before any model call; `3` `canary_incomplete` after a confirmed cleanup rollback; `4` execution or infrastructure failure, or a release summary that could not be written, with no summary. The summary is printed for every completed status, and the public `release-summary-v1` record is written to `--release-summary` first.
 
 Every episode costs provider spend or GPU time. The canary, monitor, and frozen-reference files are still local DRAFT settings. `synthetic --scenario blocked|healthy|regression` runs the same function on injected runtimes, with `serve.py`'s own dependency builder and test admission. It is an engineering test: it exits `0` when the scenario reaches its expected outcome (blocked, promoted, rolled back), and `1` when it does not.
+
+### 8b. Consecutive releases and the release workflow (wired, not run)
+
+**One store per release.** Each release runs against its own new SQLite store, and the stores of earlier releases stay on the trusted machine as audit history. Restart recovery (step 8) is unchanged: it serves one production/candidate pair per store, so a release never reuses an earlier store.
+
+**Release summary.** `--release-summary` gets a `release-summary-v1` document with hashes, outcomes, and counts only:
+
+- `configurations`: `production`, `candidate`, `serving` (what the service serves after the run: the candidate after a promotion, production otherwise), `known_good` (the production this release started from), and `frozen_reference` (the reference hash on the store's last lifecycle decision, null when nothing was admitted).
+- `gate`: outcome, reason codes, artifact id, evidence source, and the train hashes.
+- `deployment`: the last `admit`/`promote`/`rollback` decision and its method, the decision sequence, state, admission, and candidate episodes served.
+- `monitoring`: period id, Tier 3 and fallback-verification arrival counts, and alert counts by signal.
+- `lineage`: null for a first release.
+
+It holds no task id, trace, or store path.
+
+**Lineage.** `--previous-release` names release N's summary. Release N+1 is refused with exit `2`, before any model call or admission, unless its `--production-config` hashes to release N's `serving` hash. The service for N+1 is therefore provisioned with that configuration as production and a frozen reference for it (`serve.py` already requires the frozen reference hash to match production). Release N+1's `lineage` records the SHA-256 of release N's summary, its status, and its serving, known-good, and frozen-reference hashes, so the chain of known-good configurations survives across stores.
+
+**One pinned commit.** `git_commit` is part of the configuration hash, and live preflight refuses a configuration not built at HEAD. Consecutive releases therefore run at one commit: release N+1's production file is release N's candidate file, unchanged. A release at a different commit is refused by name (`cross-commit rollout is not supported`). Rehashing a deployed configuration at a new commit would be a new configuration with no stored evidence behind it, so cross-commit rollout is an open limitation, not a supported path.
+
+**Workflow.** `.github/workflows/release-lifecycle.yml` starts only from `workflow_dispatch`. Mode `synthetic` runs the `blocked`, `healthy`, and `regression` scenarios on a GitHub-hosted CPU runner; each job fails unless its scenario reaches its expected outcome. Mode `live` runs only when dispatched from `main` of this repository. It runs on a self-hosted runner labelled `llm-behavior-ci-release` in the `release-live` environment, and only when `confirm_live` repeats `release_id`. It calls `scripts/ci/run_live_release.sh`, which runs step 8a's command from a provisioned release directory and exits with the command's own code. Only `0` (promoted) passes the job. `1` (not promoted), `3` (canary incomplete), `2`, and `4` all fail it. The job log shows only the exit code and its meaning; the lifecycle summary and stderr stay in the release directory. No artifact is uploaded.
+
+**Prerequisites before any live dispatch, none of them done:**
+
+- Approve and register the self-hosted runner with label `llm-behavior-ci-release` (`CONSTRAINTS.md`; the repo's fork-PR exposure applies even though no PR trigger exists).
+- Create the `release-live` environment with required reviewers and a `main`-only deployment branch rule.
+- Set the environment variables `LIFECYCLE_RELEASE_ROOT`, `LIFECYCLE_SERVICE_URL`, `LIFECYCLE_PYTHON` (the `.venv-service` interpreter), and, for vLLM gates, `LIFECYCLE_REFERENCE_ENDPOINT` and `LIFECYCLE_CANDIDATE_ENDPOINT`.
+- Provider keys and `APPWORLD_ROOT` live in the runner's own environment. The workflow reads no secrets.
+- For each release, provision `$LIFECYCLE_RELEASE_ROOT/<release_id>/` with `gate_reference.json`, `gate_candidate.json`, `train_task_set.json`, `gate_settings.json`, `plan_evidence.json`, `production.json`, `candidate.json`, and `dev_task_set.json`, all built at the `main` commit being dispatched.
+- Start `serve.py` (step 8) with that release's production and candidate configurations, canary, monitor, and frozen-reference settings, allowance, and `--store $LIFECYCLE_RELEASE_ROOT/<release_id>/episodes.sqlite`. The runner and the service must see the same file.
+- Authorize the paid or GPU spend for the release.
 
 ### 9. Dev stream rehearsal
 

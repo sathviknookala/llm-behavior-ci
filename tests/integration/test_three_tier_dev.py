@@ -24,12 +24,16 @@ from llm_behavior_ci.experiments.run_config import build_run_configuration
 from llm_behavior_ci.lifecycle.connected import (
     ConnectedLifecycleError,
     DevTraffic,
+    ReleaseLineageError,
+    release_summary,
+    require_fresh_store,
+    require_release_lineage,
     run_three_tier_dev,
 )
 from llm_behavior_ci.lifecycle.monitoring import monitoring_period_id
 from llm_behavior_ci.lifecycle.offline_gate import GateCapabilityError
 from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-from llm_behavior_ci.service import create_app
+from llm_behavior_ci.service import ConfigurationRegistry, ServiceError, create_app
 from llm_behavior_ci.storage import EpisodeStore
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -435,6 +439,258 @@ class ThreeTierDevLifecycleTests(unittest.TestCase):
         self.assertEqual(self._artifact_count(), 0)
 
 
+class ServiceRestartTests(unittest.TestCase):
+    """A restarted service reads its last deployment decision back from SQLite."""
+
+    def setUp(self) -> None:
+        self._tmpdir = TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+
+    def _first_run(self, scenario: str, **traffic_changes):
+        lifecycle = demo.build_synthetic(scenario, self.root)
+        traffic = replace(lifecycle.traffic, **traffic_changes)
+        with TestClient(create_app(lifecycle.dependencies)) as client:
+            summary = run_three_tier_dev(
+                lifecycle.gate, traffic, store_path=lifecycle.store_path, service=client
+            )
+        self.production_hash = run_configuration_hash(traffic.production)
+        self.candidate_hash = run_configuration_hash(traffic.candidate)
+        self.store_path = lifecycle.store_path
+        return summary
+
+    def _restart(self, **dependency_changes) -> TestClient:
+        lifecycle = demo.build_synthetic("healthy", self.root)
+        client = TestClient(create_app(replace(lifecycle.dependencies, **dependency_changes)))
+        client.__enter__()
+        self.addCleanup(client.__exit__, None, None, None)
+        return client
+
+    def _decisions(self):
+        reader = EpisodeStore(self.store_path)
+        try:
+            return reader.load_deployment_decisions(), reader.load_alerts()
+        finally:
+            reader.close()
+
+    def test_a_promotion_survives_restart(self) -> None:
+        summary = self._first_run("healthy")
+        artifact_id = summary["tier1"]["artifact_id"]
+        decisions_before, alerts_before = self._decisions()
+        self.assertEqual(len(alerts_before), 1)
+
+        client = self._restart()
+        deployment = client.get("/deployment").json()
+        self.assertEqual(deployment["state"], "PROMOTED")
+        self.assertTrue(deployment["recovered_from_store"])
+        self.assertEqual(deployment["serving_configuration_hash"], self.candidate_hash)
+        self.assertEqual(deployment["production_configuration_hash"], self.candidate_hash)
+        self.assertEqual(deployment["promoted_configuration_hash"], self.candidate_hash)
+        self.assertEqual(
+            deployment["previous_production_configuration_hash"], self.production_hash
+        )
+        self.assertEqual(
+            deployment["monitor_period_id"],
+            monitoring_period_id(self.candidate_hash, self.production_hash),
+        )
+
+        served = client.post(
+            "/episodes",
+            json={"task_id": demo.REGRESS_TASK_IDS[0], "mode": "execute", "assignment_key": "r"},
+        )
+        self.assertEqual(served.status_code, 200)
+        self.assertEqual(served.json()["role"], "production")
+        self.assertEqual(served.json()["configuration_hash"], self.candidate_hash)
+        self.assertEqual(served.json()["monitoring_status"], "updated")
+        self.assertEqual(
+            client.post("/candidates", json={"artifact_id": artifact_id}).status_code, 409
+        )
+        decisions_after, alerts_after = self._decisions()
+        self.assertEqual(decisions_after, decisions_before)
+        self.assertEqual(alerts_after, alerts_before)
+
+    def test_a_rollback_survives_restart(self) -> None:
+        summary = self._first_run("regression")
+        artifact_id = summary["tier1"]["artifact_id"]
+        decisions_before, _ = self._decisions()
+
+        client = self._restart()
+        deployment = client.get("/deployment").json()
+        self.assertEqual(deployment["state"], "ROLLED_BACK")
+        self.assertEqual(deployment["admission"], "rollback_requested")
+        self.assertEqual(deployment["serving_configuration_hash"], self.production_hash)
+        self.assertIsNone(deployment["promoted_configuration_hash"])
+        self.assertEqual(
+            deployment["rejected_candidate_configuration_hash"], self.candidate_hash
+        )
+        self.assertEqual(deployment["recovered_decision_method"], "stopping_rule_alarm")
+
+        candidate = client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-0", "mode": "execute", "role": "candidate"},
+        )
+        self.assertEqual(candidate.status_code, 409)
+        routed = client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-0", "mode": "execute", "assignment_key": "r"},
+        )
+        self.assertEqual(routed.json()["configuration_hash"], self.production_hash)
+        readmit = client.post("/candidates", json={"artifact_id": artifact_id})
+        self.assertEqual(readmit.status_code, 409)
+        self.assertIn("rolled back", readmit.json()["detail"])
+        self.assertEqual(self._decisions()[0], decisions_before)
+
+    def test_an_unfinished_canary_is_closed_at_restart(self) -> None:
+        lifecycle = demo.build_synthetic("healthy", self.root)
+        self.store_path = lifecycle.store_path
+        self.production_hash = run_configuration_hash(lifecycle.traffic.production)
+        self.candidate_hash = run_configuration_hash(lifecycle.traffic.candidate)
+        short = replace(lifecycle.traffic, canary_task_ids=demo.CANARY_TASK_IDS[:1])
+        with TestClient(create_app(lifecycle.dependencies)) as real:
+            service = RollbackOverride(real, lambda inner: FakeResponse(503, {}))
+            with self.assertRaises(ConnectedLifecycleError):
+                run_three_tier_dev(
+                    lifecycle.gate, short, store_path=lifecycle.store_path, service=service
+                )
+            self.assertEqual(real.get("/deployment").json()["state"], "CANARY_ACTIVE")
+        self.assertEqual([row.decision for row in self._decisions()[0]], ["admit"])
+
+        client = self._restart()
+        deployment = client.get("/deployment").json()
+        self.assertEqual(deployment["state"], "ROLLED_BACK")
+        self.assertEqual(deployment["serving_configuration_hash"], self.production_hash)
+        self.assertEqual(
+            deployment["rejected_candidate_configuration_hash"], self.candidate_hash
+        )
+        decisions = self._decisions()[0]
+        self.assertEqual([row.decision for row in decisions], ["admit", "rollback"])
+        self.assertEqual(decisions[1].method, "restart_with_unfinished_canary")
+        candidate = client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-1", "mode": "execute", "role": "candidate"},
+        )
+        self.assertEqual(candidate.status_code, 409)
+        routed = client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-1", "mode": "execute", "assignment_key": "r"},
+        )
+        self.assertEqual(routed.json()["configuration_hash"], self.production_hash)
+
+    def test_a_stored_decision_for_other_configurations_refuses_startup(self) -> None:
+        self._first_run("healthy")
+        lifecycle = demo.build_synthetic("healthy", self.root)
+        swapped = ConfigurationRegistry(
+            production=lifecycle.dependencies.registry.candidate,
+            candidate=lifecycle.dependencies.registry.production,
+        )
+        app = create_app(replace(lifecycle.dependencies, registry=swapped))
+        with self.assertRaises(ServiceError) as caught:
+            with TestClient(app):
+                pass
+        self.assertIn("stored promotion does not match", str(caught.exception))
+
+
+class ReleaseLineageTests(unittest.TestCase):
+    """Release N+1 starts from what release N left serving, on a fresh store."""
+
+    def setUp(self) -> None:
+        self._tmpdir = TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+
+    def _run(self, scenario: str):
+        root = self.root / scenario
+        root.mkdir()
+        lifecycle = demo.build_synthetic(scenario, root)
+        with TestClient(create_app(lifecycle.dependencies)) as client:
+            summary = run_three_tier_dev(
+                lifecycle.gate,
+                lifecycle.traffic,
+                store_path=lifecycle.store_path,
+                service=client,
+            )
+        return summary, lifecycle
+
+    def _release(self, scenario: str):
+        summary, lifecycle = self._run(scenario)
+        return release_summary(summary, lifecycle.traffic), lifecycle
+
+    def test_a_promoted_release_hands_its_candidate_to_the_next_release(self) -> None:
+        record, lifecycle = self._release("healthy")
+        production = lifecycle.traffic.production
+        candidate = lifecycle.traffic.candidate
+        production_hash = run_configuration_hash(production)
+        candidate_hash = run_configuration_hash(candidate)
+        self.assertEqual(record["status"], "promoted")
+        self.assertEqual(
+            record["configurations"],
+            {
+                "production": production_hash,
+                "candidate": candidate_hash,
+                "serving": candidate_hash,
+                "known_good": production_hash,
+                "frozen_reference": production_hash,
+            },
+        )
+        self.assertEqual(record["deployment"]["decision"], "promote")
+        self.assertEqual(record["deployment"]["decisions"], ["admit", "promote"])
+        self.assertEqual(record["gate"]["outcome"], "PASS")
+        self.assertEqual(record["monitoring"]["tier3_arrivals"], len(demo.PRODUCTION_TASK_IDS))
+        self.assertEqual(record["monitoring"]["alerts"], 1)
+        self.assertIsNone(record["lineage"])
+        self.assertNotIn("dev-", json.dumps(record))
+
+        lineage = require_release_lineage(record, candidate)
+        self.assertEqual(lineage["previous_serving_configuration_hash"], candidate_hash)
+        self.assertEqual(lineage["previous_known_good_configuration_hash"], production_hash)
+        self.assertEqual(lineage["previous_frozen_reference_configuration_hash"], production_hash)
+        with self.assertRaises(ReleaseLineageError):
+            require_release_lineage(record, production)
+        with self.assertRaises(ConnectedLifecycleError):
+            require_fresh_store(lifecycle.store_path)
+        require_fresh_store(self.root / "next.sqlite")
+
+    def test_a_rolled_back_release_keeps_production_as_the_next_start(self) -> None:
+        record, lifecycle = self._release("regression")
+        production = lifecycle.traffic.production
+        self.assertEqual(record["status"], "rolled_back")
+        self.assertEqual(
+            record["configurations"]["serving"], run_configuration_hash(production)
+        )
+        self.assertEqual(record["monitoring"]["tier3_arrivals"], 0)
+        require_release_lineage(record, production)
+        with self.assertRaises(ReleaseLineageError):
+            require_release_lineage(record, lifecycle.traffic.candidate)
+
+    def test_a_blocked_release_leaves_a_store_that_is_not_fresh(self) -> None:
+        record, lifecycle = self._release("blocked")
+        self.assertEqual(record["status"], "blocked")
+        self.assertIsNone(record["deployment"]["decision"])
+        self.assertIsNone(record["configurations"]["frozen_reference"])
+        with self.assertRaises(ConnectedLifecycleError):
+            require_fresh_store(lifecycle.store_path)
+
+    def test_lineage_refuses_another_commit_and_other_documents(self) -> None:
+        record, lifecycle = self._release("healthy")
+        candidate = lifecycle.traffic.candidate
+        with self.assertRaises(ReleaseLineageError) as caught:
+            require_release_lineage(record, replace(candidate, git_commit="f" * 40))
+        self.assertIn("cross-commit rollout is not supported", str(caught.exception))
+        for document in (
+            {**record, "version": "release-summary-v0"},
+            {**record, "status": "unknown"},
+            {**record, "configurations": {}},
+            [record],
+        ):
+            with self.assertRaises(ReleaseLineageError):
+                require_release_lineage(document, candidate)
+
+    def test_a_summary_that_disagrees_with_the_service_is_refused(self) -> None:
+        summary, lifecycle = self._run("healthy")
+        with self.assertRaises(ConnectedLifecycleError):
+            release_summary({**summary, "status": "rolled_back"}, lifecycle.traffic)
+
+
 def _live_argv(root: Path, **overrides: str) -> list[str]:
     values = {
         "--gate-reference": str(root / "gate_reference.json"),
@@ -449,6 +705,7 @@ def _live_argv(root: Path, **overrides: str) -> list[str]:
         "--production-arrivals": "4",
         "--service-url": "http://127.0.0.1:9",
         "--store": str(root / "lifecycle.sqlite"),
+        "--release-summary": str(root / "release_summary.json"),
     }
     values.update(overrides)
     argv = ["live"]
@@ -475,6 +732,9 @@ class ThreeTierDevCommandTests(unittest.TestCase):
             self.assertEqual(demo.main(["live", "--store", "x.sqlite"]), 2)
             self.assertEqual(demo.main(["synthetic", "--scenario", "unknown"]), 2)
 
+    def _traffic(self) -> DevTraffic:
+        return demo.build_synthetic("healthy", self.root).traffic
+
     def test_live_exit_code_for_each_lifecycle_status(self) -> None:
         expected = {
             "promoted": 0,
@@ -483,29 +743,78 @@ class ThreeTierDevCommandTests(unittest.TestCase):
             "admission_refused": 1,
             "canary_incomplete": 3,
         }
+        traffic = self._traffic()
         for status, code in expected.items():
             with self.subTest(status=status):
-                with patch.object(demo, "live_inputs", return_value=(None, None)), patch.object(
+                path = self.root / f"{status}.json"
+                with patch.object(
+                    demo, "live_inputs", return_value=(None, traffic)
+                ), patch.object(
                     demo, "run_live", return_value={"status": status}
-                ) as run:
-                    exit_code, output = self._main(_live_argv(self.root))
+                ) as run, patch.object(
+                    demo, "release_summary", return_value={"status": status}
+                ):
+                    exit_code, output = self._main(
+                        _live_argv(self.root, **{"--release-summary": str(path)})
+                    )
                 self.assertEqual(exit_code, code)
                 self.assertEqual(json.loads(output)["status"], status)
+                self.assertEqual(json.loads(path.read_text())["status"], status)
                 run.assert_called_once()
 
     def test_live_failures_exit_4_and_print_no_summary(self) -> None:
+        traffic = self._traffic()
         for name, effect in {
             "lifecycle": {"side_effect": ConnectedLifecycleError("cleanup failed")},
             "transport": {"side_effect": ConnectionError("refused")},
             "unknown status": {"return_value": {"status": "unexpected"}},
         }.items():
             with self.subTest(case=name):
-                with patch.object(demo, "live_inputs", return_value=(None, None)), patch.object(
-                    demo, "run_live", **effect
-                ):
+                with patch.object(
+                    demo, "live_inputs", return_value=(None, traffic)
+                ), patch.object(demo, "run_live", **effect):
                     exit_code, output = self._main(_live_argv(self.root))
                 self.assertEqual(exit_code, 4)
                 self.assertEqual(output, "")
+                self.assertFalse((self.root / "release_summary.json").exists())
+
+    def test_a_promotion_without_a_release_summary_is_not_a_success(self) -> None:
+        with patch.object(
+            demo, "live_inputs", return_value=(None, self._traffic())
+        ), patch.object(demo, "run_live", return_value={"status": "promoted"}):
+            exit_code, output = self._main(_live_argv(self.root))
+        self.assertEqual(exit_code, 4)
+        self.assertEqual(output, "")
+
+    def test_a_broken_lineage_exits_2_before_any_model_call(self) -> None:
+        traffic = self._traffic()
+        previous = self.root / "previous.json"
+        previous.write_text(
+            json.dumps(
+                {
+                    "record": "release_summary",
+                    "version": "release-summary-v1",
+                    "git_commit": traffic.production.git_commit,
+                    "status": "promoted",
+                    "configurations": {"serving": "0" * 64},
+                }
+            )
+        )
+        existing = self.root / "existing.json"
+        existing.write_text("{}")
+        for name, overrides in {
+            "mismatched production": {"--previous-release": str(previous)},
+            "missing previous release": {"--previous-release": str(self.root / "none.json")},
+            "existing release summary": {"--release-summary": str(existing)},
+        }.items():
+            with self.subTest(case=name):
+                with patch.object(
+                    demo, "live_inputs", return_value=(None, traffic)
+                ), patch.object(demo, "run_live") as run:
+                    exit_code, output = self._main(_live_argv(self.root, **overrides))
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(output, "")
+                run.assert_not_called()
 
     def test_invalid_live_inputs_exit_2_before_any_model_call(self) -> None:
         results = self.root / "results"
@@ -515,6 +824,9 @@ class ThreeTierDevCommandTests(unittest.TestCase):
             "store under results": _live_argv(
                 self.root, **{"--store": str(results / "lifecycle.sqlite")}
             ),
+            "store not provisioned": _live_argv(
+                self.root, **{"--store": str(self.root / "absent.sqlite")}
+            ),
         }.items():
             with self.subTest(case=name):
                 with patch.object(demo, "run_live") as run:
@@ -522,6 +834,18 @@ class ThreeTierDevCommandTests(unittest.TestCase):
                 self.assertEqual(exit_code, 2)
                 self.assertEqual(output, "")
                 run.assert_not_called()
+
+    def test_a_used_store_is_refused_before_any_input_is_loaded(self) -> None:
+        previous = self.root / "previous"
+        previous.mkdir()
+        demo.run_synthetic("blocked", previous)
+        argv = _live_argv(self.root, **{"--store": str(previous / "lifecycle.sqlite")})
+        values = {
+            name.lstrip("-").replace("-", "_"): value
+            for name, value in zip(argv[1::2], argv[2::2])
+        }
+        with self.assertRaisesRegex(ConnectedLifecycleError, "needs its own store"):
+            demo.live_inputs(demo.argparse.Namespace(**values))
 
     def test_synthetic_scenarios_succeed_as_engineering_tests(self) -> None:
         for scenario, status in demo.EXPECTED_SYNTHETIC_STATUS.items():

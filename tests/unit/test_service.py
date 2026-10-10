@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -839,26 +838,11 @@ class ServiceUnitTests(unittest.TestCase):
         self.assertEqual(deployment["admission"], "rollback_requested")
 
     def test_concurrency_returns_429(self) -> None:
-        from llm_behavior_ci.service import _EpisodeRequest, _run_production_episode
-
-        started = threading.Event()
-        release = threading.Event()
-
-        class BlockingAgent(FakeAgent):
-            def next_turn(self, *, tool_output: str | None) -> AgentTurn:
-                started.set()
-                if not release.wait(timeout=5):
-                    raise TimeoutError("release event was not set")
-                return super().next_turn(tool_output=tool_output)
-
         def factory(config: RunConfiguration) -> RuntimeDependencies:
             del config
             return RuntimeDependencies(
                 session_factory=lambda task_id: FakeSession(task_id),
-                agent=BlockingAgent(
-                    [_turn(_PLAN, action=None)],
-                    clock=self.clock,
-                ),
+                agent=FakeAgent([_turn(_PLAN, action=None)], clock=self.clock),
                 clock=self.clock,
             )
 
@@ -867,43 +851,17 @@ class ServiceUnitTests(unittest.TestCase):
             max_in_flight=1,
         )
         app = self.create_app(dependencies)
-        errors: list[BaseException] = []
+        body = {"task_id": "task-2", "mode": "plan", "role": "production"}
 
         with TestClient(app) as client:
             state = app.state.service
-            request = _EpisodeRequest(
-                task_id="task-1",
-                mode="plan",
-                role="production",
-                assignment_key=None,
-            )
-
-            def first() -> None:
-                if not state.try_acquire_slot():
-                    errors.append(RuntimeError("expected a free slot"))
-                    return
-                try:
-                    _run_production_episode(state, request)
-                except BaseException as error:
-                    errors.append(error)
-                finally:
-                    state.release_slot()
-
-            worker = threading.Thread(target=first)
-            worker.start()
-            self.assertTrue(started.wait(timeout=5))
-            second = client.post(
-                "/episodes",
-                json={
-                    "task_id": "task-2",
-                    "mode": "plan",
-                    "role": "production",
-                },
-            )
+            self.assertTrue(state.try_acquire_slot())
+            try:
+                second = client.post("/episodes", json=body)
+            finally:
+                state.release_slot()
             self.assertEqual(second.status_code, 429)
-            release.set()
-            worker.join(timeout=5)
-        self.assertEqual(errors, [])
+            self.assertEqual(client.post("/episodes", json=body).status_code, 200)
 
     def test_dependencies_reject_non_positive_max_in_flight(self) -> None:
         from llm_behavior_ci.service import ServiceError
