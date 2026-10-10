@@ -319,15 +319,32 @@ It holds no task id, trace, or store path.
 
 `scripts/demo/run_tier2_canary_test.py` runs the real canary, with real hosted agents and AppWorld dev worlds, without running Tier 1. It is an integration test of the downstream software, not a release. Its admission evidence is a PASS artifact labelled `synthetic_fixture`, which the harness builds itself; no gate produced it. Every summary says `test_only_admission: true` and `gate_executed: false`. A Tier 1 result from another run, such as a BLOCK, is not read, changed, or reinterpreted.
 
-- **`preflight`** loads every input and checks provenance at HEAD. It builds `serve.py`'s dependencies against a scratch store, which also checks that the provider key is set. It checks that test admission accepts the fixture and that release admission (`authorize_gated_candidate`) refuses it. It makes no provider call and starts no service.
-- **`serve`** builds the same dependencies with `serve.py`'s `_build_dependencies` and switches only `admission_mode` to `test`. It runs uvicorn on 127.0.0.1, on a free unprivileged port, with a `--store` that must not exist yet. The store is used on the main thread, as under `serve.py`. `serve.py` has no test mode and the release workflow does not use this script.
-- **`drive`** writes the fixture into that store and admits it through `POST /candidates`. It then sends at most `--canary-arrivals` canary arrivals through `POST /episodes`, using `lifecycle.connected.admit_and_run_canary`, the same code step 8a uses. It sends no Tier 3 arrivals.
-  - An exhausted canary is rolled back through `POST /deployment/rollback`, as in step 8a.
-  - After the run, every persisted pair is checked: registered hashes per role, distinct episodes, both episodes persisted, the controller's served count, the admit decision's evidence source, and the final deployment state.
-  - It writes a new `--summary` file and prints the same `tier2-canary-test-v1` record, which holds hashes, counts and decisions only.
-- `run_pair` opens two worlds per pair and rejects a pair whose worlds are the same object or do not share an initial state. The world identity itself is not stored.
-- A pair missing either evaluator outcome is counted, but the stopping rule never sees it. With 12 arrivals and horizon 12, a single such pair leaves the canary `canary_incomplete`.
-- **Exit codes:** `0` the run completed and every check passed, whatever the canary decided; `1` a check failed; `2` invalid input; `4` execution failure. A promoted test service keeps running with its store for Tier 3; stop it with Ctrl-C or SIGINT.
+- **`preflight`** makes no provider call and starts no service.
+  - It loads every input and checks provenance at HEAD.
+  - It builds the service dependencies exactly as `serve` does, against a scratch store. That also checks that the provider key is set.
+  - It checks that their identity equals the one computed from the intended files.
+  - It checks that test admission accepts the fixture and that release admission (`authorize_gated_candidate`) refuses it.
+- **`serve`** builds `serve.py`'s dependencies with `_build_dependencies` and switches only `admission_mode` to `test`.
+  - It runs uvicorn on 127.0.0.1, on a free unprivileged port, with a `--store` that must not exist yet. The store is used on the main thread, as under `serve.py`.
+  - Two routes exist on this app only. `GET /test-only/identity` reports the settings the running service loaded: both configuration hashes, the canary settings, the assignment seed, the task-selection allowance, the monitor reference, the admission mode, and their SHA-256. `GET /test-only/canary` reports how many paired outcomes the stopping rule received.
+  - `serve.py` has no test mode or test routes, and the release workflow does not use this script.
+- **`drive`** compares `GET /test-only/identity` with the identity computed from the intended files. On any difference it exits `2` before writing the fixture, calling admission, or running a model.
+  - It then admits the fixture through `POST /candidates` and sends at most `--canary-arrivals` canary arrivals through `POST /episodes`, using `lifecycle.connected.admit_and_run_canary`, the same code step 8a uses. It sends no Tier 3 arrivals.
+  - Pair ids stay in process for the stored-pair checks and never enter a summary.
+  - The summary keeps three verdicts apart:
+    - `admission_verification`: the fixture checks and whether it was admitted.
+    - `canary_execution`: pairs executed and persisted, pairs with both evaluator outcomes, pairs eligible for the stopping rule, stopping-rule observations, horizon reached, the controller's decision and its method, the final state, and `statistical_integration`.
+    - `integrity_checks`: registered hashes per role, distinct and persisted episodes, the controller's served count, every eligible pair reaching the stopping rule, the fixture-backed admit decision, and the final deployment state.
+- **`statistical_integration`** is `complete` only when the stopping rule itself promoted or rolled back (`stopping_rule` or `stopping_rule_alarm`). A cleanup rollback (`manual_rollback`) leaves it `incomplete`, even when the integrity checks pass.
+- **Missing outcomes:** a pair missing either evaluator outcome is counted but never reaches the stopping rule.
+- **Separate worlds:** `run_pair` opens two worlds per pair and rejects a pair whose worlds are the same object or do not share an initial state. The world identity itself is not stored.
+- **`drive` exit codes:**
+  - `0`: integrity holds, pairs ran, and the stopping rule decided.
+  - `3`: integrity holds and pairs ran, but statistical integration is incomplete.
+  - `1`: an integrity check failed, admission was refused, or no pair ran.
+  - `2`: invalid input or a service identity mismatch.
+  - `4`: execution failure.
+- A promoted test service keeps running with its store for Tier 3; stop it with Ctrl-C or SIGINT.
 
 ### 9. Dev stream rehearsal
 

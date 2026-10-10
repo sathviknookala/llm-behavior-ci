@@ -1183,6 +1183,19 @@ class UsageAggregate(Record):
             raise RecordError("a currency needs a pricing version")
 
 
+_PROTECTED_IDENTIFIERS = ("task_id", "scenario_id", "episode_id", "pair_id")
+
+
+def _protected_key(key: str) -> bool:
+    if key in PROTECTED_FIELDS:
+        return True
+    for field in _PROTECTED_IDENTIFIERS:
+        for name in (field, field + "s"):
+            if key == name or key.endswith("_" + name):
+                return True
+    return False
+
+
 def assert_public_payload(payload: object) -> None:
     """Reject task content and local records in a public payload."""
 
@@ -1192,7 +1205,7 @@ def assert_public_payload(payload: object) -> None:
         for key, value in payload.items():
             if not isinstance(key, str):
                 raise RecordError("public payload has a non-string field name")
-            if key in PROTECTED_FIELDS:
+            if _protected_key(key):
                 raise RecordError(f"public payload contains {key}")
             assert_public_payload(value)
         return

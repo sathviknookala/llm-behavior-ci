@@ -526,6 +526,12 @@ class CanaryController:
         self._state = replace(state, outstanding=state.outstanding - 1)
         return self.snapshot()
 
+    @property
+    def detector_updates(self) -> int:
+        """Paired outcomes the stopping rule has received."""
+
+        return self._detector_updates
+
     def snapshot(self) -> DeploymentSnapshot:
         state = self._state
         serving = self._reference_hash

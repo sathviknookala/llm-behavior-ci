@@ -330,22 +330,35 @@ def _roll_back_incomplete_canary(
     }
 
 
+@dataclass(frozen=True)
+class CanaryStage:
+    """Admission and Tier 2 outcome.
+
+    ``public`` holds only public-safe summary entries. ``pair_ids`` is
+    private: it lets a local verifier find the stored pairs and never
+    enters a public summary.
+    """
+
+    public: dict[str, object]
+    state: str | None
+    pair_ids: tuple[str, ...]
+
+
 def admit_and_run_canary(
     traffic: DevTraffic,
     *,
     store_path: Path,
     service: ServiceClient,
     artifact_id: str,
-) -> tuple[dict[str, object], str | None]:
+) -> CanaryStage:
     """Admission and Tier 2: ``POST /candidates``, then canary arrivals.
 
     The artifact behind ``artifact_id`` must already be in the service's
     store; the service's own admission mode decides whether it is accepted.
-    Returns the summary entries and the final canary state. An
-    ``admission_refused`` or ``canary_incomplete`` result is complete, with
-    ``deployment`` and ``evidence`` read back; after PROMOTED or ROLLED_BACK
-    the caller continues. A failed arrival rolls the canary back through
-    the service before the error propagates.
+    An ``admission_refused`` or ``canary_incomplete`` result is complete,
+    with ``deployment`` and ``evidence`` read back; after PROMOTED or
+    ROLLED_BACK the caller continues. A failed arrival rolls the canary
+    back through the service before the error propagates.
     """
 
     stage: dict[str, object] = {}
@@ -360,7 +373,7 @@ def admit_and_run_canary(
         )
         stage["evidence"] = lifecycle_evidence(store_path, artifact_id)
         assert_public_payload(stage)
-        return stage, None
+        return CanaryStage(public=stage, state=None, pair_ids=())
     admitted = _json(response, "POST /candidates")
     if admitted.get("candidate_configuration_hash") != run_configuration_hash(
         traffic.candidate
@@ -391,9 +404,9 @@ def admit_and_run_canary(
                 ) from failure
         raise
     stage["tier2"] = {**_receipts(canary), "state": state}
-    stage["canary_pair_ids"] = [
+    pair_ids = tuple(
         str(item["pair_id"]) for item in canary if item.get("pair_id") is not None
-    ]
+    )
     if state not in _TERMINAL:
         stage["cleanup"] = _roll_back_incomplete_canary(service, production_hash)
         stage["status"] = "canary_incomplete"
@@ -402,9 +415,12 @@ def admit_and_run_canary(
         )
         stage["evidence"] = lifecycle_evidence(store_path, artifact_id)
         assert_public_payload(stage)
-        return stage, None if state is None else str(state)
+        return CanaryStage(
+            public=stage, state=None if state is None else str(state), pair_ids=pair_ids
+        )
     stage["status"] = _STATUS[str(state)]
-    return stage, str(state)
+    assert_public_payload(stage)
+    return CanaryStage(public=stage, state=str(state), pair_ids=pair_ids)
 
 
 def run_three_tier_dev(
@@ -451,10 +467,11 @@ def run_three_tier_dev(
         assert_public_payload(summary)
         return summary
 
-    stage, state = admit_and_run_canary(
+    canary_stage = admit_and_run_canary(
         traffic, store_path=store_path, service=service, artifact_id=artifact_id
     )
-    summary.update(stage)
+    summary.update(canary_stage.public)
+    state = canary_stage.state
     if state not in _TERMINAL:
         return summary
 

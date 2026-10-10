@@ -1118,6 +1118,7 @@ def create_app(dependencies: ServiceDependencies) -> FastAPI:
         state.close_store_once()
 
     app = FastAPI(lifespan=lifespan)
+    app.state.service_state = state
     app.state.service = state
 
     @app.exception_handler(ServiceError)

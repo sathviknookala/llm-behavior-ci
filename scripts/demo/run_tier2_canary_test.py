@@ -9,29 +9,38 @@ release admission, and the release workflow are unchanged; the same
 artifact is refused by ``authorize_gated_candidate``.
 
 ``preflight`` loads and checks every input, builds the service
-dependencies, and checks the fixture against both admission paths. It
-makes no provider call and starts no service.
+dependencies exactly as ``serve`` does, and checks that their identity
+matches the intended files and that the fixture passes test admission
+and fails release admission. It makes no provider call and starts no
+service.
 
 ``serve`` runs the isolated service in the foreground: ``serve.py``'s own
 dependency builder, then ``admission_mode="test"``, uvicorn on 127.0.0.1
-only, on a port that must be free, with a store that must not exist yet.
-The store is opened and used on the main thread, as under ``serve.py``.
+only, on a free port, with a store that must not exist yet. Two
+test-only routes exist on this app only: ``GET /test-only/identity``
+reports what the running service loaded, and ``GET /test-only/canary``
+reports how many paired outcomes the stopping rule received.
 
-``drive`` persists the fixture into that store, admits it through ``POST
-/candidates``, sends canary arrivals through ``POST /episodes`` until the
-controller promotes or rolls back (``lifecycle.connected``'s
-``admit_and_run_canary``), checks every persisted pair, and writes a
-public ``tier2-canary-test-v1`` summary. No Tier 3 arrivals are sent; a
-promoted service and its store are left for Tier 3.
+``drive`` refuses to start unless the running service's identity equals
+the intended one (configurations, canary settings, assignment seed,
+allowance, monitor reference, test admission). Only then does it persist
+the fixture, admit it through ``POST /candidates``, and send canary
+arrivals through ``POST /episodes`` (``admit_and_run_canary``). It then
+checks every stored pair and writes a public ``tier2-canary-test-v1``
+summary. No Tier 3 arrivals are sent.
 
-Exit codes: 0 the run completed and every integrity check passed,
-whatever the canary decided; 1 an integrity check failed; 2 invalid
-input; 4 an execution failure. Bare invocation exits 2.
+Exit codes: 0 every integrity check passed, pairs ran, and the stopping
+rule decided; 3 every integrity check passed and pairs ran, but the
+stopping rule did not decide (statistical integration incomplete); 1 an
+integrity check failed, admission was refused, or no pair ran; 2 invalid
+input or a service identity mismatch, before any model call; 4 an
+execution failure. Bare invocation exits 2.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import socket
@@ -42,15 +51,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from llm_behavior_ci.config import (
+    CanarySettings,
     ConfigError,
+    MonitorSettings,
     RunConfiguration,
     new_run_identity,
     run_configuration_hash,
 )
 from llm_behavior_ci.experiments.protocol import (
     ProtocolError,
+    TaskSelectionAllowance,
     authorize_gated_candidate,
     authorize_test_gated_candidate,
+    task_selection_allowance_document,
     task_selection_allowance_from_dict,
 )
 from llm_behavior_ci.lifecycle.connected import (
@@ -58,14 +71,17 @@ from llm_behavior_ci.lifecycle.connected import (
     DevTraffic,
     ServiceClient,
     admit_and_run_canary,
+    deployment_view,
     require_fresh_store,
     require_registered,
 )
+from llm_behavior_ci.lifecycle.monitoring import FrozenReference
 from llm_behavior_ci.lifecycle.validation_artifact import (
     ValidationArtifact,
     build_validation_artifact,
 )
 from llm_behavior_ci.records import StatisticalEvidence, assert_public_payload
+from llm_behavior_ci.service import ServiceDependencies, create_app
 from llm_behavior_ci.storage import EpisodeStore
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -73,7 +89,11 @@ HOST = "127.0.0.1"
 RECORD = "tier2_canary_integration_test"
 VERSION = "tier2-canary-test-v1"
 FIXTURE_METHOD = "test_only_admission_fixture"
+IDENTITY_ROUTE = "/test-only/identity"
+CANARY_ROUTE = "/test-only/canary"
+STOPPING_RULE_METHODS = frozenset({"stopping_rule", "stopping_rule_alarm"})
 EXIT_INVALID = 2
+EXIT_INCOMPLETE = 3
 EXIT_FAILURE = 4
 
 
@@ -89,11 +109,113 @@ def _load_script(name: str, relative: str):
 serve = _load_script("serve_for_tier2_canary_test", "scripts/service/serve.py")
 
 
+class ServiceIdentityError(ConnectedLifecycleError):
+    """The running service is not the intended isolated test service."""
+
+
 @dataclass(frozen=True)
 class Tier2Inputs:
     gate_reference: RunConfiguration
     gate_candidate: RunConfiguration
     traffic: DevTraffic
+
+
+def service_identity(
+    *,
+    admission_mode: str,
+    production: RunConfiguration,
+    candidate: RunConfiguration | None,
+    canary_settings: CanarySettings,
+    assignment_seed: int,
+    allowance: TaskSelectionAllowance | None,
+    frozen_reference: FrozenReference,
+) -> dict[str, object]:
+    """The settings a test service runs with, and their SHA-256."""
+
+    document: dict[str, object] = {
+        "admission_mode": admission_mode,
+        "production_configuration_hash": run_configuration_hash(production),
+        "candidate_configuration_hash": (
+            None if candidate is None else run_configuration_hash(candidate)
+        ),
+        "canary_settings": canary_settings.to_dict(),
+        "canary_assignment_seed": int(assignment_seed),
+        "task_selection_allowance": (
+            None if allowance is None else task_selection_allowance_document(allowance)
+        ),
+        "monitor_reference": {
+            "configuration_hash": frozen_reference.configuration_hash,
+            "baselines": [[name, value] for name, value in frozen_reference.baselines],
+        },
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    return {**document, "identity_sha256": hashlib.sha256(canonical.encode()).hexdigest()}
+
+
+def identity_from_dependencies(dependencies: ServiceDependencies) -> dict[str, object]:
+    return service_identity(
+        admission_mode=dependencies.admission_mode,
+        production=dependencies.registry.production,
+        candidate=dependencies.registry.candidate,
+        canary_settings=dependencies.canary_settings,
+        assignment_seed=dependencies.canary_assignment_seed,
+        allowance=dependencies.task_selection_allowance,
+        frozen_reference=dependencies.monitor.reference,
+    )
+
+
+def isolated_app(dependencies: ServiceDependencies):
+    """``create_app`` plus the two test-only routes; never used by ``serve.py``."""
+
+    app = create_app(dependencies)
+    identity = identity_from_dependencies(dependencies)
+    state = app.state.service_state
+    horizon = dependencies.canary_settings.stopping_rule.horizon_episodes
+
+    @app.get(IDENTITY_ROUTE)
+    async def get_identity() -> dict[str, object]:
+        return identity
+
+    @app.get(CANARY_ROUTE)
+    async def get_canary() -> dict[str, object]:
+        with state.deployment_lock:
+            controller = state.controller
+            if controller is None:
+                return {
+                    "admitted": False,
+                    "stopping_rule_observations": 0,
+                    "horizon_episodes": horizon,
+                }
+            snapshot = controller.snapshot()
+            return {
+                "admitted": True,
+                "state": snapshot.state,
+                "stopping_rule_observations": controller.detector_updates,
+                "candidate_episodes_served": snapshot.candidate_episodes_served,
+                "horizon_episodes": horizon,
+            }
+
+    return app
+
+
+def require_service_identity(service: ServiceClient, expected: dict[str, object]) -> None:
+    """Refuse a service whose loaded settings differ from the intended ones."""
+
+    response = service.get(IDENTITY_ROUTE)
+    if response.status_code != 200:
+        raise ServiceIdentityError(
+            "service has no test-only identity; it is not the isolated test service"
+        )
+    actual = response.json()
+    if not isinstance(actual, dict):
+        raise ServiceIdentityError("service identity is not an object")
+    mismatched = sorted(
+        key for key in set(expected) | set(actual) if expected.get(key) != actual.get(key)
+    )
+    if mismatched:
+        raise ServiceIdentityError(
+            "running service does not match the intended settings: " + ", ".join(mismatched)
+        )
 
 
 def fixture_artifact(inputs: Tier2Inputs) -> ValidationArtifact:
@@ -129,19 +251,19 @@ def fixture_artifact(inputs: Tier2Inputs) -> ValidationArtifact:
 def admission_checks(
     artifact: ValidationArtifact,
     inputs: Tier2Inputs,
-    allowance: object,
+    allowance: TaskSelectionAllowance | None,
 ) -> dict[str, bool]:
     """The fixture passes test admission and is refused by release admission."""
 
     production = inputs.traffic.production
     candidate = inputs.traffic.candidate
     try:
-        authorize_test_gated_candidate(artifact, production, candidate, allowance)  # type: ignore[arg-type]
+        authorize_test_gated_candidate(artifact, production, candidate, allowance)
         test_accepts = True
     except ProtocolError:
         test_accepts = False
     try:
-        authorize_gated_candidate(artifact, production, candidate, allowance)  # type: ignore[arg-type]
+        authorize_gated_candidate(artifact, production, candidate, allowance)
         release_refuses = False
     except ProtocolError:
         release_refuses = True
@@ -164,21 +286,28 @@ def _pair_checks(
         finished = {item.episode.episode_id for item in reader.load_finished_episodes()}
     finally:
         reader.close()
-    eligible = [
+    persisted = [
+        pair
+        for pair in pairs
+        if pair.reference.episode.episode_id in finished
+        and pair.candidate.episode.episode_id in finished
+    ]
+    both = [
         pair
         for pair in pairs
         if pair.reference.evaluator_outcome is not None
         and pair.candidate.evaluator_outcome is not None
     ]
     counts: dict[str, object] = {
-        "pairs": len(pairs),
-        "eligible_pairs": len(eligible),
-        "missing_evaluator_outcome": len(pairs) - len(eligible),
+        "pairs_executed": len(pair_ids),
+        "pairs_persisted": len(persisted),
+        "pairs_with_both_evaluator_outcomes": len(both),
+        "pairs_missing_an_evaluator_outcome": len(pairs) - len(both),
         "reference_success": sum(
-            1 for pair in eligible if pair.reference.evaluator_outcome.success  # type: ignore[union-attr]
+            1 for pair in both if pair.reference.evaluator_outcome.success  # type: ignore[union-attr]
         ),
         "candidate_success": sum(
-            1 for pair in eligible if pair.candidate.evaluator_outcome.success  # type: ignore[union-attr]
+            1 for pair in both if pair.candidate.evaluator_outcome.success  # type: ignore[union-attr]
         ),
         "candidate_status": dict(
             sorted(
@@ -199,11 +328,7 @@ def _pair_checks(
             pair.reference.episode.episode_id != pair.candidate.episode.episode_id
             for pair in pairs
         ),
-        "pair_episodes_persisted": all(
-            pair.reference.episode.episode_id in finished
-            and pair.candidate.episode.episode_id in finished
-            for pair in pairs
-        ),
+        "pair_episodes_persisted": len(persisted) == len(pair_ids),
     }
     return counts, checks
 
@@ -213,15 +338,15 @@ def run_tier2_test(
     *,
     store_path: Path,
     service: ServiceClient,
-    allowance: object,
+    allowance: TaskSelectionAllowance | None,
+    expected_identity: dict[str, object],
     git_commit: str,
 ) -> dict[str, object]:
-    """Admit the fixture through the service and run the real canary.
+    """Verify the service identity, admit the fixture, and run the real canary.
 
-    ``service`` is an HTTP client on a service whose store is
-    ``store_path``. The fixture is written to that store, then ``POST
-    /candidates`` decides: an isolated test service admits it, a release
-    service refuses it (``admission_refused``).
+    ``service`` is an HTTP client on an ``isolated_app`` whose store is
+    ``store_path``. Nothing is written and no model is called until the
+    service's identity equals ``expected_identity``.
     """
 
     traffic = inputs.traffic
@@ -229,42 +354,28 @@ def run_tier2_test(
         raise ConnectedLifecycleError("the Tier 2 test sends no Tier 3 arrivals")
     require_fresh_store(store_path)
     require_registered(service, traffic)
+    require_service_identity(service, expected_identity)
     artifact = fixture_artifact(inputs)
-    checks = admission_checks(artifact, inputs, allowance)
+    admission = admission_checks(artifact, inputs, allowance)
     writer = EpisodeStore(store_path)
     try:
         writer.append_validation_artifact(artifact)
     finally:
         writer.close()
-    stage, state = admit_and_run_canary(
+    stage = admit_and_run_canary(
         traffic,
         store_path=store_path,
         service=service,
         artifact_id=artifact.artifact_id,
     )
+    public = stage.public
     production_hash = run_configuration_hash(traffic.production)
     candidate_hash = run_configuration_hash(traffic.candidate)
-    if "deployment" not in stage:
-        deployment = service.get("/deployment").json()
-        stage["deployment"] = {
-            key: deployment.get(key)
-            for key in (
-                "admission",
-                "state",
-                "production_configuration_hash",
-                "candidate_configuration_hash",
-                "serving_configuration_hash",
-                "previous_production_configuration_hash",
-                "promoted_configuration_hash",
-                "candidate_episodes_served",
-                "served_before_rollback",
-                "monitor_period_id",
-            )
-        }
-    raw_pair_ids = stage.pop("canary_pair_ids", [])
-    pair_ids = [str(item) for item in raw_pair_ids] if isinstance(raw_pair_ids, list) else []
-    pairs, pair_checks = _pair_checks(store_path, pair_ids, production_hash, candidate_hash)
-    checks.update(pair_checks)
+    deployment = public.get("deployment")
+    if not isinstance(deployment, dict):
+        deployment = deployment_view(service.get("/deployment").json())
+    canary = service.get(CANARY_ROUTE).json()
+    pairs, integrity = _pair_checks(store_path, stage.pair_ids, production_hash, candidate_hash)
     reader = EpisodeStore(store_path)
     try:
         decisions = [
@@ -274,34 +385,66 @@ def run_tier2_test(
         ]
     finally:
         reader.close()
-    deployment = stage["deployment"]
-    assert isinstance(deployment, dict)
-    status = stage["status"]
-    if status != "admission_refused":
-        checks["controller_observed_every_pair"] = (
-            deployment.get("candidate_episodes_served") == len(pair_ids)
-            or deployment.get("served_before_rollback") == len(pair_ids)
+    status = public["status"]
+    admitted = status != "admission_refused"
+    admission_status = public.get("admission")
+    admission_verification: dict[str, object] = {
+        **admission,
+        "admitted": admitted,
+        "status_code": (
+            admission_status.get("status_code") if isinstance(admission_status, dict) else None
+        ),
+    }
+    final = decisions[-1] if decisions and decisions[-1].decision != "admit" else None
+    observations = int(canary.get("stopping_rule_observations", 0))
+    horizon = int(canary.get("horizon_episodes", 0))
+    executed = len(stage.pair_ids)
+    statistical = (
+        "complete"
+        if final is not None and final.method in STOPPING_RULE_METHODS and observations > 0
+        else "incomplete"
+    )
+    canary_execution: dict[str, object] = {
+        **pairs,
+        "pairs_eligible_for_stopping_rule": pairs["pairs_with_both_evaluator_outcomes"],
+        "stopping_rule_observations": observations,
+        "horizon_episodes": horizon,
+        "horizon_reached": observations >= horizon > 0,
+        "controller_decision": None if final is None else final.decision,
+        "controller_decision_method": None if final is None else final.method,
+        "final_state": deployment.get("state"),
+        "statistical_integration": statistical,
+    }
+    if admitted:
+        integrity["controller_served_every_pair"] = (
+            deployment.get("candidate_episodes_served") == executed
+            or deployment.get("served_before_rollback") == executed
         )
-        checks["admission_used_fixture"] = bool(decisions) and (
+        integrity["stopping_rule_received_every_eligible_pair"] = (
+            observations == pairs["pairs_with_both_evaluator_outcomes"]
+        )
+        integrity["admission_used_fixture"] = bool(decisions) and (
             decisions[0].decision == "admit"
             and decisions[0].evidence_artifact_id == artifact.artifact_id
             and decisions[0].evidence_source == "synthetic_fixture"
         )
     if status == "promoted":
-        checks["deployment_reflects_promotion"] = (
+        integrity["deployment_reflects_promotion"] = (
             deployment.get("state") == "PROMOTED"
             and deployment.get("serving_configuration_hash") == candidate_hash
-            and decisions[-1].decision == "promote"
+            and final is not None
+            and final.decision == "promote"
         )
     elif status in {"rolled_back", "canary_incomplete"}:
-        checks["candidate_traffic_closed"] = (
+        integrity["candidate_traffic_closed"] = (
             deployment.get("state") == "ROLLED_BACK"
             and deployment.get("serving_configuration_hash") == production_hash
-            and decisions[-1].decision == "rollback"
-            and (status == "rolled_back" or deployment.get("admission") == "rollback_requested")
+            and deployment.get("admission") == "rollback_requested"
+            and final is not None
+            and final.decision == "rollback"
         )
     else:
-        checks["refused_admission_left_no_decision"] = not decisions
+        integrity["refused_admission_left_no_decision"] = not decisions
     summary: dict[str, object] = {
         "record": RECORD,
         "version": VERSION,
@@ -310,17 +453,19 @@ def run_tier2_test(
         "admission_evidence_source": "synthetic_fixture",
         "git_commit": git_commit,
         "status": status,
-        "final_state": state,
         "configurations": {
             "production": production_hash,
             "candidate": candidate_hash,
             "gate_reference": run_configuration_hash(inputs.gate_reference),
             "gate_candidate": run_configuration_hash(inputs.gate_candidate),
         },
+        "service_identity_sha256": expected_identity.get("identity_sha256"),
         "fixture_artifact_id": artifact.artifact_id,
-        "admission": stage.get("admission"),
-        "tier2": stage.get("tier2"),
-        "cleanup": stage.get("cleanup"),
+        "admission_verification": admission_verification,
+        "tier2_executed": admitted and executed > 0,
+        "canary_execution": canary_execution,
+        "tier2": public.get("tier2"),
+        "cleanup": public.get("cleanup"),
         "deployment": deployment,
         "lifecycle_decisions": [
             {
@@ -333,12 +478,22 @@ def run_tier2_test(
             }
             for item in decisions
         ],
-        "pairs": pairs,
-        "checks": checks,
-        "verified": all(checks.values()),
+        "integrity_checks": integrity,
+        "integrity_verified": all(integrity.values()) and all(admission.values()),
     }
     assert_public_payload(summary)
     return summary
+
+
+def exit_code_for(summary: dict[str, object]) -> int:
+    """0 only when integrity holds, pairs ran, and the stopping rule decided."""
+
+    if not summary.get("integrity_verified") or not summary.get("tier2_executed"):
+        return 1
+    execution = summary.get("canary_execution")
+    if not isinstance(execution, dict) or execution.get("statistical_integration") != "complete":
+        return EXIT_INCOMPLETE
+    return 0
 
 
 def _under_results(path: Path) -> bool:
@@ -346,8 +501,12 @@ def _under_results(path: Path) -> bool:
     return any(parent.name == "results" for parent in (resolved, *resolved.parents))
 
 
+def _json(raw: str) -> object:
+    return json.loads(Path(raw).read_text(encoding="utf-8"))
+
+
 def _configuration(raw: str) -> RunConfiguration:
-    return RunConfiguration.from_dict(json.loads(Path(raw).read_text(encoding="utf-8")))
+    return RunConfiguration.from_dict(_json(raw))
 
 
 def load_inputs(args: argparse.Namespace, *, check_provenance: bool = True) -> Tier2Inputs:
@@ -380,9 +539,25 @@ def load_inputs(args: argparse.Namespace, *, check_provenance: bool = True) -> T
     )
 
 
-def _allowance(args: argparse.Namespace) -> object:
-    return task_selection_allowance_from_dict(
-        json.loads(Path(args.task_selection_allowance).read_text(encoding="utf-8"))
+def load_allowance(args: argparse.Namespace) -> TaskSelectionAllowance:
+    return task_selection_allowance_from_dict(_json(args.task_selection_allowance))
+
+
+def intended_identity(args: argparse.Namespace, inputs: Tier2Inputs) -> dict[str, object]:
+    """The identity the test service must report, from the intended files."""
+
+    monitor = MonitorSettings.from_dict(_json(args.monitor_settings))
+    frozen = serve._frozen_reference(_json(args.frozen_reference))
+    if monitor.reference_configuration_hash != frozen.configuration_hash:
+        raise ConfigError("monitor settings reference hash must match the frozen reference")
+    return service_identity(
+        admission_mode="test",
+        production=inputs.traffic.production,
+        candidate=inputs.traffic.candidate,
+        canary_settings=CanarySettings.from_dict(_json(args.canary_settings)),
+        assignment_seed=int(args.canary_assignment_seed),
+        allowance=load_allowance(args),
+        frozen_reference=frozen,
     )
 
 
@@ -429,7 +604,7 @@ def service_arguments(args: argparse.Namespace) -> argparse.Namespace:
     )
 
 
-def isolated_service_dependencies(args: argparse.Namespace):
+def isolated_service_dependencies(args: argparse.Namespace) -> ServiceDependencies:
     """``serve.py``'s dependencies with test admission; nothing else changes."""
 
     built = serve._build_dependencies(service_arguments(args))
@@ -441,16 +616,20 @@ def preflight(args: argparse.Namespace, *, check_provenance: bool = True) -> dic
 
     inputs = load_inputs(args, check_provenance=check_provenance)
     require_isolated_target(Path(args.store), int(args.port))
-    allowance = _allowance(args)
+    allowance = load_allowance(args)
+    expected = intended_identity(args, inputs)
     artifact = fixture_artifact(inputs)
-    checks = admission_checks(artifact, inputs, allowance)
+    checks: dict[str, bool] = dict(admission_checks(artifact, inputs, allowance))
     with TemporaryDirectory() as scratch:
-        scratch_args = argparse.Namespace(**{**vars(args), "store": str(Path(scratch) / "x.sqlite")})
+        scratch_args = argparse.Namespace(
+            **{**vars(args), "store": str(Path(scratch) / "preflight.sqlite")}
+        )
         dependencies = isolated_service_dependencies(scratch_args)
         dependencies.store.close()
+    built = identity_from_dependencies(dependencies)
     canary = dependencies.canary_settings
     arrivals = len(inputs.traffic.canary_task_ids)
-    checks["service_dependencies_built"] = dependencies.admission_mode == "test"
+    checks["service_identity_matches_intended"] = built == expected
     checks["canary_fraction_is_one"] = canary.fraction == 1.0
     checks["arrivals_cover_horizon"] = arrivals >= canary.stopping_rule.horizon_episodes
     summary: dict[str, object] = {
@@ -459,14 +638,8 @@ def preflight(args: argparse.Namespace, *, check_provenance: bool = True) -> dic
         "test_only_admission": True,
         "gate_executed": False,
         "provider_calls": 0,
-        "configurations": {
-            "production": run_configuration_hash(inputs.traffic.production),
-            "candidate": run_configuration_hash(inputs.traffic.candidate),
-            "gate_reference": run_configuration_hash(inputs.gate_reference),
-            "gate_candidate": run_configuration_hash(inputs.gate_candidate),
-        },
         "git_commit": inputs.traffic.production.git_commit,
-        "canary": canary.to_dict(),
+        "service_identity": expected,
         "canary_arrivals": arrivals,
         "max_execute_episodes": 2 * arrivals,
         "checks": checks,
@@ -481,7 +654,15 @@ def _fail(error: BaseException, code: int) -> int:
     return code
 
 
-_INVALID = (ConfigError, ConnectedLifecycleError, ProtocolError, OSError, ValueError, KeyError, TypeError)
+_INVALID = (
+    ConfigError,
+    ConnectedLifecycleError,
+    ProtocolError,
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+)
 
 
 def _main_preflight(args: argparse.Namespace) -> int:
@@ -502,9 +683,7 @@ def _main_serve(args: argparse.Namespace) -> int:
         return _fail(error, EXIT_INVALID)
     import uvicorn
 
-    from llm_behavior_ci.service import create_app
-
-    uvicorn.run(create_app(dependencies), host=HOST, port=int(args.port))
+    uvicorn.run(isolated_app(dependencies), host=HOST, port=int(args.port))
     return 0
 
 
@@ -514,7 +693,8 @@ def _main_drive(args: argparse.Namespace) -> int:
     output = Path(args.summary)
     try:
         inputs = load_inputs(args)
-        allowance = _allowance(args)
+        allowance = load_allowance(args)
+        expected = intended_identity(args, inputs)
         store = Path(args.store)
         if not store.is_file():
             raise ConfigError("--store must be the running test service's store")
@@ -529,14 +709,17 @@ def _main_drive(args: argparse.Namespace) -> int:
                 store_path=store,
                 service=client,
                 allowance=allowance,
+                expected_identity=expected,
                 git_commit=inputs.traffic.production.git_commit,
             )
         with output.open("x", encoding="utf-8") as handle:
             handle.write(json.dumps(summary, sort_keys=True) + "\n")
+    except ServiceIdentityError as error:
+        return _fail(error, EXIT_INVALID)
     except Exception as error:
         return _fail(error, EXIT_FAILURE)
     print(json.dumps(summary, sort_keys=True))
-    return 0 if summary["verified"] else 1
+    return exit_code_for(summary)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -555,15 +738,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--dev-task-set",
             "--task-selection-allowance",
             "--canary-arrivals",
+            "--canary-settings",
+            "--monitor-settings",
+            "--frozen-reference",
             "--store",
             "--port",
         ):
             command.add_argument(flag, required=True)
-        if name != "drive":
-            for flag in ("--canary-settings", "--monitor-settings", "--frozen-reference"):
-                command.add_argument(flag, required=True)
-            command.add_argument("--canary-assignment-seed", default="3")
-        else:
+        command.add_argument("--canary-assignment-seed", default="3")
+        if name == "drive":
             command.add_argument("--summary", required=True)
     try:
         args = parser.parse_args(args_list)
