@@ -255,6 +255,33 @@ Admission (`POST /candidates`, HTTP 409 on refusal) accepts only a stored `gate_
 
 Hosted roles take no `--*-base-url`. Endpoints route by configuration hash, so a promoted candidate keeps serving from its own route while the monitor compares it with the previous production reference.
 
+### 8a. Connected three-tier dev run (documented, not run)
+
+`scripts/demo/run_three_tier_dev.py live` replaces step 7 and the manual `curl` in step 8 with one command. Start `serve.py` exactly as in step 8, on a fresh `--store`. Then run:
+
+```bash
+py scripts/demo/run_three_tier_dev.py live \
+  --gate-reference data/processed/configs/glm_general_train.json \
+  --gate-candidate data/processed/configs/glm_general_train_reasoning_disabled.json \
+  --task-set data/processed/train_gate.json \
+  --gate-settings data/processed/gate_settings.json \
+  --plan-evidence data/processed/plan_evidence_hosted.json \
+  --production-config data/processed/configs/glm_general_dev.json \
+  --candidate-config data/processed/configs/glm_general_dev_reasoning_disabled.json \
+  --dev-task-set data/processed/dev_calibration.json \
+  --canary-arrivals 10 --production-arrivals 10 \
+  --service-url http://127.0.0.1:8000 \
+  --store data/processed/three_tier_dev.sqlite
+```
+
+For this dev run, set `fraction` to `1.0` in the local canary settings file passed to `serve.py --canary-settings`. Set `--canary-arrivals` to at least that file's `stopping_rule.horizon_episodes`. Each arrival is one request that the service routes. At a fraction below `1.0`, some canary arrivals go to production, so 10 arrivals at a fraction of `0.1` do not guarantee 10 candidate pairs. A canary that runs out of arrivals before its horizon ends as `canary_incomplete`. This applies only to the local dev settings; it changes no production default or threshold.
+
+The command has no model-specific logic. A vLLM gate takes `--reference-endpoint` and `--candidate-endpoint`, a hosted gate takes neither, and `serve.py` takes the matching `--*-base-url`. Before the gate runs, it refuses a dirty tree or a configuration not built at HEAD. It also refuses a store that already holds decisions or episodes, a service whose registered hashes differ from the dev files, and a `kl` requirement on a hosted configuration. The gate artifact goes into `--store`. A BLOCK stops before admission. A PASS is admitted only by the service's release admission and allowance. The canary arrivals run until the controller promotes or rolls back. After a promotion, the production arrivals are Tier 3: the service sends them to the promoted configuration, and its monitor compares them against the previous production configuration. After a rollback, the same arrivals are reported as `fallback_verification` and must all go to the known-good configuration. If the canary arrivals run out before the controller decides, the command calls `POST /deployment/rollback`, which records a `manual_rollback` decision, not a stopping-rule decision. It then checks that the candidate is closed and the known-good configuration serves, and reports `canary_incomplete` with a `cleanup` entry. If that check fails, the command reports an execution failure. The JSON summary holds the gate result, the admission status, receipts by role and hash, the deployment state, and the stored decisions, alerts, and episode counts.
+
+Exit codes: `0` promoted; `1` blocked, rolled back, or admission refused; `2` invalid invocation or input, before any model call; `3` `canary_incomplete` after a confirmed cleanup rollback; `4` execution or infrastructure failure, with no summary. The summary is printed for every completed status.
+
+Every episode costs provider spend or GPU time. The canary, monitor, and frozen-reference files are still local DRAFT settings. `synthetic --scenario blocked|healthy|regression` runs the same function on injected runtimes, with `serve.py`'s own dependency builder and test admission. It is an engineering test: it exits `0` when the scenario reaches its expected outcome (blocked, promoted, rolled back), and `1` when it does not.
+
 ### 9. Dev stream rehearsal
 
 ```bash
