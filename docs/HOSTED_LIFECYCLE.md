@@ -255,6 +255,8 @@ Admission (`POST /candidates`, HTTP 409 on refusal) accepts only a stored `gate_
 
 Hosted roles take no `--*-base-url`. Endpoints route by configuration hash, so a promoted candidate keeps serving from its own route while the monitor compares it with the previous production reference.
 
+On restart against the same `--store`, the service reads its last deployment decision back from SQLite before serving. A stored promotion must name the registered candidate as promoted over the registered production. The promoted candidate then serves again, compared against that production in the same monitoring period, so an open incident does not alert twice. A stored rollback keeps production and refuses the rolled-back candidate at `POST /candidates`. An admission with no promotion or rollback after it is closed with a persisted `restart_with_unfinished_canary` rollback, and candidate traffic does not resume. A stored decision whose hashes differ from the registered configurations stops startup. `GET /deployment` reports the recovered state with `recovered_from_store`.
+
 ### 8a. Connected three-tier dev run (documented, not run)
 
 `scripts/demo/run_three_tier_dev.py live` replaces step 7 and the manual `curl` in step 8 with one command. Start `serve.py` exactly as in step 8, on a fresh `--store`. Then run:

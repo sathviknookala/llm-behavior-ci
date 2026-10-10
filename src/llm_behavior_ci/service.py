@@ -87,6 +87,8 @@ _FORBIDDEN_OVERRIDE_FIELDS = frozenset(
     }
 )
 _TERMINAL_CANARY = frozenset({"ROLLED_BACK", "PROMOTED"})
+_LIFECYCLE_DECISIONS = frozenset({"admit", "promote", "rollback"})
+_UNFINISHED_AT_RESTART = "restart_with_unfinished_canary"
 _ACTIVE_CANARY = frozenset({"GATE_PASSED", "CANARY_ACTIVE"})
 
 
@@ -212,11 +214,23 @@ class _EpisodeRequest:
     assignment_key: str | None
 
 
+@dataclass(frozen=True)
+class _RecoveredDeployment:
+    """The terminal deployment state a restarted service read back from its store."""
+
+    state: Literal["PROMOTED", "ROLLED_BACK"]
+    previous_production_configuration_hash: str
+    promoted_configuration_hash: str | None
+    rejected_candidate_configuration_hash: str | None
+    method: str
+
+
 class _ServiceState:
     def __init__(self, dependencies: ServiceDependencies) -> None:
         self.dependencies = dependencies
         self.admission = "open"
         self.controller: CanaryController | None = None
+        self.recovered: _RecoveredDeployment | None = None
         self.serving_configuration = dependencies.registry.production
         self.monitor_period_id = dependencies.monitor.period_id
         self.alert_sink = LocalAlertSink(
@@ -605,6 +619,23 @@ def _deployment_document(state: _ServiceState) -> dict[str, object]:
     controller = state.controller
     if controller is not None:
         document.update(_snapshot_fields(controller.snapshot()))
+    elif state.recovered is not None:
+        recovered = state.recovered
+        document.update(
+            {
+                "state": recovered.state,
+                "serving_configuration_hash": production_hash,
+                "previous_production_configuration_hash": (
+                    recovered.previous_production_configuration_hash
+                ),
+                "promoted_configuration_hash": recovered.promoted_configuration_hash,
+                "rejected_candidate_configuration_hash": (
+                    recovered.rejected_candidate_configuration_hash
+                ),
+                "recovered_from_store": True,
+                "recovered_decision_method": recovered.method,
+            }
+        )
     return document
 
 
@@ -638,6 +669,155 @@ def _persist_lifecycle_decision(
     )
 
 
+def _serve_promoted(
+    state: _ServiceState,
+    promoted: RunConfiguration,
+    previous_hash: str,
+) -> None:
+    """Serve ``promoted`` and monitor it against ``previous_hash`` in its own period."""
+
+    state.serving_configuration = promoted
+    current = state.dependencies.monitor.reference
+    new_period = monitoring_period_id(run_configuration_hash(promoted), previous_hash)
+    state.dependencies.monitor.reset_for_promotion(
+        FrozenReference(
+            configuration_hash=previous_hash,
+            baselines=current.baselines,
+            slice_baselines=current.slice_baselines,
+            source=current.source,
+        ),
+        period_id=new_period,
+    )
+    for distributional in (
+        state.dependencies.tool_selection_monitor,
+        state.dependencies.task_mix_monitor,
+    ):
+        if distributional is not None:
+            distributional.reset(
+                reference_configuration_hash=previous_hash,
+                period_id=new_period,
+            )
+    state.monitor_period_id = new_period
+
+
+def _admitted_candidate_hash(
+    state: _ServiceState,
+    admit: DeploymentDecisionRecord,
+) -> str | None:
+    """The registered candidate's hash when ``admit``'s artifact authorized it, else ``None``.
+
+    This identifies the candidate a stored admission let in; it is not an
+    admission, so synthetic evidence is accepted here.
+    """
+
+    registry = state.dependencies.registry
+    if registry.candidate is None:
+        return None
+    if admit.evidence_artifact_id is None:
+        raise ServiceError("stored admission names no validation artifact")
+    artifact = state.dependencies.store.load_validation_artifact(admit.evidence_artifact_id)
+    if artifact is None:
+        raise ServiceError("stored admission's validation artifact is not recorded")
+    try:
+        admission = authorize_test_gated_candidate(
+            artifact,
+            registry.production,
+            registry.candidate,
+            allowance=state.dependencies.task_selection_allowance,
+        )
+    except ProtocolError:
+        return None
+    return admission.served_candidate_configuration_hash
+
+
+def _reconcile_deployment(state: _ServiceState) -> None:
+    """Restore the last stored deployment decision at startup, or refuse to start.
+
+    No decision keeps the registered production. A stored promotion must
+    name the registered candidate as promoted over the registered
+    production; it is served again against that production in the same
+    monitoring period. A stored rollback keeps production and refuses the
+    candidate that admission let in. An admission with no promotion or
+    rollback after it is closed with a persisted rollback decision, so
+    candidate traffic never resumes. A decision whose hashes do not match the
+    registered configurations raises ``ServiceError``.
+    """
+
+    dependencies = state.dependencies
+    store = dependencies.store
+    rows = [
+        row
+        for row in store.load_deployment_decisions()
+        if row.signal == "deployment" and row.decision in _LIFECYCLE_DECISIONS
+    ]
+    if not rows:
+        return
+    registry = dependencies.registry
+    production_hash = run_configuration_hash(registry.production)
+    candidate_hash = (
+        None if registry.candidate is None else run_configuration_hash(registry.candidate)
+    )
+    last = rows[-1]
+    if last.decision == "promote":
+        if (
+            registry.candidate is None
+            or last.configuration_hash != candidate_hash
+            or last.reference_configuration_hash != production_hash
+        ):
+            raise ServiceError(
+                "stored promotion does not match the registered production and "
+                "candidate configurations"
+            )
+        _serve_promoted(state, registry.candidate, production_hash)
+        state.recovered = _RecoveredDeployment(
+            state="PROMOTED",
+            previous_production_configuration_hash=production_hash,
+            promoted_configuration_hash=candidate_hash,
+            rejected_candidate_configuration_hash=None,
+            method=last.method,
+        )
+        return
+    if (
+        last.configuration_hash != production_hash
+        or last.reference_configuration_hash != production_hash
+    ):
+        raise ServiceError(
+            f"stored {last.decision} decision does not match the registered "
+            "production configuration"
+        )
+    admits = [row for row in rows if row.decision == "admit"]
+    if not admits:
+        raise ServiceError("stored rollback has no admission before it")
+    rejected = _admitted_candidate_hash(state, admits[-1])
+    method = last.method
+    if last.decision == "admit":
+        method = _UNFINISHED_AT_RESTART
+        store.append_deployment_decision(
+            DeploymentDecisionRecord(
+                configuration_hash=production_hash,
+                reference_configuration_hash=production_hash,
+                signal="deployment",
+                slice_name="canary",
+                decision="rollback",
+                method=method,
+                estimate=0.0,
+                boundary=None,
+                sample_size=0,
+                decided_at=dependencies.clock(),
+                evidence_artifact_id=last.evidence_artifact_id,
+                evidence_source=last.evidence_source,
+            )
+        )
+    state.admission = "rollback_requested"
+    state.recovered = _RecoveredDeployment(
+        state="ROLLED_BACK",
+        previous_production_configuration_hash=production_hash,
+        promoted_configuration_hash=None,
+        rejected_candidate_configuration_hash=rejected,
+        method=method,
+    )
+
+
 def _apply_canary_decision(
     state: _ServiceState,
     decision: CanaryDecision,
@@ -646,31 +826,11 @@ def _apply_canary_decision(
         registry = state.dependencies.registry
         if registry.candidate is None:
             raise _Conflict("candidate configuration is not registered")
-        state.serving_configuration = registry.candidate
-        previous_hash = decision.snapshot.previous_production_configuration_hash
-        current = state.dependencies.monitor.reference
-        new_period = monitoring_period_id(
-            run_configuration_hash(registry.candidate), previous_hash
+        _serve_promoted(
+            state,
+            registry.candidate,
+            decision.snapshot.previous_production_configuration_hash,
         )
-        state.dependencies.monitor.reset_for_promotion(
-            FrozenReference(
-                configuration_hash=previous_hash,
-                baselines=current.baselines,
-                slice_baselines=current.slice_baselines,
-                source=current.source,
-            ),
-            period_id=new_period,
-        )
-        for distributional in (
-            state.dependencies.tool_selection_monitor,
-            state.dependencies.task_mix_monitor,
-        ):
-            if distributional is not None:
-                distributional.reset(
-                    reference_configuration_hash=previous_hash,
-                    period_id=new_period,
-                )
-        state.monitor_period_id = new_period
         decided_at = decision.snapshot.promoted_at
         if decided_at is None:
             decided_at = state.dependencies.clock()
@@ -865,6 +1025,13 @@ def _admit_candidate(state: _ServiceState, artifact_id: str) -> dict[str, object
         raise _Conflict(
             "final-test admission is not performed by this service"
         )
+    recovered = state.recovered
+    if recovered is not None and state.controller is None:
+        candidate_hash = run_configuration_hash(registry.candidate)
+        if recovered.promoted_configuration_hash == candidate_hash:
+            raise _Conflict("the registered candidate is already promoted")
+        if recovered.rejected_candidate_configuration_hash == candidate_hash:
+            raise _Conflict("the registered candidate was rolled back")
     artifact = state.dependencies.store.load_validation_artifact(artifact_id)
     if artifact is None:
         raise _Conflict("validation artifact is not recorded")
@@ -940,6 +1107,7 @@ def create_app(dependencies: ServiceDependencies) -> FastAPI:
     async def lifespan(app: FastAPI):
         del app
         state.admission = "open"
+        _reconcile_deployment(state)
         yield
         state.admission = "shutting_down"
         deadline = monotonic() + float(

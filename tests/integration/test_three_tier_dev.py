@@ -29,7 +29,7 @@ from llm_behavior_ci.lifecycle.connected import (
 from llm_behavior_ci.lifecycle.monitoring import monitoring_period_id
 from llm_behavior_ci.lifecycle.offline_gate import GateCapabilityError
 from llm_behavior_ci.runtime.episode import RuntimeUnavailable
-from llm_behavior_ci.service import create_app
+from llm_behavior_ci.service import ConfigurationRegistry, ServiceError, create_app
 from llm_behavior_ci.storage import EpisodeStore
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -433,6 +433,157 @@ class ThreeTierDevLifecycleTests(unittest.TestCase):
         with self.assertRaises(ConnectedLifecycleError):
             self._run("healthy", traffic=swapped)
         self.assertEqual(self._artifact_count(), 0)
+
+
+class ServiceRestartTests(unittest.TestCase):
+    """A restarted service reads its last deployment decision back from SQLite."""
+
+    def setUp(self) -> None:
+        self._tmpdir = TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+
+    def _first_run(self, scenario: str, **traffic_changes):
+        lifecycle = demo.build_synthetic(scenario, self.root)
+        traffic = replace(lifecycle.traffic, **traffic_changes)
+        with TestClient(create_app(lifecycle.dependencies)) as client:
+            summary = run_three_tier_dev(
+                lifecycle.gate, traffic, store_path=lifecycle.store_path, service=client
+            )
+        self.production_hash = run_configuration_hash(traffic.production)
+        self.candidate_hash = run_configuration_hash(traffic.candidate)
+        self.store_path = lifecycle.store_path
+        return summary
+
+    def _restart(self, **dependency_changes) -> TestClient:
+        lifecycle = demo.build_synthetic("healthy", self.root)
+        client = TestClient(create_app(replace(lifecycle.dependencies, **dependency_changes)))
+        client.__enter__()
+        self.addCleanup(client.__exit__, None, None, None)
+        return client
+
+    def _decisions(self):
+        reader = EpisodeStore(self.store_path)
+        try:
+            return reader.load_deployment_decisions(), reader.load_alerts()
+        finally:
+            reader.close()
+
+    def test_a_promotion_survives_restart(self) -> None:
+        summary = self._first_run("healthy")
+        artifact_id = summary["tier1"]["artifact_id"]
+        decisions_before, alerts_before = self._decisions()
+        self.assertEqual(len(alerts_before), 1)
+
+        client = self._restart()
+        deployment = client.get("/deployment").json()
+        self.assertEqual(deployment["state"], "PROMOTED")
+        self.assertTrue(deployment["recovered_from_store"])
+        self.assertEqual(deployment["serving_configuration_hash"], self.candidate_hash)
+        self.assertEqual(deployment["production_configuration_hash"], self.candidate_hash)
+        self.assertEqual(deployment["promoted_configuration_hash"], self.candidate_hash)
+        self.assertEqual(
+            deployment["previous_production_configuration_hash"], self.production_hash
+        )
+        self.assertEqual(
+            deployment["monitor_period_id"],
+            monitoring_period_id(self.candidate_hash, self.production_hash),
+        )
+
+        served = client.post(
+            "/episodes",
+            json={"task_id": demo.REGRESS_TASK_IDS[0], "mode": "execute", "assignment_key": "r"},
+        )
+        self.assertEqual(served.status_code, 200)
+        self.assertEqual(served.json()["role"], "production")
+        self.assertEqual(served.json()["configuration_hash"], self.candidate_hash)
+        self.assertEqual(served.json()["monitoring_status"], "updated")
+        self.assertEqual(
+            client.post("/candidates", json={"artifact_id": artifact_id}).status_code, 409
+        )
+        decisions_after, alerts_after = self._decisions()
+        self.assertEqual(decisions_after, decisions_before)
+        self.assertEqual(alerts_after, alerts_before)
+
+    def test_a_rollback_survives_restart(self) -> None:
+        summary = self._first_run("regression")
+        artifact_id = summary["tier1"]["artifact_id"]
+        decisions_before, _ = self._decisions()
+
+        client = self._restart()
+        deployment = client.get("/deployment").json()
+        self.assertEqual(deployment["state"], "ROLLED_BACK")
+        self.assertEqual(deployment["admission"], "rollback_requested")
+        self.assertEqual(deployment["serving_configuration_hash"], self.production_hash)
+        self.assertIsNone(deployment["promoted_configuration_hash"])
+        self.assertEqual(
+            deployment["rejected_candidate_configuration_hash"], self.candidate_hash
+        )
+        self.assertEqual(deployment["recovered_decision_method"], "stopping_rule_alarm")
+
+        candidate = client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-0", "mode": "execute", "role": "candidate"},
+        )
+        self.assertEqual(candidate.status_code, 409)
+        routed = client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-0", "mode": "execute", "assignment_key": "r"},
+        )
+        self.assertEqual(routed.json()["configuration_hash"], self.production_hash)
+        readmit = client.post("/candidates", json={"artifact_id": artifact_id})
+        self.assertEqual(readmit.status_code, 409)
+        self.assertIn("rolled back", readmit.json()["detail"])
+        self.assertEqual(self._decisions()[0], decisions_before)
+
+    def test_an_unfinished_canary_is_closed_at_restart(self) -> None:
+        lifecycle = demo.build_synthetic("healthy", self.root)
+        self.store_path = lifecycle.store_path
+        self.production_hash = run_configuration_hash(lifecycle.traffic.production)
+        self.candidate_hash = run_configuration_hash(lifecycle.traffic.candidate)
+        short = replace(lifecycle.traffic, canary_task_ids=demo.CANARY_TASK_IDS[:1])
+        with TestClient(create_app(lifecycle.dependencies)) as real:
+            service = RollbackOverride(real, lambda inner: FakeResponse(503, {}))
+            with self.assertRaises(ConnectedLifecycleError):
+                run_three_tier_dev(
+                    lifecycle.gate, short, store_path=lifecycle.store_path, service=service
+                )
+            self.assertEqual(real.get("/deployment").json()["state"], "CANARY_ACTIVE")
+        self.assertEqual([row.decision for row in self._decisions()[0]], ["admit"])
+
+        client = self._restart()
+        deployment = client.get("/deployment").json()
+        self.assertEqual(deployment["state"], "ROLLED_BACK")
+        self.assertEqual(deployment["serving_configuration_hash"], self.production_hash)
+        self.assertEqual(
+            deployment["rejected_candidate_configuration_hash"], self.candidate_hash
+        )
+        decisions = self._decisions()[0]
+        self.assertEqual([row.decision for row in decisions], ["admit", "rollback"])
+        self.assertEqual(decisions[1].method, "restart_with_unfinished_canary")
+        candidate = client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-1", "mode": "execute", "role": "candidate"},
+        )
+        self.assertEqual(candidate.status_code, 409)
+        routed = client.post(
+            "/episodes",
+            json={"task_id": "dev-canary-1", "mode": "execute", "assignment_key": "r"},
+        )
+        self.assertEqual(routed.json()["configuration_hash"], self.production_hash)
+
+    def test_a_stored_decision_for_other_configurations_refuses_startup(self) -> None:
+        self._first_run("healthy")
+        lifecycle = demo.build_synthetic("healthy", self.root)
+        swapped = ConfigurationRegistry(
+            production=lifecycle.dependencies.registry.candidate,
+            candidate=lifecycle.dependencies.registry.production,
+        )
+        app = create_app(replace(lifecycle.dependencies, registry=swapped))
+        with self.assertRaises(ServiceError) as caught:
+            with TestClient(app):
+                pass
+        self.assertIn("stored promotion does not match", str(caught.exception))
 
 
 def _live_argv(root: Path, **overrides: str) -> list[str]:
