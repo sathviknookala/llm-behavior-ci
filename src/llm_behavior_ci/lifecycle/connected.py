@@ -154,7 +154,7 @@ def require_fresh_store(store_path: Path) -> None:
         reader.close()
 
 
-def _require_registered(service: ServiceClient, traffic: DevTraffic) -> dict[str, object]:
+def require_registered(service: ServiceClient, traffic: DevTraffic) -> dict[str, object]:
     deployment = _json(service.get("/deployment"), "GET /deployment")
     if deployment.get("production_configuration_hash") != run_configuration_hash(
         traffic.production
@@ -228,7 +228,7 @@ def _receipts(receipts: Sequence[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def _deployment_view(deployment: dict[str, object]) -> dict[str, object]:
+def deployment_view(deployment: dict[str, object]) -> dict[str, object]:
     keys = (
         "admission",
         "state",
@@ -244,7 +244,7 @@ def _deployment_view(deployment: dict[str, object]) -> dict[str, object]:
     return {key: deployment.get(key) for key in keys}
 
 
-def _evidence(store_path: Path, artifact_id: str) -> dict[str, object]:
+def lifecycle_evidence(store_path: Path, artifact_id: str) -> dict[str, object]:
     reader = EpisodeStore(store_path)
     try:
         artifact = reader.load_validation_artifact(artifact_id)
@@ -330,62 +330,37 @@ def _roll_back_incomplete_canary(
     }
 
 
-def run_three_tier_dev(
-    gate: GateInputs,
+def admit_and_run_canary(
     traffic: DevTraffic,
     *,
     store_path: Path,
     service: ServiceClient,
-) -> dict[str, object]:
-    """Run Tier 1, admission, Tier 2, and Tier 3 against one service and one store.
+    artifact_id: str,
+) -> tuple[dict[str, object], str | None]:
+    """Admission and Tier 2: ``POST /candidates``, then canary arrivals.
 
-    ``service`` is an HTTP client bound to a service whose store is
-    ``store_path``: a ``TestClient`` in process, or an ``httpx.Client`` on
-    a running ``serve.py``. Status is ``blocked``, ``admission_refused``,
-    ``canary_incomplete``, ``promoted``, or ``rolled_back``. A canary whose
-    arrivals run out before its rule decides is rolled back through the
-    service and reported as ``canary_incomplete`` with a ``cleanup`` entry;
-    an unconfirmed cleanup raises. Arrivals after PROMOTED are ``tier3``;
-    after ROLLED_BACK they are ``fallback_verification``, and either raises
-    when the service routed one to the wrong configuration. Gate execution
-    errors and capability refusals propagate before anything is persisted.
+    The artifact behind ``artifact_id`` must already be in the service's
+    store; the service's own admission mode decides whether it is accepted.
+    Returns the summary entries and the final canary state. An
+    ``admission_refused`` or ``canary_incomplete`` result is complete, with
+    ``deployment`` and ``evidence`` read back; after PROMOTED or ROLLED_BACK
+    the caller continues. A failed arrival rolls the canary back through
+    the service before the error propagates.
     """
 
-    if not isinstance(gate, GateInputs):
-        raise ConnectedLifecycleError("gate must be GateInputs")
-    if not isinstance(traffic, DevTraffic):
-        raise ConnectedLifecycleError("traffic must be DevTraffic")
-    require_fresh_store(store_path)
-    _require_registered(service, traffic)
-
-    decision = _run_gate(gate)
-    _persist_artifact(store_path, decision)
-    artifact_id = decision.artifact.artifact_id
-    summary: dict[str, object] = {
-        "record": "three_tier_dev_lifecycle",
-        "tier1": _tier1(decision),
-    }
-    if decision.outcome != "PASS":
-        summary["status"] = "blocked"
-        summary["deployment"] = _deployment_view(
-            _json(service.get("/deployment"), "GET /deployment")
-        )
-        summary["evidence"] = _evidence(store_path, artifact_id)
-        assert_public_payload(summary)
-        return summary
-
+    stage: dict[str, object] = {}
     response = service.post("/candidates", json={"artifact_id": artifact_id})
     admission: dict[str, object] = {"status_code": response.status_code}
-    summary["admission"] = admission
+    stage["admission"] = admission
     if response.status_code != 200:
         admission["detail"] = _detail(response)
-        summary["status"] = "admission_refused"
-        summary["deployment"] = _deployment_view(
+        stage["status"] = "admission_refused"
+        stage["deployment"] = deployment_view(
             _json(service.get("/deployment"), "GET /deployment")
         )
-        summary["evidence"] = _evidence(store_path, artifact_id)
-        assert_public_payload(summary)
-        return summary
+        stage["evidence"] = lifecycle_evidence(store_path, artifact_id)
+        assert_public_payload(stage)
+        return stage, None
     admitted = _json(response, "POST /candidates")
     if admitted.get("candidate_configuration_hash") != run_configuration_hash(
         traffic.candidate
@@ -415,17 +390,75 @@ def run_three_tier_dev(
                     f"canary failed ({failure}) and cleanup rollback failed ({cleanup})"
                 ) from failure
         raise
-    summary["tier2"] = {**_receipts(canary), "state": state}
+    stage["tier2"] = {**_receipts(canary), "state": state}
+    stage["canary_pair_ids"] = [
+        str(item["pair_id"]) for item in canary if item.get("pair_id") is not None
+    ]
     if state not in _TERMINAL:
-        summary["cleanup"] = _roll_back_incomplete_canary(service, production_hash)
-        summary["status"] = "canary_incomplete"
-        summary["deployment"] = _deployment_view(
+        stage["cleanup"] = _roll_back_incomplete_canary(service, production_hash)
+        stage["status"] = "canary_incomplete"
+        stage["deployment"] = deployment_view(
             _json(service.get("/deployment"), "GET /deployment")
         )
-        summary["evidence"] = _evidence(store_path, artifact_id)
+        stage["evidence"] = lifecycle_evidence(store_path, artifact_id)
+        assert_public_payload(stage)
+        return stage, None if state is None else str(state)
+    stage["status"] = _STATUS[str(state)]
+    return stage, str(state)
+
+
+def run_three_tier_dev(
+    gate: GateInputs,
+    traffic: DevTraffic,
+    *,
+    store_path: Path,
+    service: ServiceClient,
+) -> dict[str, object]:
+    """Run Tier 1, admission, Tier 2, and Tier 3 against one service and one store.
+
+    ``service`` is an HTTP client bound to a service whose store is
+    ``store_path``: a ``TestClient`` in process, or an ``httpx.Client`` on
+    a running ``serve.py``. Status is ``blocked``, ``admission_refused``,
+    ``canary_incomplete``, ``promoted``, or ``rolled_back``. A canary whose
+    arrivals run out before its rule decides is rolled back through the
+    service and reported as ``canary_incomplete`` with a ``cleanup`` entry;
+    an unconfirmed cleanup raises. Arrivals after PROMOTED are ``tier3``;
+    after ROLLED_BACK they are ``fallback_verification``, and either raises
+    when the service routed one to the wrong configuration. Gate execution
+    errors and capability refusals propagate before anything is persisted.
+    """
+
+    if not isinstance(gate, GateInputs):
+        raise ConnectedLifecycleError("gate must be GateInputs")
+    if not isinstance(traffic, DevTraffic):
+        raise ConnectedLifecycleError("traffic must be DevTraffic")
+    require_fresh_store(store_path)
+    require_registered(service, traffic)
+
+    decision = _run_gate(gate)
+    _persist_artifact(store_path, decision)
+    artifact_id = decision.artifact.artifact_id
+    summary: dict[str, object] = {
+        "record": "three_tier_dev_lifecycle",
+        "tier1": _tier1(decision),
+    }
+    if decision.outcome != "PASS":
+        summary["status"] = "blocked"
+        summary["deployment"] = deployment_view(
+            _json(service.get("/deployment"), "GET /deployment")
+        )
+        summary["evidence"] = lifecycle_evidence(store_path, artifact_id)
         assert_public_payload(summary)
         return summary
 
+    stage, state = admit_and_run_canary(
+        traffic, store_path=store_path, service=service, artifact_id=artifact_id
+    )
+    summary.update(stage)
+    if state not in _TERMINAL:
+        return summary
+
+    production_hash = run_configuration_hash(traffic.production)
     expected_hash = (
         run_configuration_hash(traffic.candidate) if state == "PROMOTED" else production_hash
     )
@@ -439,13 +472,13 @@ def run_three_tier_dev(
             f"{len(misrouted)} production arrivals after {state} were not served by "
             "the expected configuration"
         )
-    stage = "tier3" if state == "PROMOTED" else "fallback_verification"
-    summary[stage] = _receipts(production)
+    label = "tier3" if state == "PROMOTED" else "fallback_verification"
+    summary[label] = _receipts(production)
     summary["status"] = _STATUS[str(state)]
-    summary["deployment"] = _deployment_view(
+    summary["deployment"] = deployment_view(
         _json(service.get("/deployment"), "GET /deployment")
     )
-    summary["evidence"] = _evidence(store_path, artifact_id)
+    summary["evidence"] = lifecycle_evidence(store_path, artifact_id)
     assert_public_payload(summary)
     return summary
 
