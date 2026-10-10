@@ -14,12 +14,19 @@ promoted configuration and feeds to its production monitor. After
 ROLLED_BACK the same arrivals only verify that the known-good
 configuration still serves. The summary is read back from the store and
 ``GET /deployment``, never from the runner's own bookkeeping.
+
+Consecutive releases each use a fresh store. ``release_summary`` reduces
+one run to a public ``release-summary-v1`` document, and
+``require_release_lineage`` refuses release N+1 unless its production
+configuration is the one release N left serving, at the same commit.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -38,10 +45,20 @@ from llm_behavior_ci.tasks.selection import TaskSet
 
 _TERMINAL = frozenset({"PROMOTED", "ROLLED_BACK"})
 _STATUS = {"PROMOTED": "promoted", "ROLLED_BACK": "rolled_back"}
+_LIFECYCLE_DECISIONS = frozenset({"admit", "promote", "rollback"})
+RELEASE_SUMMARY_RECORD = "release_summary"
+RELEASE_SUMMARY_VERSION = "release-summary-v1"
+RELEASE_STATUSES = frozenset(
+    {"blocked", "admission_refused", "canary_incomplete", "promoted", "rolled_back"}
+)
 
 
 class ConnectedLifecycleError(RuntimeError):
     """The lifecycle cannot continue; no later stage ran."""
+
+
+class ReleaseLineageError(ConnectedLifecycleError):
+    """Release N+1 does not continue from the configuration release N left serving."""
 
 
 class ServiceClient(Protocol):
@@ -119,13 +136,19 @@ def _detail(response: Any) -> str:
     return ""
 
 
-def _require_fresh_store(store_path: Path) -> None:
+def require_fresh_store(store_path: Path) -> None:
+    """Refuse a store that already holds a gate artifact, decision, or episode."""
+
     reader = EpisodeStore(store_path)
     try:
-        if reader.load_deployment_decisions() or reader.load_finished_episodes():
+        if (
+            reader.load_validation_artifact_ids()
+            or reader.load_deployment_decisions()
+            or reader.load_finished_episodes()
+        ):
             raise ConnectedLifecycleError(
-                "store already holds deployment decisions or episodes; "
-                "one lifecycle needs its own store"
+                "store already holds validation artifacts, deployment decisions, "
+                "or episodes; one lifecycle needs its own store"
             )
     finally:
         reader.close()
@@ -332,7 +355,7 @@ def run_three_tier_dev(
         raise ConnectedLifecycleError("gate must be GateInputs")
     if not isinstance(traffic, DevTraffic):
         raise ConnectedLifecycleError("traffic must be DevTraffic")
-    _require_fresh_store(store_path)
+    require_fresh_store(store_path)
     _require_registered(service, traffic)
 
     decision = _run_gate(gate)
@@ -425,3 +448,160 @@ def run_three_tier_dev(
     summary["evidence"] = _evidence(store_path, artifact_id)
     assert_public_payload(summary)
     return summary
+
+
+def release_summary(
+    summary: Mapping[str, object],
+    traffic: DevTraffic,
+    *,
+    lineage: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Reduce one ``run_three_tier_dev`` summary to a public release record.
+
+    ``serving`` is the configuration the service serves after the run, the
+    one release N+1 must start from. ``known_good`` is the production
+    configuration this release started from, and ``frozen_reference`` is
+    the reference the store's last lifecycle decision was measured
+    against. Holds hashes, outcomes, and counts only.
+    """
+
+    if not isinstance(traffic, DevTraffic):
+        raise ConnectedLifecycleError("traffic must be DevTraffic")
+    status = summary.get("status")
+    if status not in RELEASE_STATUSES:
+        raise ConnectedLifecycleError(f"unknown lifecycle status {status}")
+    deployment = summary["deployment"]
+    evidence = summary["evidence"]
+    tier1 = summary["tier1"]
+    if not isinstance(deployment, Mapping) or not isinstance(evidence, Mapping):
+        raise ConnectedLifecycleError("summary has no deployment or evidence")
+    if not isinstance(tier1, Mapping):
+        raise ConnectedLifecycleError("summary has no tier1 decision")
+    serving = deployment.get("serving_configuration_hash") or deployment.get(
+        "production_configuration_hash"
+    )
+    if serving != deployment.get("production_configuration_hash"):
+        raise ConnectedLifecycleError("service reports two serving configurations")
+    production_hash = run_configuration_hash(traffic.production)
+    candidate_hash = run_configuration_hash(traffic.candidate)
+    expected_serving = candidate_hash if status == "promoted" else production_hash
+    if serving != expected_serving:
+        raise ConnectedLifecycleError(
+            f"service serves a configuration that a {status} release does not leave serving"
+        )
+    decisions = [
+        item
+        for item in _sequence(evidence.get("deployment_decisions"))
+        if item.get("decision") in _LIFECYCLE_DECISIONS
+    ]
+    last = decisions[-1] if decisions else None
+    alerts = _sequence(evidence.get("alerts"))
+    document: dict[str, object] = {
+        "record": RELEASE_SUMMARY_RECORD,
+        "version": RELEASE_SUMMARY_VERSION,
+        "git_commit": traffic.production.git_commit,
+        "status": status,
+        "configurations": {
+            "production": production_hash,
+            "candidate": candidate_hash,
+            "serving": serving,
+            "known_good": production_hash,
+            "frozen_reference": (
+                None if last is None else last.get("reference_configuration_hash")
+            ),
+        },
+        "gate": {
+            key: tier1.get(key)
+            for key in (
+                "outcome",
+                "reason_codes",
+                "artifact_id",
+                "evidence_source",
+                "reference_configuration_hash",
+                "candidate_configuration_hash",
+                "task_set_hash",
+            )
+        },
+        "deployment": {
+            "decision": None if last is None else last.get("decision"),
+            "method": None if last is None else last.get("method"),
+            "decisions": [item.get("decision") for item in decisions],
+            "state": deployment.get("state"),
+            "admission": deployment.get("admission"),
+            "candidate_episodes_served": deployment.get("candidate_episodes_served"),
+        },
+        "monitoring": {
+            "monitor_period_id": deployment.get("monitor_period_id"),
+            "tier3_arrivals": _arrivals(summary.get("tier3")),
+            "fallback_verification_arrivals": _arrivals(
+                summary.get("fallback_verification")
+            ),
+            "alerts": len(alerts),
+            "alerts_by_signal": dict(
+                sorted(Counter(str(item.get("signal")) for item in alerts).items())
+            ),
+        },
+        "lineage": None if lineage is None else dict(lineage),
+    }
+    assert_public_payload(document)
+    return document
+
+
+def require_release_lineage(
+    previous: object,
+    production: RunConfiguration,
+) -> dict[str, object]:
+    """Accept release N+1 only if its production is what release N left serving.
+
+    The configuration hash includes ``git_commit``, and live preflight
+    binds every configuration to HEAD, so a release at another commit
+    cannot continue a lineage: that is refused by name rather than by a
+    rehashed history.
+    """
+
+    if (
+        not isinstance(previous, Mapping)
+        or previous.get("record") != RELEASE_SUMMARY_RECORD
+        or previous.get("version") != RELEASE_SUMMARY_VERSION
+    ):
+        raise ReleaseLineageError("previous release is not a release-summary-v1 record")
+    if previous.get("status") not in RELEASE_STATUSES:
+        raise ReleaseLineageError("previous release has no lifecycle status")
+    configurations = previous.get("configurations")
+    if not isinstance(configurations, Mapping):
+        raise ReleaseLineageError("previous release records no configurations")
+    serving = configurations.get("serving")
+    if not isinstance(serving, str) or serving == "":
+        raise ReleaseLineageError("previous release records no serving configuration")
+    if previous.get("git_commit") != production.git_commit:
+        raise ReleaseLineageError(
+            f"previous release ran at commit {previous.get('git_commit')} and this "
+            f"release at {production.git_commit}; cross-commit rollout is not supported"
+        )
+    if run_configuration_hash(production) != serving:
+        raise ReleaseLineageError(
+            "production configuration is not the configuration the previous release "
+            "left serving"
+        )
+    canonical = json.dumps(previous, sort_keys=True, separators=(",", ":"))
+    return {
+        "previous_release_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "previous_status": previous["status"],
+        "previous_serving_configuration_hash": serving,
+        "previous_known_good_configuration_hash": configurations.get("known_good"),
+        "previous_frozen_reference_configuration_hash": configurations.get(
+            "frozen_reference"
+        ),
+    }
+
+
+def _sequence(value: object) -> list[Mapping[str, object]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _arrivals(stage: object) -> int:
+    if not isinstance(stage, Mapping):
+        return 0
+    return int(stage.get("arrivals", 0))

@@ -1,0 +1,99 @@
+name: Release lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "synthetic: deterministic scenarios on a hosted CPU runner. live: one release on the trusted runner (main only, protected environment)."
+        type: choice
+        options:
+          - synthetic
+          - live
+        default: synthetic
+      release_id:
+        description: "live only: the provisioned release directory under LIFECYCLE_RELEASE_ROOT"
+        type: string
+        default: ""
+      previous_release_id:
+        description: "live only: the release this one continues; empty for the first release"
+        type: string
+        default: ""
+      canary_arrivals:
+        description: "live only: dev arrivals offered to the canary"
+        type: string
+        default: ""
+      production_arrivals:
+        description: "live only: dev arrivals after the canary decides"
+        type: string
+        default: ""
+      confirm_live:
+        description: "live only: repeat release_id to authorize live execution"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic:
+    if: inputs.mode == 'synthetic'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - blocked
+          - healthy
+          - regression
+    env:
+      PYTHONPATH: src
+      SCENARIO: ${{ matrix.scenario }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r environments/test-requirements.txt
+      - name: Run and verify the synthetic scenario
+        run: python scripts/demo/run_three_tier_dev.py synthetic --scenario "$SCENARIO"
+
+  live:
+    if: >-
+      inputs.mode == 'live'
+      && github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+      && github.repository == 'sathviknookala/llm-behavior-ci'
+    runs-on: [self-hosted, linux, llm-behavior-ci-release]
+    environment: release-live
+    timeout-minutes: 360
+    concurrency:
+      group: release-lifecycle-live
+      cancel-in-progress: false
+    env:
+      PYTHONPATH: src
+      RELEASE_ID: ${{ inputs.release_id }}
+      PREVIOUS_RELEASE_ID: ${{ inputs.previous_release_id }}
+      CANARY_ARRIVALS: ${{ inputs.canary_arrivals }}
+      PRODUCTION_ARRIVALS: ${{ inputs.production_arrivals }}
+      CONFIRM_LIVE: ${{ inputs.confirm_live }}
+      LIFECYCLE_RELEASE_ROOT: ${{ vars.LIFECYCLE_RELEASE_ROOT }}
+      LIFECYCLE_SERVICE_URL: ${{ vars.LIFECYCLE_SERVICE_URL }}
+      LIFECYCLE_PYTHON: ${{ vars.LIFECYCLE_PYTHON }}
+      LIFECYCLE_REFERENCE_ENDPOINT: ${{ vars.LIFECYCLE_REFERENCE_ENDPOINT }}
+      LIFECYCLE_CANDIDATE_ENDPOINT: ${{ vars.LIFECYCLE_CANDIDATE_ENDPOINT }}
+    steps:
+      - name: Require explicit authorization
+        run: |
+          test -n "$RELEASE_ID"
+          test "$CONFIRM_LIVE" = "$RELEASE_ID"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run the release lifecycle
+        run: bash scripts/ci/run_live_release.sh

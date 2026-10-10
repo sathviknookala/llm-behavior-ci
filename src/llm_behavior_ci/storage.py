@@ -797,6 +797,15 @@ class EpisodeStore:
 
         return self._run("append_validation_artifact", write)
 
+    def load_validation_artifact_ids(self) -> tuple[str, ...]:
+        def read(connection: sqlite3.Connection) -> tuple[str, ...]:
+            rows = connection.execute(
+                "SELECT artifact_id FROM validation_artifacts ORDER BY artifact_id"
+            ).fetchall()
+            return tuple(artifact_id for (artifact_id,) in rows)
+
+        return self._run("load_validation_artifact_ids", read)
+
     def load_validation_artifact(
         self,
         artifact_id: str,

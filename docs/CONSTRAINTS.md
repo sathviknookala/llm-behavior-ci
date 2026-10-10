@@ -53,6 +53,7 @@ GitHub advises that self-hosted runners should almost never be used with public 
 So:
 
 - The current GitHub-hosted CPU job installs `environments/test-requirements.txt` and runs unit tests, the plan-only gate CI tests, the synthetic integration contract, the local validity suite, exit-2 checks on the gate, benchmark, replay, serve, and protocol-lock commands, and the synthetic connected lifecycle. Lint is still absent. `STUDY_BUDGETS` in `experiments/validation.py` caps a `cpu_fast` or `gpu` run at 40 seeds, sample size 64, horizon 64, 40 permutations, 200 resamples, and 20,000 work units. A `simulation` run caps at 2,000 seeds, sample size 5,000, horizon 5,000, 2,000 permutations, 20,000 resamples, and 5,000,000 work units. `gpu` uses the `cpu_fast` cap for its CPU portion. These caps are runner limits. They are not α, a harm margin, or a stopping rule.
+- `.github/workflows/release-lifecycle.yml` is manual dispatch only. Its `synthetic` mode runs the three demo scenarios on a GitHub-hosted CPU runner. Its `live` mode needs `main`, the `release-live` environment, and a self-hosted runner labelled `llm-behavior-ci-release`. No such runner is registered (`HOSTED_LIFECYCLE.md` step 8b).
 - The GPU gate runs either on a self-hosted runner triggered only by pushes to protected branches or by manual dispatch, never by fork pull requests, or as a local `make gate` whose result is posted as a commit status.
 - Ask Sathvik before registering any runner (`DECISIONS.md` D12).
 

@@ -12,8 +12,13 @@ worlds, a lazily opened store, and test admission, because the artifact is
 ``live`` runs the same function against a ``serve.py`` already listening
 on --service-url with --store, and builds plan runtimes with the
 ``LiveRuntimeFactory``. It refuses a dirty tree, a non-train gate, a
-non-dev service, and a store under results/. Exit codes are in ``main``.
-Bare invocation exits 2.
+non-dev service, and a store under results/. The store must already be
+the running service's store and hold nothing: one release, one store.
+--release-summary names a new file for the public ``release-summary-v1``
+record. --previous-release names release N's record; release N+1 is
+refused before any model call unless its production configuration is the
+one release N left serving, at the same commit. Exit codes are in
+``main``. Bare invocation exits 2.
 """
 
 from __future__ import annotations
@@ -45,6 +50,9 @@ from llm_behavior_ci.lifecycle.connected import (
     ConnectedLifecycleError,
     DevTraffic,
     GateInputs,
+    release_summary,
+    require_fresh_store,
+    require_release_lineage,
     run_three_tier_dev,
 )
 from llm_behavior_ci.lifecycle.offline_gate import GateExecutionError
@@ -375,6 +383,9 @@ def live_inputs(args: argparse.Namespace) -> tuple[GateInputs, DevTraffic]:
 
     if _under_results(Path(args.store)):
         raise ConfigError("store must not be under results/")
+    if not Path(args.store).is_file():
+        raise ConfigError("--store must be the running service's existing store")
+    require_fresh_store(Path(args.store))
     gate_reference = _load_configuration(args.gate_reference)
     gate_candidate = _load_configuration(args.gate_candidate)
     production = _load_configuration(args.production_config)
@@ -418,6 +429,27 @@ def live_inputs(args: argparse.Namespace) -> tuple[GateInputs, DevTraffic]:
         ),
     )
     return gate, traffic
+
+
+def release_inputs(
+    args: argparse.Namespace, production: RunConfiguration
+) -> dict[str, object] | None:
+    """Check the release-summary path and, with --previous-release, the lineage."""
+
+    output = Path(args.release_summary)
+    if output.exists():
+        raise ConfigError("--release-summary must name a new file")
+    if _under_results(output):
+        raise ConfigError("--release-summary must not be under results/")
+    if args.previous_release is None:
+        return None
+    previous = json.loads(Path(args.previous_release).read_text(encoding="utf-8"))
+    return require_release_lineage(previous, production)
+
+
+def write_release_summary(path: Path, document: dict[str, object]) -> None:
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(document, sort_keys=True) + "\n")
 
 
 def run_live(
@@ -474,6 +506,7 @@ def _main_synthetic(scenario: str) -> int:
 def _main_live(args: argparse.Namespace) -> int:
     try:
         gate, traffic = live_inputs(args)
+        lineage = release_inputs(args, traffic.production)
     except (
         ConfigError,
         ConnectedLifecycleError,
@@ -493,6 +526,13 @@ def _main_live(args: argparse.Namespace) -> int:
     code = LIVE_EXIT_CODES.get(str(summary.get("status")))
     if code is None:
         return _fail(RuntimeError(f"unknown lifecycle status {summary.get('status')}"), EXIT_FAILURE)
+    try:
+        write_release_summary(
+            Path(args.release_summary),
+            release_summary(summary, traffic, lineage=lineage),
+        )
+    except Exception as error:
+        return _fail(error, EXIT_FAILURE)
     print(json.dumps(summary, sort_keys=True))
     return code
 
@@ -501,7 +541,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Exit codes: synthetic 0 when the scenario's expected outcome is verified,
     1 when it is not; live 0 promoted, 1 blocked, rolled back, or admission
     refused, 3 canary incomplete after a confirmed cleanup rollback; 2 for an
-    invalid invocation or input; 4 for an execution or infrastructure failure.
+    invalid invocation or input, including a broken release lineage; 4 for an
+    execution or infrastructure failure, or a release summary that could not
+    be written.
     """
 
     args_list = list(sys.argv[1:] if argv is None else argv)
@@ -525,8 +567,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--production-arrivals",
         "--service-url",
         "--store",
+        "--release-summary",
     ):
         live.add_argument(name, required=True)
+    live.add_argument("--previous-release", default=None)
     live.add_argument("--reference-endpoint", default=None)
     live.add_argument("--candidate-endpoint", default=None)
     try:
