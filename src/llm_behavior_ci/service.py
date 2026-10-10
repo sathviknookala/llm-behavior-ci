@@ -87,9 +87,15 @@ _FORBIDDEN_OVERRIDE_FIELDS = frozenset(
     }
 )
 _TERMINAL_CANARY = frozenset({"ROLLED_BACK", "PROMOTED"})
-_LIFECYCLE_DECISIONS = frozenset({"admit", "promote", "rollback"})
+_PRODUCTION_ROLLBACK = "production_rollback"
+_LIFECYCLE_DECISIONS = frozenset({"admit", "promote", "rollback", _PRODUCTION_ROLLBACK})
 _UNFINISHED_AT_RESTART = "restart_with_unfinished_canary"
 _ACTIVE_CANARY = frozenset({"GATE_PASSED", "CANARY_ACTIVE"})
+_PRODUCTION_ROLLBACK_METHODS = frozenset({"monitor_alert", "manual_rollback"})
+_SUPERSEDED = "superseded"
+POST_PROMOTION_ROLLBACK_POLICIES = ("record_only", "rollback_on_alert")
+ROLLBACK_SIGNAL = "task_success"
+PRODUCTION_ROLLED_BACK = "PRODUCTION_ROLLED_BACK"
 
 
 ModeName = Literal["plan", "execute"]
@@ -126,6 +132,7 @@ class ServiceDependencies:
     plan_kl_mean_nats_for: Callable[[EpisodeResult], float | None] | None = None
     admission_mode: Literal["release", "test"] = "release"
     alert_dedup_seconds: float = 0.0
+    post_promotion_rollback: Literal["record_only", "rollback_on_alert"] = "record_only"
 
     def __post_init__(self) -> None:
         try:
@@ -202,6 +209,11 @@ class ServiceDependencies:
                 raise ValueError("plan_kl_mean_nats_for must be callable or None")
             if self.admission_mode not in {"release", "test"}:
                 raise ValueError("admission_mode must be release or test")
+            if self.post_promotion_rollback not in POST_PROMOTION_ROLLBACK_POLICIES:
+                raise ValueError(
+                    "post_promotion_rollback must be one of: "
+                    + ", ".join(POST_PROMOTION_ROLLBACK_POLICIES)
+                )
         except ValueError as error:
             raise ServiceError(error) from error
 
@@ -225,12 +237,35 @@ class _RecoveredDeployment:
     method: str
 
 
+@dataclass(frozen=True)
+class _ProductionRollback:
+    """A post-promotion rollback: the promoted configuration stopped serving.
+
+    ``source`` is ``production_monitor`` (an eligible alert in this
+    process), ``operator`` (``POST /deployment/rollback``), or
+    ``restart_reconciliation`` (an eligible alert found at startup with no
+    rollback after it). ``persisted`` is false only while the decision row
+    could not be written; the known-good configuration serves regardless.
+    """
+
+    rolled_back_configuration_hash: str
+    restored_configuration_hash: str
+    rolled_back_period_id: str
+    method: str
+    source: str
+    trigger: Alert | None
+    decided_at: datetime
+    persisted: bool
+    recovered: bool
+
+
 class _ServiceState:
     def __init__(self, dependencies: ServiceDependencies) -> None:
         self.dependencies = dependencies
         self.admission = "open"
         self.controller: CanaryController | None = None
         self.recovered: _RecoveredDeployment | None = None
+        self.production_rollback: _ProductionRollback | None = None
         self.serving_configuration = dependencies.registry.production
         self.monitor_period_id = dependencies.monitor.period_id
         self.alert_sink = LocalAlertSink(
@@ -429,6 +464,8 @@ def _feed_monitor(
     observation; ``task_mix`` is recorded whenever the caller's metadata
     names one. Both are routed to their configured ``DistributionalMonitor``
     when the deployment wires one, never coerced into a scalar signal.
+    The caller holds ``deployment_lock``, so a rollback the delivered alerts
+    trigger (``_apply_rollback_policy``) cannot interleave with routing.
     Every fed signal's metadata is persisted (``EpisodeStore.
     append_monitor_metadata``) beside the already-persisted episode, so a
     later reader can reconstruct the exact detector input this call used.
@@ -546,7 +583,7 @@ def _feed_monitor(
             recorded = True
 
     if all_alerts:
-        state.alert_sink.deliver(all_alerts)
+        _apply_rollback_policy(state, state.alert_sink.deliver(all_alerts))
     if updated:
         return "updated"
     if recorded:
@@ -615,6 +652,7 @@ def _deployment_document(state: _ServiceState) -> dict[str, object]:
         "production_configuration_hash": production_hash,
         "candidate_configuration_hash": candidate_hash,
         "monitor_period_id": state.monitor_period_id,
+        "post_promotion_rollback": state.dependencies.post_promotion_rollback,
     }
     controller = state.controller
     if controller is not None:
@@ -636,7 +674,48 @@ def _deployment_document(state: _ServiceState) -> dict[str, object]:
                 "recovered_decision_method": recovered.method,
             }
         )
+    rollback = state.production_rollback
+    if rollback is not None:
+        document.update(
+            {
+                "state": PRODUCTION_ROLLED_BACK,
+                "serving_configuration_hash": production_hash,
+                "previous_production_configuration_hash": (
+                    rollback.restored_configuration_hash
+                ),
+                "promoted_configuration_hash": rollback.rolled_back_configuration_hash,
+                "rolled_back_configuration_hash": rollback.rolled_back_configuration_hash,
+                "production_rollback": _production_rollback_fields(rollback),
+            }
+        )
     return document
+
+
+def _production_rollback_fields(rollback: _ProductionRollback) -> dict[str, object]:
+    trigger = rollback.trigger
+    return {
+        "method": rollback.method,
+        "source": rollback.source,
+        "decided_at": rollback.decided_at.isoformat(),
+        "rolled_back_configuration_hash": rollback.rolled_back_configuration_hash,
+        "restored_configuration_hash": rollback.restored_configuration_hash,
+        "rolled_back_period_id": rollback.rolled_back_period_id,
+        "persisted": rollback.persisted,
+        "recovered_from_store": rollback.recovered,
+        "trigger": (
+            None
+            if trigger is None
+            else {
+                "signal": trigger.signal,
+                "slice_name": trigger.slice_name,
+                "method": trigger.method,
+                "estimate": trigger.estimate,
+                "boundary": trigger.boundary,
+                "sample_size": trigger.sample_size,
+                "period_id": trigger.period_id,
+            }
+        ),
+    }
 
 
 def _persist_lifecycle_decision(
@@ -669,6 +748,39 @@ def _persist_lifecycle_decision(
     )
 
 
+def _start_monitoring_period(state: _ServiceState, serving_hash: str, reference_hash: str) -> None:
+    """Monitor ``serving_hash`` against ``reference_hash`` in their own period.
+
+    Detectors are rebuilt from the same frozen baselines, bound to
+    ``reference_hash``. A monitor already in that period is left as it is.
+    """
+
+    monitor = state.dependencies.monitor
+    period = monitoring_period_id(serving_hash, reference_hash)
+    if monitor.period_id != period:
+        current = monitor.reference
+        monitor.reset_for_promotion(
+            FrozenReference(
+                configuration_hash=reference_hash,
+                baselines=current.baselines,
+                slice_baselines=current.slice_baselines,
+                source=current.source,
+            ),
+            period_id=period,
+        )
+        for distributional in (
+            state.dependencies.tool_selection_monitor,
+            state.dependencies.task_mix_monitor,
+        ):
+            if distributional is not None:
+                distributional.reset(
+                    reference_configuration_hash=reference_hash,
+                    period_id=period,
+                )
+    state.monitor_period_id = period
+    state.incidents_restored = False
+
+
 def _serve_promoted(
     state: _ServiceState,
     promoted: RunConfiguration,
@@ -677,27 +789,173 @@ def _serve_promoted(
     """Serve ``promoted`` and monitor it against ``previous_hash`` in its own period."""
 
     state.serving_configuration = promoted
-    current = state.dependencies.monitor.reference
-    new_period = monitoring_period_id(run_configuration_hash(promoted), previous_hash)
-    state.dependencies.monitor.reset_for_promotion(
-        FrozenReference(
-            configuration_hash=previous_hash,
-            baselines=current.baselines,
-            slice_baselines=current.slice_baselines,
-            source=current.source,
-        ),
-        period_id=new_period,
-    )
-    for distributional in (
-        state.dependencies.tool_selection_monitor,
-        state.dependencies.task_mix_monitor,
+    _start_monitoring_period(state, run_configuration_hash(promoted), previous_hash)
+
+
+def _serve_known_good(state: _ServiceState) -> None:
+    """Serve the registered production again, monitored against itself.
+
+    Its period is the one the service started in before admission, never
+    the rolled-back configuration's, so fallback traffic is not scored as
+    if it belonged to the failed promotion.
+    """
+
+    production = state.dependencies.registry.production
+    production_hash = run_configuration_hash(production)
+    state.serving_configuration = production
+    _start_monitoring_period(state, production_hash, production_hash)
+
+
+def _promoted_lineage(state: _ServiceState) -> tuple[str, str] | None:
+    """``(promoted hash, previous production hash)`` while a promotion serves."""
+
+    if state.production_rollback is not None:
+        return None
+    controller = state.controller
+    if controller is not None:
+        snapshot = controller.snapshot()
+        if snapshot.state != "PROMOTED":
+            return None
+        return (
+            snapshot.serving_configuration_hash,
+            snapshot.previous_production_configuration_hash,
+        )
+    recovered = state.recovered
+    if (
+        recovered is not None
+        and recovered.state == "PROMOTED"
+        and recovered.promoted_configuration_hash is not None
     ):
-        if distributional is not None:
-            distributional.reset(
-                reference_configuration_hash=previous_hash,
-                period_id=new_period,
+        return (
+            recovered.promoted_configuration_hash,
+            recovered.previous_production_configuration_hash,
+        )
+    return None
+
+
+def _is_rollback_alert(alert: Alert, promoted_hash: str, previous_hash: str) -> bool:
+    """Whether ``alert`` is the aggregate ``task_success`` incident of this promotion."""
+
+    return (
+        alert.signal == ROLLBACK_SIGNAL
+        and alert.slice_name == ROLLBACK_SIGNAL
+        and alert.configuration_hash == promoted_hash
+        and alert.reference_configuration_hash == previous_hash
+        and alert.period_id == monitoring_period_id(promoted_hash, previous_hash)
+    )
+
+
+def _stored_rollback_alert(
+    state: _ServiceState,
+    promoted_hash: str,
+    previous_hash: str,
+) -> Alert | None:
+    for record in state.dependencies.store.load_alerts(signal=ROLLBACK_SIGNAL):
+        alert = Alert.from_record(record)
+        if _is_rollback_alert(alert, promoted_hash, previous_hash):
+            return alert
+    return None
+
+
+def _persist_production_rollback(state: _ServiceState, rollback: _ProductionRollback) -> None:
+    trigger = rollback.trigger
+    state.dependencies.store.append_deployment_decision(
+        DeploymentDecisionRecord(
+            configuration_hash=rollback.rolled_back_configuration_hash,
+            reference_configuration_hash=rollback.restored_configuration_hash,
+            signal="deployment",
+            slice_name="production",
+            decision=_PRODUCTION_ROLLBACK,
+            method=rollback.method,
+            estimate=0.0 if trigger is None else trigger.estimate,
+            boundary=None if trigger is None else trigger.boundary,
+            sample_size=0 if trigger is None else trigger.sample_size,
+            decided_at=rollback.decided_at,
+            evidence_source=rollback.source,
+            period_id=rollback.rolled_back_period_id,
+            trigger_signal=None if trigger is None else trigger.signal,
+        )
+    )
+    state.production_rollback = replace(rollback, persisted=True)
+
+
+def _roll_back_production(
+    state: _ServiceState,
+    *,
+    method: str,
+    source: str,
+    trigger: Alert | None,
+) -> None:
+    """Stop serving the promoted configuration and serve the previous production.
+
+    The one post-promotion transition, shared by the monitor policy, the
+    manual endpoint, and restart reconciliation; the caller holds
+    ``deployment_lock`` or runs before the app serves. The canary controller
+    is not touched: it stays PROMOTED as the record of Tier 2. The previous
+    production must be the registered production and the promoted
+    configuration the registered candidate. Routing switches before the
+    decision is written, so a failed write still leaves the known-good
+    configuration serving; the write is retried by the next call. A call
+    after the rollback changes nothing.
+    """
+
+    existing = state.production_rollback
+    if existing is not None:
+        if not existing.persisted:
+            _persist_production_rollback(state, existing)
+        return
+    lineage = _promoted_lineage(state)
+    if lineage is None:
+        raise _Conflict("no promoted deployment to roll back")
+    promoted_hash, previous_hash = lineage
+    registry = state.dependencies.registry
+    if previous_hash != run_configuration_hash(registry.production):
+        raise _Conflict("the promotion's previous production is not the registered production")
+    if registry.candidate is None or promoted_hash != run_configuration_hash(registry.candidate):
+        raise _Conflict("the promoted configuration is not the registered candidate")
+    rollback = _ProductionRollback(
+        rolled_back_configuration_hash=promoted_hash,
+        restored_configuration_hash=previous_hash,
+        rolled_back_period_id=monitoring_period_id(promoted_hash, previous_hash),
+        method=method,
+        source=source,
+        trigger=trigger,
+        decided_at=state.dependencies.clock(),
+        persisted=False,
+        recovered=False,
+    )
+    state.production_rollback = rollback
+    state.admission = "rollback_requested"
+    _serve_known_good(state)
+    _persist_production_rollback(state, rollback)
+
+
+def _apply_rollback_policy(state: _ServiceState, delivered: tuple[Alert, ...]) -> None:
+    """Under ``rollback_on_alert``, roll a promotion back on its first eligible new alert.
+
+    Only alerts ``LocalAlertSink`` newly delivered reach here, so a
+    de-duplicated or restored incident never acts twice. Eligible means the
+    aggregate ``task_success`` alert of the configuration being served
+    against the frozen previous production, in the current monitoring
+    period; other signals, slices, and periods are recorded only.
+    """
+
+    if state.dependencies.post_promotion_rollback != "rollback_on_alert":
+        return
+    lineage = _promoted_lineage(state)
+    if lineage is None:
+        return
+    promoted_hash, previous_hash = lineage
+    if state.dependencies.monitor.reference.configuration_hash != previous_hash:
+        return
+    for alert in delivered:
+        if alert.period_id == state.monitor_period_id and _is_rollback_alert(
+            alert, promoted_hash, previous_hash
+        ):
+            _roll_back_production(
+                state, method="monitor_alert", source="production_monitor", trigger=alert
             )
-    state.monitor_period_id = new_period
+            return
 
 
 def _admitted_candidate_hash(
@@ -739,7 +997,11 @@ def _reconcile_deployment(state: _ServiceState) -> None:
     monitoring period. A stored rollback keeps production and refuses the
     candidate that admission let in. An admission with no promotion or
     rollback after it is closed with a persisted rollback decision, so
-    candidate traffic never resumes. A decision whose hashes do not match the
+    candidate traffic never resumes. A stored ``production_rollback`` after
+    its promotion serves the previous production again and refuses the
+    candidate (``_recover_production_rollback``). A promotion whose eligible
+    alert was stored with no rollback after it is rolled back now under
+    ``rollback_on_alert``. A decision whose hashes do not match the
     registered configurations raises ``ServiceError``.
     """
 
@@ -758,6 +1020,11 @@ def _reconcile_deployment(state: _ServiceState) -> None:
         None if registry.candidate is None else run_configuration_hash(registry.candidate)
     )
     last = rows[-1]
+    if last.decision == _PRODUCTION_ROLLBACK:
+        _recover_production_rollback(state, rows)
+        return
+    if any(row.decision == _PRODUCTION_ROLLBACK for row in rows):
+        raise ServiceError("a stored production rollback is followed by another lifecycle decision")
     if last.decision == "promote":
         if (
             registry.candidate is None
@@ -776,6 +1043,15 @@ def _reconcile_deployment(state: _ServiceState) -> None:
             rejected_candidate_configuration_hash=None,
             method=last.method,
         )
+        if dependencies.post_promotion_rollback == "rollback_on_alert":
+            alert = _stored_rollback_alert(state, candidate_hash, production_hash)
+            if alert is not None:
+                _roll_back_production(
+                    state,
+                    method="monitor_alert",
+                    source="restart_reconciliation",
+                    trigger=alert,
+                )
         return
     if (
         last.configuration_hash != production_hash
@@ -816,6 +1092,78 @@ def _reconcile_deployment(state: _ServiceState) -> None:
         rejected_candidate_configuration_hash=rejected,
         method=method,
     )
+
+
+def _recover_production_rollback(
+    state: _ServiceState,
+    rows: list[DeploymentDecisionRecord],
+) -> None:
+    """Serve the previous production after a stored post-promotion rollback.
+
+    The stored lifecycle must end admit, promote, production_rollback, for
+    the registered candidate over the registered production, in that
+    promotion's monitoring period; a ``monitor_alert`` rollback must also
+    find its alert in the store. Nothing is written: the promotion, alert,
+    and rollback rows stay as they are, and no alert is delivered again.
+    """
+
+    registry = state.dependencies.registry
+    production_hash = run_configuration_hash(registry.production)
+    candidate_hash = (
+        None if registry.candidate is None else run_configuration_hash(registry.candidate)
+    )
+    rollback = rows[-1]
+    if (
+        len(rows) < 3
+        or rows[-2].decision != "promote"
+        or rows[-3].decision != "admit"
+        or sum(row.decision == _PRODUCTION_ROLLBACK for row in rows) != 1
+    ):
+        raise ServiceError(
+            "stored production rollback does not follow an admission and a promotion"
+        )
+    promote = rows[-2]
+    if (
+        candidate_hash is None
+        or promote.configuration_hash != candidate_hash
+        or rollback.configuration_hash != candidate_hash
+        or promote.reference_configuration_hash != production_hash
+        or rollback.reference_configuration_hash != production_hash
+    ):
+        raise ServiceError(
+            "stored production rollback does not match the registered production and "
+            "candidate configurations"
+        )
+    period = monitoring_period_id(candidate_hash, production_hash)
+    if rollback.period_id != period:
+        raise ServiceError("stored production rollback names another monitoring period")
+    if rollback.method not in _PRODUCTION_ROLLBACK_METHODS:
+        raise ServiceError(f"stored production rollback method {rollback.method} is unknown")
+    trigger = None
+    if rollback.method == "monitor_alert":
+        trigger = _stored_rollback_alert(state, candidate_hash, production_hash)
+        if trigger is None or rollback.trigger_signal != trigger.signal:
+            raise ServiceError("stored monitor-triggered rollback has no matching alert")
+    state.recovered = _RecoveredDeployment(
+        state="PROMOTED",
+        previous_production_configuration_hash=production_hash,
+        promoted_configuration_hash=candidate_hash,
+        rejected_candidate_configuration_hash=candidate_hash,
+        method=promote.method,
+    )
+    state.production_rollback = _ProductionRollback(
+        rolled_back_configuration_hash=candidate_hash,
+        restored_configuration_hash=production_hash,
+        rolled_back_period_id=period,
+        method=rollback.method,
+        source=rollback.evidence_source or "unrecorded",
+        trigger=trigger,
+        decided_at=rollback.decided_at,
+        persisted=True,
+        recovered=True,
+    )
+    state.admission = "rollback_requested"
+    _serve_known_good(state)
 
 
 def _apply_canary_decision(
@@ -909,7 +1257,18 @@ def _run_production_episode(
     state: _ServiceState,
     request: _EpisodeRequest,
 ) -> dict[str, object]:
-    config = state.serving_configuration
+    """Serve one episode on the configuration serving when it was admitted.
+
+    The configuration and monitoring period are read together under
+    ``deployment_lock``. The receipt names the configuration that actually
+    ran. An execute episode whose period ended while it ran (a promotion or
+    a rollback in between) is persisted but not fed to the monitor, and its
+    ``monitoring_status`` is ``superseded``.
+    """
+
+    with state.deployment_lock:
+        config = state.serving_configuration
+        period_id = state.monitor_period_id
     run = new_run_identity(config)
     runtime = _runtime_for(state, config, request.mode, "production")
     on_start, on_step = _persistence_callbacks(
@@ -927,7 +1286,11 @@ def _run_production_episode(
     )
     state.dependencies.store.finish_episode(episode)
     if request.mode == "execute":
-        monitoring_status = _feed_monitor(state, episode)
+        with state.deployment_lock:
+            if state.monitor_period_id == period_id:
+                monitoring_status = _feed_monitor(state, episode)
+            else:
+                monitoring_status = _SUPERSEDED
     else:
         monitoring_status = "skipped"
     return _public_episode_receipt(
@@ -1025,6 +1388,8 @@ def _admit_candidate(state: _ServiceState, artifact_id: str) -> dict[str, object
         raise _Conflict(
             "final-test admission is not performed by this service"
         )
+    if state.production_rollback is not None:
+        raise _Conflict("the registered candidate was rolled back after promotion")
     recovered = state.recovered
     if recovered is not None and state.controller is None:
         candidate_hash = run_configuration_hash(registry.candidate)
@@ -1050,9 +1415,13 @@ def _admit_candidate(state: _ServiceState, artifact_id: str) -> dict[str, object
     except ProtocolError as error:
         raise _Conflict(_message(error)) from error
     with state.deployment_lock:
+        if state.production_rollback is not None:
+            raise _Conflict("the registered candidate was rolled back after promotion")
         existing = state.controller
         if existing is not None and existing.snapshot().state not in _TERMINAL_CANARY:
             raise _Conflict("a non-terminal canary controller already exists")
+        if existing is not None and existing.snapshot().state == "PROMOTED":
+            raise _Conflict("the registered candidate is already promoted")
         controller = CanaryController(
             registry.production,
             registry.candidate,
@@ -1078,7 +1447,20 @@ def _admit_candidate(state: _ServiceState, artifact_id: str) -> dict[str, object
 
 
 def _request_rollback(state: _ServiceState) -> dict[str, object]:
+    """Roll back whatever the deployment is doing, at most once.
+
+    An active canary is closed through ``CanaryController.rollback``. A
+    promotion, live or recovered, takes the post-promotion transition
+    (``_roll_back_production``) instead. After either, a repeated request
+    changes nothing and writes no decision.
+    """
+
     with state.deployment_lock:
+        if state.production_rollback is not None or _promoted_lineage(state) is not None:
+            _roll_back_production(
+                state, method="manual_rollback", source="operator", trigger=None
+            )
+            return _deployment_document(state)
         state.admission = "rollback_requested"
         controller = state.controller
         if controller is not None:

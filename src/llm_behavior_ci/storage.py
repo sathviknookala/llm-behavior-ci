@@ -147,6 +147,12 @@ class DeploymentDecisionRecord:
     decision may not, since ``lifecycle.canary`` is not extended here to
     thread it through). ``None`` means no artifact backs this row, not
     that verification was skipped for a row that needed it.
+
+    ``period_id`` and ``trigger_signal`` are set only on a post-promotion
+    ``production_rollback`` row: the monitoring period of the rolled-back
+    configuration and, when an alert triggered it, that alert's signal. They
+    are omitted from the stored JSON when unset, so older rows read back
+    unchanged.
     """
 
     configuration_hash: str
@@ -161,9 +167,11 @@ class DeploymentDecisionRecord:
     decided_at: datetime
     evidence_artifact_id: str | None = None
     evidence_source: str | None = None
+    period_id: str | None = None
+    trigger_signal: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "configuration_hash": self.configuration_hash,
             "reference_configuration_hash": self.reference_configuration_hash,
             "signal": self.signal,
@@ -177,6 +185,11 @@ class DeploymentDecisionRecord:
             "evidence_artifact_id": self.evidence_artifact_id,
             "evidence_source": self.evidence_source,
         }
+        if self.period_id is not None:
+            payload["period_id"] = self.period_id
+        if self.trigger_signal is not None:
+            payload["trigger_signal"] = self.trigger_signal
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> DeploymentDecisionRecord:
@@ -221,6 +234,12 @@ class DeploymentDecisionRecord:
             not isinstance(evidence_source, str) or evidence_source == ""
         ):
             raise StorageError("deployment decision evidence_source is invalid")
+        optional: dict[str, str | None] = {}
+        for key in ("period_id", "trigger_signal"):
+            value = payload.get(key)
+            if value is not None and (not isinstance(value, str) or value == ""):
+                raise StorageError(f"deployment decision {key} is invalid")
+            optional[key] = value
         return cls(
             configuration_hash=str(payload["configuration_hash"]),
             reference_configuration_hash=str(
@@ -236,6 +255,8 @@ class DeploymentDecisionRecord:
             decided_at=parsed,
             evidence_artifact_id=evidence_artifact_id,
             evidence_source=evidence_source,
+            period_id=optional["period_id"],
+            trigger_signal=optional["trigger_signal"],
         )
 
 

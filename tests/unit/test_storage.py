@@ -360,3 +360,52 @@ class EpisodeStoreTests(unittest.TestCase):
             everything = store.load_monitor_metadata_for_episode("episode-1")
             self.assertEqual(everything, (record, other_signal))
             store.close()
+
+
+class DeploymentDecisionRecordTests(unittest.TestCase):
+    def _record(self, **changes):
+        from llm_behavior_ci.storage import DeploymentDecisionRecord
+
+        values = dict(
+            configuration_hash=_HASH_B,
+            reference_configuration_hash=_HASH_A,
+            signal="deployment",
+            slice_name="production",
+            decision="production_rollback",
+            method="monitor_alert",
+            estimate=2.7,
+            boundary=2.0,
+            sample_size=6,
+            decided_at=_START,
+            evidence_source="production_monitor",
+        )
+        values.update(changes)
+        return DeploymentDecisionRecord(**values)
+
+    def test_rows_without_rollback_fields_keep_their_stored_json(self) -> None:
+        from llm_behavior_ci.storage import DeploymentDecisionRecord
+
+        record = self._record(decision="promote", slice_name="canary")
+        payload = record.to_dict()
+        self.assertNotIn("period_id", payload)
+        self.assertNotIn("trigger_signal", payload)
+        self.assertEqual(DeploymentDecisionRecord.from_dict(payload), record)
+
+    def test_rollback_fields_round_trip_through_sqlite(self) -> None:
+        record = self._record(period_id="period-1", trigger_signal="task_success")
+        with TemporaryDirectory() as directory:
+            store = EpisodeStore(Path(directory) / "episodes.sqlite")
+            try:
+                store.append_deployment_decision(record)
+                self.assertEqual(store.load_deployment_decisions(), (record,))
+            finally:
+                store.close()
+
+    def test_empty_rollback_fields_are_rejected(self) -> None:
+        from llm_behavior_ci.storage import DeploymentDecisionRecord
+
+        for key in ("period_id", "trigger_signal"):
+            with self.subTest(key=key):
+                payload = {**self._record().to_dict(), key: ""}
+                with self.assertRaises(StorageError):
+                    DeploymentDecisionRecord.from_dict(payload)

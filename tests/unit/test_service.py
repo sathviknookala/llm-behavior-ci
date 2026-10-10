@@ -863,6 +863,32 @@ class ServiceUnitTests(unittest.TestCase):
             self.assertEqual(second.status_code, 429)
             self.assertEqual(client.post("/episodes", json=body).status_code, 200)
 
+    def test_post_promotion_rollback_defaults_to_record_only(self) -> None:
+        from llm_behavior_ci.service import ServiceError
+
+        self.assertEqual(self._dependencies().post_promotion_rollback, "record_only")
+        enabled = replace(self._dependencies(), post_promotion_rollback="rollback_on_alert")
+        self.assertEqual(enabled.post_promotion_rollback, "rollback_on_alert")
+        for value in ("rollback", "", None, True):
+            with self.subTest(value=value), self.assertRaises(ServiceError):
+                replace(self._dependencies(), post_promotion_rollback=value)
+        deployment = self._client().get("/deployment").json()
+        self.assertEqual(deployment["post_promotion_rollback"], "record_only")
+
+    def test_manual_rollback_without_a_promotion_writes_no_production_rollback(self) -> None:
+        client = self._client()
+        artifact = _gate_artifact(self.production, self.candidate)
+        self._persist_artifact(artifact)
+        client.post("/candidates", json={"artifact_id": artifact.artifact_id})
+        for _ in range(2):
+            rollback = client.post("/deployment/rollback")
+            self.assertEqual(rollback.status_code, 200)
+            self.assertEqual(rollback.json()["state"], "ROLLED_BACK")
+            self.assertNotIn("production_rollback", rollback.json())
+        self.assertEqual(
+            [row.decision for row in self._read_decisions()], ["admit", "rollback"]
+        )
+
     def test_dependencies_reject_non_positive_max_in_flight(self) -> None:
         from llm_behavior_ci.service import ServiceError
 

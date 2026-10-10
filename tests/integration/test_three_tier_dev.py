@@ -622,6 +622,7 @@ class ReleaseLineageTests(unittest.TestCase):
         production_hash = run_configuration_hash(production)
         candidate_hash = run_configuration_hash(candidate)
         self.assertEqual(record["status"], "promoted")
+        self.assertEqual(record["version"], "release-summary-v2")
         self.assertEqual(
             record["configurations"],
             {
@@ -630,8 +631,11 @@ class ReleaseLineageTests(unittest.TestCase):
                 "serving": candidate_hash,
                 "known_good": production_hash,
                 "frozen_reference": production_hash,
+                "rolled_back": None,
             },
         )
+        self.assertIsNone(record["deployment"]["production_rollback"])
+        self.assertEqual(record["monitoring"]["tier3_fallback_arrivals"], 0)
         self.assertEqual(record["deployment"]["decision"], "promote")
         self.assertEqual(record["deployment"]["decisions"], ["admit", "promote"])
         self.assertEqual(record["gate"]["outcome"], "PASS")
@@ -742,6 +746,7 @@ class ThreeTierDevCommandTests(unittest.TestCase):
             "rolled_back": 1,
             "admission_refused": 1,
             "canary_incomplete": 3,
+            "production_rolled_back": 5,
         }
         traffic = self._traffic()
         for status, code in expected.items():

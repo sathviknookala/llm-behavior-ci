@@ -115,6 +115,25 @@ class LiveReleaseStepTests(unittest.TestCase):
         summary = (self.root / "step_summary.md").read_text(encoding="utf-8")
         self.assertIn("release r2: exit 0, promoted", summary)
         self.assertIn("release r2: exit 3, not promoted", summary)
+        self.assertIn(
+            "release r2: exit 5, not promoted: promoted, then rolled back to the previous "
+            "production during Tier 3",
+            summary,
+        )
+
+    def test_the_live_command_gives_a_post_promotion_rollback_its_own_failing_code(self) -> None:
+        import importlib.util
+        import sys
+
+        path = _ROOT / "scripts" / "demo" / "run_three_tier_dev.py"
+        spec = importlib.util.spec_from_file_location("run_three_tier_dev_ci", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        codes = module.LIVE_EXIT_CODES
+        self.assertEqual(codes["production_rolled_back"], 5)
+        self.assertEqual([status for status, code in codes.items() if code == 0], ["promoted"])
 
     def test_the_step_passes_the_release_lineage_to_the_lifecycle(self) -> None:
         self._step(0)

@@ -1,6 +1,6 @@
 """Run the connected three-tier dev lifecycle and print its JSON summary.
 
-``synthetic --scenario blocked|healthy|regression`` runs
+``synthetic --scenario blocked|healthy|regression|production_regression`` runs
 ``lifecycle.connected.run_three_tier_dev`` in process. The gate uses the
 synthetic plan-evidence fixture and the fake plan agents of
 ``scripts/synthetic/run_connected_lifecycle.py``. The service is built by
@@ -8,13 +8,17 @@ synthetic plan-evidence fixture and the fake plan agents of
 a train-to-dev task-selection allowance, then given injected execute
 worlds, a lazily opened store, and test admission, because the artifact is
 ``synthetic_fixture``. No network, GPU, AppWorld, or provider is used.
+``production_regression`` is ``healthy`` on a service started with
+``--post-promotion-rollback rollback_on_alert``: the canary promotes, the
+production monitor alerts on the regressed tasks, and the service restores
+the previous production.
 
 ``live`` runs the same function against a ``serve.py`` already listening
 on --service-url with --store, and builds plan runtimes with the
 ``LiveRuntimeFactory``. It refuses a dirty tree, a non-train gate, a
 non-dev service, and a store under results/. The store must already be
 the running service's store and hold nothing: one release, one store.
---release-summary names a new file for the public ``release-summary-v1``
+--release-summary names a new file for the public ``release-summary-v2``
 record. --previous-release names release N's record; release N+1 is
 refused before any model call unless its production configuration is the
 one release N left serving, at the same commit. Exit codes are in
@@ -68,7 +72,7 @@ from llm_behavior_ci.tasks.selection import (
 )
 
 _REPO = Path(__file__).resolve().parents[2]
-SCENARIOS = ("blocked", "healthy", "regression")
+SCENARIOS = ("blocked", "healthy", "regression", "production_regression")
 CANARY_TASK_IDS = tuple(f"dev-canary-{index}" for index in range(4))
 STEADY_TASK_IDS = tuple(f"dev-steady-{index}" for index in range(3))
 REGRESS_TASK_IDS = tuple(f"dev-regress-{index}" for index in range(4))
@@ -149,7 +153,7 @@ def candidate_faulted(scenario: str, task_id: str) -> bool:
 
     if scenario == "regression":
         return True
-    if scenario == "healthy":
+    if scenario in {"healthy", "production_regression"}:
         return task_id in REGRESS_TASK_IDS
     return False
 
@@ -316,6 +320,9 @@ def build_synthetic(scenario: str, root: Path) -> SyntheticLifecycle:
             "task_selection_allowance.json",
             task_selection_allowance_document(task_selection_allowance_for(train_reference)),
         ),
+        post_promotion_rollback=(
+            "rollback_on_alert" if scenario == "production_regression" else "record_only"
+        ),
     )
     built = serve._build_dependencies(args)
     built.store.close()
@@ -471,11 +478,13 @@ LIVE_EXIT_CODES = {
     "rolled_back": 1,
     "admission_refused": 1,
     "canary_incomplete": 3,
+    "production_rolled_back": 5,
 }
 EXPECTED_SYNTHETIC_STATUS = {
     "blocked": "blocked",
     "healthy": "promoted",
     "regression": "rolled_back",
+    "production_regression": "production_rolled_back",
 }
 EXIT_INVALID = 2
 EXIT_FAILURE = 4
@@ -540,7 +549,8 @@ def _main_live(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """Exit codes: synthetic 0 when the scenario's expected outcome is verified,
     1 when it is not; live 0 promoted, 1 blocked, rolled back, or admission
-    refused, 3 canary incomplete after a confirmed cleanup rollback; 2 for an
+    refused, 3 canary incomplete after a confirmed cleanup rollback, 5 promoted
+    and then rolled back to the previous production during Tier 3; 2 for an
     invalid invocation or input, including a broken release lineage; 4 for an
     execution or infrastructure failure, or a release summary that could not
     be written.

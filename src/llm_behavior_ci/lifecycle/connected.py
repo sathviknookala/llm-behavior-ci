@@ -10,15 +10,19 @@ arrivals to ``POST /episodes`` until the service's ``CanaryController``
 reaches PROMOTED or ROLLED_BACK, and closes it through ``POST
 /deployment/rollback`` when the arrivals run out first. After PROMOTED the
 remaining arrivals are Tier 3: ordinary traffic the service routes to the
-promoted configuration and feeds to its production monitor. After
-ROLLED_BACK the same arrivals only verify that the known-good
+promoted configuration and feeds to its production monitor. If the
+service rolls the promotion back during Tier 3 (its ``rollback_on_alert``
+policy, or an operator), the arrivals after that are ``tier3_fallback``
+on the previous production and the run ends ``production_rolled_back``.
+After ROLLED_BACK the same arrivals only verify that the known-good
 configuration still serves. The summary is read back from the store and
 ``GET /deployment``, never from the runner's own bookkeeping.
 
 Consecutive releases each use a fresh store. ``release_summary`` reduces
-one run to a public ``release-summary-v1`` document, and
+one run to a public ``release-summary-v2`` document, and
 ``require_release_lineage`` refuses release N+1 unless its production
-configuration is the one release N left serving, at the same commit.
+configuration is the one release N left serving, at the same commit; a
+``release-summary-v1`` record is still accepted as release N.
 """
 
 from __future__ import annotations
@@ -44,12 +48,25 @@ from llm_behavior_ci.storage import EpisodeStore
 from llm_behavior_ci.tasks.selection import TaskSet
 
 _TERMINAL = frozenset({"PROMOTED", "ROLLED_BACK"})
-_STATUS = {"PROMOTED": "promoted", "ROLLED_BACK": "rolled_back"}
-_LIFECYCLE_DECISIONS = frozenset({"admit", "promote", "rollback"})
+PRODUCTION_ROLLED_BACK = "PRODUCTION_ROLLED_BACK"
+_STATUS = {
+    "PROMOTED": "promoted",
+    "ROLLED_BACK": "rolled_back",
+    PRODUCTION_ROLLED_BACK: "production_rolled_back",
+}
+_LIFECYCLE_DECISIONS = frozenset({"admit", "promote", "rollback", "production_rollback"})
 RELEASE_SUMMARY_RECORD = "release_summary"
-RELEASE_SUMMARY_VERSION = "release-summary-v1"
+RELEASE_SUMMARY_VERSION = "release-summary-v2"
+_READABLE_RELEASE_SUMMARY_VERSIONS = frozenset({"release-summary-v1", RELEASE_SUMMARY_VERSION})
 RELEASE_STATUSES = frozenset(
-    {"blocked", "admission_refused", "canary_incomplete", "promoted", "rolled_back"}
+    {
+        "blocked",
+        "admission_refused",
+        "canary_incomplete",
+        "promoted",
+        "rolled_back",
+        "production_rolled_back",
+    }
 )
 
 
@@ -237,11 +254,38 @@ def deployment_view(deployment: dict[str, object]) -> dict[str, object]:
         "serving_configuration_hash",
         "previous_production_configuration_hash",
         "promoted_configuration_hash",
+        "rolled_back_configuration_hash",
         "candidate_episodes_served",
         "served_before_rollback",
         "monitor_period_id",
+        "post_promotion_rollback",
     )
-    return {key: deployment.get(key) for key in keys}
+    view = {key: deployment.get(key) for key in keys}
+    view["production_rollback"] = _production_rollback_view(deployment)
+    return view
+
+
+def _production_rollback_view(deployment: Mapping[str, object]) -> dict[str, object] | None:
+    rollback = deployment.get("production_rollback")
+    if not isinstance(rollback, Mapping):
+        return None
+    trigger = rollback.get("trigger")
+    return {
+        "method": rollback.get("method"),
+        "source": rollback.get("source"),
+        "rolled_back_configuration_hash": rollback.get("rolled_back_configuration_hash"),
+        "restored_configuration_hash": rollback.get("restored_configuration_hash"),
+        "rolled_back_period_id": rollback.get("rolled_back_period_id"),
+        "persisted": rollback.get("persisted"),
+        "trigger": (
+            None
+            if not isinstance(trigger, Mapping)
+            else {
+                key: trigger.get(key)
+                for key in ("signal", "method", "estimate", "boundary", "sample_size")
+            }
+        ),
+    }
 
 
 def lifecycle_evidence(store_path: Path, artifact_id: str) -> dict[str, object]:
@@ -271,6 +315,12 @@ def lifecycle_evidence(store_path: Path, artifact_id: str) -> dict[str, object]:
                 "sample_size": item.sample_size,
                 "evidence_artifact_id": item.evidence_artifact_id,
                 "evidence_source": item.evidence_source,
+                **({} if item.period_id is None else {"period_id": item.period_id}),
+                **(
+                    {}
+                    if item.trigger_signal is None
+                    else {"trigger_signal": item.trigger_signal}
+                ),
             }
             for item in decisions
         ],
@@ -435,10 +485,11 @@ def run_three_tier_dev(
     ``service`` is an HTTP client bound to a service whose store is
     ``store_path``: a ``TestClient`` in process, or an ``httpx.Client`` on
     a running ``serve.py``. Status is ``blocked``, ``admission_refused``,
-    ``canary_incomplete``, ``promoted``, or ``rolled_back``. A canary whose
-    arrivals run out before its rule decides is rolled back through the
-    service and reported as ``canary_incomplete`` with a ``cleanup`` entry;
-    an unconfirmed cleanup raises. Arrivals after PROMOTED are ``tier3``;
+    ``canary_incomplete``, ``promoted``, ``rolled_back``, or
+    ``production_rolled_back``. A canary whose arrivals run out before its
+    rule decides is rolled back through the service and reported as
+    ``canary_incomplete`` with a ``cleanup`` entry; an unconfirmed cleanup
+    raises. Arrivals after PROMOTED are ``tier3`` (``_promoted_production``);
     after ROLLED_BACK they are ``fallback_verification``, and either raises
     when the service routed one to the wrong configuration. Gate execution
     errors and capability refusals propagate before anything is persisted.
@@ -475,29 +526,96 @@ def run_three_tier_dev(
     if state not in _TERMINAL:
         return summary
 
-    production_hash = run_configuration_hash(traffic.production)
-    expected_hash = (
-        run_configuration_hash(traffic.candidate) if state == "PROMOTED" else production_hash
-    )
-    production = [
-        _episode(service, task_id, f"production:{index}:{task_id}")
-        for index, task_id in enumerate(traffic.production_task_ids)
-    ]
-    misrouted = [item for item in production if item["configuration_hash"] != expected_hash]
-    if misrouted:
-        raise ConnectedLifecycleError(
-            f"{len(misrouted)} production arrivals after {state} were not served by "
-            "the expected configuration"
-        )
-    label = "tier3" if state == "PROMOTED" else "fallback_verification"
-    summary[label] = _receipts(production)
-    summary["status"] = _STATUS[str(state)]
+    if state == "PROMOTED":
+        summary.update(_promoted_production(service, traffic))
+    else:
+        production_hash = run_configuration_hash(traffic.production)
+        production = [
+            _episode(service, task_id, f"production:{index}:{task_id}")
+            for index, task_id in enumerate(traffic.production_task_ids)
+        ]
+        misrouted = [
+            item for item in production if item["configuration_hash"] != production_hash
+        ]
+        if misrouted:
+            raise ConnectedLifecycleError(
+                f"{len(misrouted)} production arrivals after {state} were not served by "
+                "the expected configuration"
+            )
+        summary["fallback_verification"] = _receipts(production)
+        summary["status"] = _STATUS[str(state)]
     summary["deployment"] = deployment_view(
         _json(service.get("/deployment"), "GET /deployment")
     )
     summary["evidence"] = lifecycle_evidence(store_path, artifact_id)
     assert_public_payload(summary)
     return summary
+
+
+def _serving_phase(deployment: Mapping[str, object], traffic: DevTraffic, label: str) -> bool:
+    """Whether the deployment has rolled the promotion back; raises if it serves anything else.
+
+    PROMOTED must serve the candidate and PRODUCTION_ROLLED_BACK the
+    previous production; any other state or hash is a routing error.
+    """
+
+    state = deployment.get("state")
+    serving = deployment.get("serving_configuration_hash")
+    if state == "PROMOTED" and serving == run_configuration_hash(traffic.candidate):
+        return False
+    if state == PRODUCTION_ROLLED_BACK and serving == run_configuration_hash(
+        traffic.production
+    ):
+        return True
+    raise ConnectedLifecycleError(
+        f"{label}: service is {state} and serves a configuration Tier 3 does not expect"
+    )
+
+
+def _promoted_production(service: ServiceClient, traffic: DevTraffic) -> dict[str, object]:
+    """Tier 3 after PROMOTED, one arrival at a time.
+
+    Before each arrival ``GET /deployment`` names the configuration
+    serving; the arrival must be served by exactly that one. Arrivals while
+    the candidate serves are ``tier3``; once the service reports
+    PRODUCTION_ROLLED_BACK they are ``tier3_fallback``, and a return to the
+    candidate is an error. ``production_rollback`` records when and why the
+    service rolled back, from the service's own document.
+    """
+
+    candidate: list[dict[str, object]] = []
+    fallback: list[dict[str, object]] = []
+    rolled_back_after: int | None = None
+    for index, task_id in enumerate(traffic.production_task_ids):
+        label = f"production arrival {index}"
+        before = _json(service.get("/deployment"), "GET /deployment")
+        rolled_back = _serving_phase(before, traffic, label)
+        if rolled_back and rolled_back_after is None:
+            rolled_back_after = index
+        if not rolled_back and rolled_back_after is not None:
+            raise ConnectedLifecycleError(f"{label}: the candidate serves again after rollback")
+        receipt = _episode(service, task_id, f"production:{index}:{task_id}")
+        if receipt.get("configuration_hash") != before.get("serving_configuration_hash"):
+            raise ConnectedLifecycleError(
+                f"{label} after {before.get('state')} was not served by the expected "
+                "configuration"
+            )
+        (fallback if rolled_back else candidate).append(receipt)
+    final = _json(service.get("/deployment"), "GET /deployment")
+    rolled_back = _serving_phase(final, traffic, "after production arrivals")
+    if not rolled_back and rolled_back_after is not None:
+        raise ConnectedLifecycleError("the candidate serves again after rollback")
+    stage: dict[str, object] = {"tier3": _receipts(candidate)}
+    if not rolled_back:
+        stage["status"] = "promoted"
+        return stage
+    stage["tier3_fallback"] = _receipts(fallback)
+    stage["production_rollback"] = {
+        **(_production_rollback_view(final) or {}),
+        "candidate_arrivals_before_rollback": len(candidate),
+    }
+    stage["status"] = "production_rolled_back"
+    return stage
 
 
 def release_summary(
@@ -512,7 +630,11 @@ def release_summary(
     one release N+1 must start from. ``known_good`` is the production
     configuration this release started from, and ``frozen_reference`` is
     the reference the store's last lifecycle decision was measured
-    against. Holds hashes, outcomes, and counts only.
+    against. ``rolled_back`` names the configuration a post-promotion
+    rollback took out of service, else ``None``. Holds hashes, outcomes,
+    and counts only. Version 2 adds ``production_rolled_back``,
+    ``rolled_back``, ``deployment.production_rollback``, and
+    ``monitoring.tier3_fallback_arrivals`` to version 1.
     """
 
     if not isinstance(traffic, DevTraffic):
@@ -535,6 +657,13 @@ def release_summary(
     production_hash = run_configuration_hash(traffic.production)
     candidate_hash = run_configuration_hash(traffic.candidate)
     expected_serving = candidate_hash if status == "promoted" else production_hash
+    if status == "production_rolled_back" and (
+        deployment.get("state") != PRODUCTION_ROLLED_BACK
+        or deployment.get("rolled_back_configuration_hash") != candidate_hash
+    ):
+        raise ConnectedLifecycleError(
+            "a production_rolled_back release needs the service to report that rollback"
+        )
     if serving != expected_serving:
         raise ConnectedLifecycleError(
             f"service serves a configuration that a {status} release does not leave serving"
@@ -559,6 +688,9 @@ def release_summary(
             "frozen_reference": (
                 None if last is None else last.get("reference_configuration_hash")
             ),
+            "rolled_back": (
+                candidate_hash if status == "production_rolled_back" else None
+            ),
         },
         "gate": {
             key: tier1.get(key)
@@ -579,10 +711,12 @@ def release_summary(
             "state": deployment.get("state"),
             "admission": deployment.get("admission"),
             "candidate_episodes_served": deployment.get("candidate_episodes_served"),
+            "production_rollback": deployment.get("production_rollback"),
         },
         "monitoring": {
             "monitor_period_id": deployment.get("monitor_period_id"),
             "tier3_arrivals": _arrivals(summary.get("tier3")),
+            "tier3_fallback_arrivals": _arrivals(summary.get("tier3_fallback")),
             "fallback_verification_arrivals": _arrivals(
                 summary.get("fallback_verification")
             ),
@@ -612,9 +746,11 @@ def require_release_lineage(
     if (
         not isinstance(previous, Mapping)
         or previous.get("record") != RELEASE_SUMMARY_RECORD
-        or previous.get("version") != RELEASE_SUMMARY_VERSION
+        or previous.get("version") not in _READABLE_RELEASE_SUMMARY_VERSIONS
     ):
-        raise ReleaseLineageError("previous release is not a release-summary-v1 record")
+        raise ReleaseLineageError(
+            "previous release is not a release-summary-v1 or release-summary-v2 record"
+        )
     if previous.get("status") not in RELEASE_STATUSES:
         raise ReleaseLineageError("previous release has no lifecycle status")
     configurations = previous.get("configurations")

@@ -41,6 +41,7 @@ from llm_behavior_ci.runtime.factory import (
     RuntimeFactoryError,
 )
 from llm_behavior_ci.service import (
+    POST_PROMOTION_ROLLBACK_POLICIES,
     ConfigurationRegistry,
     ServiceDependencies,
     create_app,
@@ -281,6 +282,12 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
             DistributionalMonitorSettings.from_dict(item)
             for item in raw_distributional
         )
+    post_promotion_rollback = getattr(args, "post_promotion_rollback", None) or "record_only"
+    if post_promotion_rollback not in POST_PROMOTION_ROLLBACK_POLICIES:
+        raise ConfigError(
+            "post-promotion rollback must be one of: "
+            + ", ".join(POST_PROMOTION_ROLLBACK_POLICIES)
+        )
     distributional_monitors = build_distributional_monitors(
         distributional_settings,
         reference_configuration_hash=frozen.configuration_hash,
@@ -303,6 +310,7 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
         tool_selection_monitor=distributional_monitors.get("tool_selection"),
         task_mix_monitor=distributional_monitors.get("task_mix"),
         alert_dedup_seconds=float(args.dedup_seconds),
+        post_promotion_rollback=post_promotion_rollback,
     )
 
 
@@ -333,6 +341,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--distributional-monitors", default=None)
     parser.add_argument("--slice-attribution", action="store_true")
     parser.add_argument("--task-selection-allowance", default=None)
+    parser.add_argument(
+        "--post-promotion-rollback",
+        choices=POST_PROMOTION_ROLLBACK_POLICIES,
+        default="record_only",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
     try:

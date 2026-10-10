@@ -59,6 +59,7 @@ case "$code" in
   2) outcome="invalid input or broken release lineage; nothing ran" ;;
   3) outcome="not promoted: canary incomplete, rolled back by cleanup" ;;
   4) outcome="execution failure" ;;
+  5) outcome="not promoted: promoted, then rolled back to the previous production during Tier 3" ;;
   *) outcome="unexpected exit code" ;;
 esac
 echo "release $RELEASE_ID: exit $code, $outcome" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
