@@ -19,10 +19,15 @@ configuration still serves. The summary is read back from the store and
 ``GET /deployment``, never from the runner's own bookkeeping.
 
 Consecutive releases each use a fresh store. ``release_summary`` reduces
-one run to a public ``release-summary-v2`` document, and
+one run to a public ``release-summary-v3`` document, and
 ``require_release_lineage`` refuses release N+1 unless its production
-configuration is the one release N left serving, at the same commit; a
-``release-summary-v1`` record is still accepted as release N.
+configuration is the one release N left serving, built at the commit that
+configuration was built at. Version 3 records the commit the release ran
+at and each configuration's own commit, so release N+1 may run at a later
+commit than the production it keeps serving; whether that code may execute
+the older configuration is ``lifecycle.release``'s runtime transition
+check. ``release-summary-v1`` and ``-v2`` records are still accepted as
+release N; their one ``git_commit`` is every configuration's commit.
 """
 
 from __future__ import annotations
@@ -56,8 +61,11 @@ _STATUS = {
 }
 _LIFECYCLE_DECISIONS = frozenset({"admit", "promote", "rollback", "production_rollback"})
 RELEASE_SUMMARY_RECORD = "release_summary"
-RELEASE_SUMMARY_VERSION = "release-summary-v2"
-_READABLE_RELEASE_SUMMARY_VERSIONS = frozenset({"release-summary-v1", RELEASE_SUMMARY_VERSION})
+RELEASE_SUMMARY_VERSION = "release-summary-v3"
+_SINGLE_COMMIT_RELEASE_SUMMARY_VERSIONS = frozenset({"release-summary-v1", "release-summary-v2"})
+_READABLE_RELEASE_SUMMARY_VERSIONS = _SINGLE_COMMIT_RELEASE_SUMMARY_VERSIONS | {
+    RELEASE_SUMMARY_VERSION
+}
 RELEASE_STATUSES = frozenset(
     {
         "blocked",
@@ -623,6 +631,8 @@ def release_summary(
     traffic: DevTraffic,
     *,
     lineage: Mapping[str, object] | None = None,
+    release_commit: str | None = None,
+    runtime: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Reduce one ``run_three_tier_dev`` summary to a public release record.
 
@@ -634,11 +644,19 @@ def release_summary(
     rollback took out of service, else ``None``. Holds hashes, outcomes,
     and counts only. Version 2 adds ``production_rolled_back``,
     ``rolled_back``, ``deployment.production_rollback``, and
-    ``monitoring.tier3_fallback_arrivals`` to version 1.
+    ``monitoring.tier3_fallback_arrivals`` to version 1. Version 3 makes
+    ``git_commit`` the commit the release ran at (``release_commit``, the
+    candidate's commit when omitted), adds ``commits`` with the production,
+    candidate, and serving configurations' own commits, and ``runtime``,
+    the runtime transition that let this commit serve an older production,
+    or ``None``.
     """
 
     if not isinstance(traffic, DevTraffic):
         raise ConnectedLifecycleError("traffic must be DevTraffic")
+    ran_at = traffic.candidate.git_commit if release_commit is None else release_commit
+    if ran_at != traffic.candidate.git_commit:
+        raise ConnectedLifecycleError("the candidate must be built at the release commit")
     status = summary.get("status")
     if status not in RELEASE_STATUSES:
         raise ConnectedLifecycleError(f"unknown lifecycle status {status}")
@@ -678,8 +696,18 @@ def release_summary(
     document: dict[str, object] = {
         "record": RELEASE_SUMMARY_RECORD,
         "version": RELEASE_SUMMARY_VERSION,
-        "git_commit": traffic.production.git_commit,
+        "git_commit": ran_at,
         "status": status,
+        "commits": {
+            "production": traffic.production.git_commit,
+            "candidate": traffic.candidate.git_commit,
+            "serving": (
+                traffic.candidate.git_commit
+                if serving == candidate_hash
+                else traffic.production.git_commit
+            ),
+        },
+        "runtime": None if runtime is None else dict(runtime),
         "configurations": {
             "production": production_hash,
             "candidate": candidate_hash,
@@ -731,17 +759,19 @@ def release_summary(
     return document
 
 
-def require_release_lineage(
-    previous: object,
-    production: RunConfiguration,
-) -> dict[str, object]:
-    """Accept release N+1 only if its production is what release N left serving.
+def serving_commit(previous: Mapping[str, object]) -> object:
+    """The commit the configuration release N left serving was built at."""
 
-    The configuration hash includes ``git_commit``, and live preflight
-    binds every configuration to HEAD, so a release at another commit
-    cannot continue a lineage: that is refused by name rather than by a
-    rehashed history.
-    """
+    if previous.get("version") in _SINGLE_COMMIT_RELEASE_SUMMARY_VERSIONS:
+        return previous.get("git_commit")
+    commits = previous.get("commits")
+    if not isinstance(commits, Mapping):
+        return None
+    return commits.get("serving")
+
+
+def require_release_record(previous: object) -> Mapping[str, object]:
+    """Refuse anything but a readable release summary with a serving configuration."""
 
     if (
         not isinstance(previous, Mapping)
@@ -749,7 +779,7 @@ def require_release_lineage(
         or previous.get("version") not in _READABLE_RELEASE_SUMMARY_VERSIONS
     ):
         raise ReleaseLineageError(
-            "previous release is not a release-summary-v1 or release-summary-v2 record"
+            "previous release is not a release-summary-v1, -v2, or -v3 record"
         )
     if previous.get("status") not in RELEASE_STATUSES:
         raise ReleaseLineageError("previous release has no lifecycle status")
@@ -759,25 +789,69 @@ def require_release_lineage(
     serving = configurations.get("serving")
     if not isinstance(serving, str) or serving == "":
         raise ReleaseLineageError("previous release records no serving configuration")
-    if previous.get("git_commit") != production.git_commit:
-        raise ReleaseLineageError(
-            f"previous release ran at commit {previous.get('git_commit')} and this "
-            f"release at {production.git_commit}; cross-commit rollout is not supported"
+    commit = serving_commit(previous)
+    if not isinstance(commit, str) or commit == "":
+        raise ReleaseLineageError("previous release records no serving commit")
+    return previous
+
+
+def require_release_lineage(
+    previous: object,
+    production: RunConfiguration,
+    *,
+    serving: str | None = None,
+) -> dict[str, object]:
+    """Accept release N+1 only if its production is what release N left serving.
+
+    The production configuration must hash to release N's serving
+    configuration, so it carries the commit it was built at; it is never
+    rehashed at the new commit. ``serving`` overrides the record's serving
+    hash when the release N store shows a later post-promotion rollback
+    (``lifecycle.release.verify_release_record``). Whether the commit this
+    release runs at may execute that configuration is checked separately.
+    """
+
+    record = require_release_record(previous)
+    configurations = record["configurations"]
+    assert isinstance(configurations, Mapping)
+    expected = configurations["serving"]
+    commit = serving_commit(record)
+    if serving is not None and serving != expected:
+        if record.get("status") != "promoted" or serving != configurations.get("known_good"):
+            raise ReleaseLineageError(
+                "only a promoted release can be continued from its known-good "
+                "configuration after a later rollback"
+            )
+        expected = serving
+        commits = record.get("commits")
+        commit = (
+            commits.get("production")
+            if isinstance(commits, Mapping)
+            else record.get("git_commit")
         )
-    if run_configuration_hash(production) != serving:
+    if production.git_commit != commit:
+        raise ReleaseLineageError(
+            f"production configuration is built at commit {production.git_commit}, but "
+            f"the configuration the previous release left serving was built at {commit}; "
+            "a deployed configuration is never rebuilt at another commit"
+        )
+    if run_configuration_hash(production) != expected:
         raise ReleaseLineageError(
             "production configuration is not the configuration the previous release "
             "left serving"
         )
-    canonical = json.dumps(previous, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(record, sort_keys=True, separators=(",", ":"))
     return {
         "previous_release_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        "previous_status": previous["status"],
-        "previous_serving_configuration_hash": serving,
+        "previous_version": record["version"],
+        "previous_status": record["status"],
+        "previous_serving_configuration_hash": expected,
+        "previous_serving_commit": commit,
         "previous_known_good_configuration_hash": configurations.get("known_good"),
         "previous_frozen_reference_configuration_hash": configurations.get(
             "frozen_reference"
         ),
+        "rolled_back_after_release": expected != configurations["serving"],
     }
 
 

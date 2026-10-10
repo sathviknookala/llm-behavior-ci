@@ -56,6 +56,7 @@ from llm_behavior_ci.lifecycle.monitoring import (
     tool_selection_observation_from_episode,
 )
 from llm_behavior_ci.records import EpisodeResult, ModelStep, ToolStep
+from llm_behavior_ci.runtime.budget import ModelCallBudget
 from llm_behavior_ci.runtime.clock import monotonic
 from llm_behavior_ci.runtime.episode import (
     EpisodeRejected,
@@ -133,6 +134,7 @@ class ServiceDependencies:
     admission_mode: Literal["release", "test"] = "release"
     alert_dedup_seconds: float = 0.0
     post_promotion_rollback: Literal["record_only", "rollback_on_alert"] = "record_only"
+    model_call_budget: ModelCallBudget | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -209,6 +211,10 @@ class ServiceDependencies:
                 raise ValueError("plan_kl_mean_nats_for must be callable or None")
             if self.admission_mode not in {"release", "test"}:
                 raise ValueError("admission_mode must be release or test")
+            if self.model_call_budget is not None and not isinstance(
+                self.model_call_budget, ModelCallBudget
+            ):
+                raise ValueError("model_call_budget must be ModelCallBudget or None")
             if self.post_promotion_rollback not in POST_PROMOTION_ROLLBACK_POLICIES:
                 raise ValueError(
                     "post_promotion_rollback must be one of: "
@@ -1253,6 +1259,31 @@ def _should_run_canary(state: _ServiceState, request: _EpisodeRequest) -> bool:
     )
 
 
+def _require_model_calls(state: _ServiceState, request: _EpisodeRequest) -> None:
+    """Refuse an episode the model-call budget cannot cover at its turn limit.
+
+    A canary arrival may run a pair, so while a canary is active the
+    candidate's limit is added. The budget's own counter still stops a call
+    that would exceed it inside an episode.
+    """
+
+    budget = state.dependencies.model_call_budget
+    if budget is None:
+        return
+    with state.deployment_lock:
+        serving = state.serving_configuration
+        active = _controller_is_active(state)
+    candidate = state.dependencies.registry.candidate
+    if request.mode == "plan":
+        needed = 1 + (1 if active else 0)
+    else:
+        needed = serving.agent.execute_turn_limit + (
+            candidate.agent.execute_turn_limit if active and candidate is not None else 0
+        )
+    if budget.remaining < needed:
+        raise _Unavailable("the release's model-call budget is spent")
+
+
 def _run_production_episode(
     state: _ServiceState,
     request: _EpisodeRequest,
@@ -1622,6 +1653,7 @@ def create_app(dependencies: ServiceDependencies) -> FastAPI:
         except Exception as error:
             raise ServiceError("body must be JSON") from error
         episode_request = _parse_episode_request(body)
+        _require_model_calls(state, episode_request)
         if not state.try_acquire_slot():
             raise _TooMany("max_in_flight episodes already running")
         try:

@@ -28,6 +28,7 @@ from llm_behavior_ci.lifecycle.connected import (
     run_three_tier_dev,
 )
 from llm_behavior_ci.lifecycle.monitoring import Alert, monitoring_period_id
+from llm_behavior_ci.lifecycle.release import RuntimeTransition
 from llm_behavior_ci.service import (
     PRODUCTION_ROLLED_BACK,
     ServiceError,
@@ -539,7 +540,7 @@ class ProductionRollbackReleaseTests(_Rollback):
     def test_the_release_summary_reports_the_rollback_and_the_restored_serving(self) -> None:
         summary, lifecycle = self._run("production_regression")
         record = release_summary(summary, lifecycle.traffic)
-        self.assertEqual(record["version"], "release-summary-v2")
+        self.assertEqual(record["version"], "release-summary-v3")
         self.assertEqual(record["status"], "production_rolled_back")
         self.assertEqual(
             record["configurations"],
@@ -609,7 +610,14 @@ class ProductionRollbackReleaseTests(_Rollback):
         argv += ["--release-summary", str(path)]
         status = {"status": "production_rolled_back"}
         stdout, stderr = io.StringIO(), io.StringIO()
+        commit = traffic.candidate.git_commit
+        context = demo.ReleaseContext(
+            lineage=None,
+            transition=RuntimeTransition(commit, commit, "same_commit", "0" * 64, "0" * 64),
+        )
         with patch.object(demo, "live_inputs", return_value=(None, traffic)), patch.object(
+            demo, "release_inputs", return_value=context
+        ), patch.object(demo, "apply_budgets", return_value=None), patch.object(
             demo, "run_live", return_value=status
         ), patch.object(demo, "release_summary", return_value=status):
             with redirect_stdout(stdout), redirect_stderr(stderr):

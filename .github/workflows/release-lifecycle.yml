@@ -1,33 +1,24 @@
 name: Release lifecycle
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       mode:
-        description: "synthetic: deterministic scenarios on a hosted CPU runner. live: one release on the trusted runner (main only, protected environment)."
+        description: "synthetic: CPU verification and the four synthetic scenarios only. release: CPU verification, then provision and run one release on the trusted runner (main only, protected environment)."
         type: choice
         options:
           - synthetic
-          - live
+          - release
         default: synthetic
       release_id:
-        description: "live only: the provisioned release directory under LIFECYCLE_RELEASE_ROOT"
-        type: string
-        default: ""
-      previous_release_id:
-        description: "live only: the release this one continues; empty for the first release"
-        type: string
-        default: ""
-      canary_arrivals:
-        description: "live only: dev arrivals offered to the canary"
-        type: string
-        default: ""
-      production_arrivals:
-        description: "live only: dev arrivals after the canary decides"
+        description: "release only: the release directory to provision (or reuse) under LIFECYCLE_RELEASE_ROOT"
         type: string
         default: ""
       confirm_live:
-        description: "live only: repeat release_id to authorize live execution"
+        description: "release only: repeat release_id to authorize the paid stage"
         type: string
         default: ""
 
@@ -35,8 +26,30 @@ permissions:
   contents: read
 
 jobs:
+  cpu:
+    name: CPU verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r environments/test-requirements.txt
+      - run: python -m unittest discover -s tests/unit -p "test_*.py"
+      - run: python -m unittest discover -s tests/ci -p "test_*.py"
+      - run: python -m unittest discover -s tests/integration -p "test_*.py"
+      - run: python -m unittest discover -s tests/validity -p "test_*.py"
+
   synthetic:
-    if: inputs.mode == 'synthetic'
+    name: Synthetic lifecycle
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -46,6 +59,7 @@ jobs:
           - blocked
           - healthy
           - regression
+          - production_regression
     env:
       PYTHONPATH: src
       SCENARIO: ${{ matrix.scenario }}
@@ -61,14 +75,63 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r environments/test-requirements.txt
       - name: Run and verify the synthetic scenario
-        run: python scripts/demo/run_three_tier_dev.py synthetic --scenario "$SCENARIO"
+        run: |
+          set +e
+          python scripts/demo/run_three_tier_dev.py synthetic --scenario "$SCENARIO" > scenario.json
+          code=$?
+          set -e
+          python scripts/ci/check_synthetic.py --scenario "$SCENARIO" --exit-code "$code" scenario.json
+
+  provision:
+    name: Provision release
+    needs: [cpu, synthetic]
+    if: >-
+      github.repository == 'sathviknookala/llm-behavior-ci'
+      && github.ref == 'refs/heads/main'
+      && ((github.event_name == 'push' && vars.LIFECYCLE_RELEASE_ENABLED == 'true')
+      || (github.event_name == 'workflow_dispatch' && inputs.mode == 'release'))
+    runs-on: [self-hosted, linux, llm-behavior-ci-release]
+    environment: release-provision
+    timeout-minutes: 30
+    concurrency:
+      group: release-lifecycle-provision
+      cancel-in-progress: false
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
+    env:
+      PYTHONPATH: src
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_RELEASE_ID: ${{ inputs.release_id }}
+      CONFIRM_LIVE: ${{ inputs.confirm_live }}
+      COMMIT: ${{ github.sha }}
+      LIFECYCLE_RELEASE_ROOT: ${{ vars.LIFECYCLE_RELEASE_ROOT }}
+      LIFECYCLE_RELEASE_SPEC: ${{ vars.LIFECYCLE_RELEASE_SPEC }}
+      LIFECYCLE_PYTHON: ${{ vars.LIFECYCLE_PYTHON }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Resolve the release id
+        id: release
+        run: bash scripts/ci/resolve_release_id.sh
+      - name: Provision the release at this commit
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          test -n "$LIFECYCLE_RELEASE_ROOT"
+          test -n "$LIFECYCLE_RELEASE_SPEC"
+          test -n "$LIFECYCLE_PYTHON"
+          "$LIFECYCLE_PYTHON" scripts/ci/release_ctl.py provision --release-root "$LIFECYCLE_RELEASE_ROOT" --release-id "$RELEASE_ID" --spec "$LIFECYCLE_RELEASE_SPEC" --reuse-existing
 
   live:
+    name: Deploy release (paid)
+    needs: provision
     if: >-
-      inputs.mode == 'live'
-      && github.event_name == 'workflow_dispatch'
+      github.repository == 'sathviknookala/llm-behavior-ci'
       && github.ref == 'refs/heads/main'
-      && github.repository == 'sathviknookala/llm-behavior-ci'
+      && ((github.event_name == 'push' && vars.LIFECYCLE_RELEASE_ENABLED == 'true')
+      || (github.event_name == 'workflow_dispatch' && inputs.mode == 'release'))
     runs-on: [self-hosted, linux, llm-behavior-ci-release]
     environment: release-live
     timeout-minutes: 360
@@ -77,23 +140,23 @@ jobs:
       cancel-in-progress: false
     env:
       PYTHONPATH: src
-      RELEASE_ID: ${{ inputs.release_id }}
-      PREVIOUS_RELEASE_ID: ${{ inputs.previous_release_id }}
-      CANARY_ARRIVALS: ${{ inputs.canary_arrivals }}
-      PRODUCTION_ARRIVALS: ${{ inputs.production_arrivals }}
-      CONFIRM_LIVE: ${{ inputs.confirm_live }}
+      RELEASE_ID: ${{ needs.provision.outputs.release_id }}
       LIFECYCLE_RELEASE_ROOT: ${{ vars.LIFECYCLE_RELEASE_ROOT }}
-      LIFECYCLE_SERVICE_URL: ${{ vars.LIFECYCLE_SERVICE_URL }}
       LIFECYCLE_PYTHON: ${{ vars.LIFECYCLE_PYTHON }}
-      LIFECYCLE_REFERENCE_ENDPOINT: ${{ vars.LIFECYCLE_REFERENCE_ENDPOINT }}
-      LIFECYCLE_CANDIDATE_ENDPOINT: ${{ vars.LIFECYCLE_CANDIDATE_ENDPOINT }}
     steps:
-      - name: Require explicit authorization
+      - name: Require a provisioned release
         run: |
           test -n "$RELEASE_ID"
-          test "$CONFIRM_LIVE" = "$RELEASE_ID"
+          test -n "$LIFECYCLE_RELEASE_ROOT"
+          test -n "$LIFECYCLE_PYTHON"
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Check the deployed service against the release lineage
+        run: |
+          "$LIFECYCLE_PYTHON" scripts/ci/release_ctl.py check-deployed --release-dir "$LIFECYCLE_RELEASE_ROOT/$RELEASE_ID"
+      - name: Activate the release service
+        run: bash scripts/ci/activate_release.sh
       - name: Run the release lifecycle
         run: bash scripts/ci/run_live_release.sh

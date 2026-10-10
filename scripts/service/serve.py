@@ -35,6 +35,7 @@ from llm_behavior_ci.lifecycle.monitoring import (
     monitoring_period_id,
 )
 from llm_behavior_ci.records import EpisodeResult
+from llm_behavior_ci.runtime.budget import BudgetedRuntimeFactory, ModelCallBudget
 from llm_behavior_ci.runtime.clock import wall_now
 from llm_behavior_ci.runtime.factory import (
     ConfigurationRoutedRuntimeFactory,
@@ -265,6 +266,17 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
         run_configuration_hash(production), frozen.configuration_hash
     )
     store = EpisodeStore(Path(args.store))
+    model_call_budget = None
+    max_model_calls = getattr(args, "max_model_calls", None)
+    if max_model_calls is not None:
+        try:
+            model_call_budget = ModelCallBudget(
+                limit=int(max_model_calls), spent=store.count_model_steps()
+            )
+        except ValueError as error:
+            store.close()
+            raise ConfigError(str(error)) from error
+        runtime_factory = BudgetedRuntimeFactory(runtime_factory, model_call_budget)
     clock = wall_now
     monitor = ProductionMonitor(
         monitor_settings,
@@ -311,12 +323,11 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
         task_mix_monitor=distributional_monitors.get("task_mix"),
         alert_dedup_seconds=float(args.dedup_seconds),
         post_promotion_rollback=post_promotion_rollback,
+        model_call_budget=model_call_budget,
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    if argv is None and len(sys.argv) <= 1:
-        return 2
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Serve the llm-behavior-ci gateway. Requires configuration files "
@@ -346,8 +357,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=POST_PROMOTION_ROLLBACK_POLICIES,
         default="record_only",
     )
+    parser.add_argument("--max-model-calls", default=None, type=int)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    if argv is None and len(sys.argv) <= 1:
+        return 2
+    parser = build_parser()
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
     except SystemExit as error:

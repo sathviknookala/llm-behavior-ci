@@ -559,6 +559,17 @@ class EpisodeStore:
 
         return self._run("load_episode", read)
 
+    def count_model_steps(self) -> int:
+        """Model steps persisted for every episode, finished or not."""
+
+        def read(connection: sqlite3.Connection) -> int:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM steps WHERE kind = 'model'"
+            ).fetchone()
+            return int(row[0])
+
+        return self._run("count_model_steps", read)
+
     def load_finished_episodes(self) -> tuple[EpisodeResult, ...]:
         def read(connection: sqlite3.Connection) -> tuple[EpisodeResult, ...]:
             rows = connection.execute(

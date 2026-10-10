@@ -31,6 +31,7 @@ from llm_behavior_ci.lifecycle.connected import (
     run_three_tier_dev,
 )
 from llm_behavior_ci.lifecycle.monitoring import monitoring_period_id
+from llm_behavior_ci.lifecycle.release import RuntimeTransition
 from llm_behavior_ci.lifecycle.offline_gate import GateCapabilityError
 from llm_behavior_ci.runtime.episode import RuntimeUnavailable
 from llm_behavior_ci.service import ConfigurationRegistry, ServiceError, create_app
@@ -50,6 +51,14 @@ def _load_demo():
 
 
 demo = _load_demo()
+
+
+def release_context(traffic: DevTraffic):
+    commit = traffic.candidate.git_commit
+    return demo.ReleaseContext(
+        lineage=None,
+        transition=RuntimeTransition(commit, commit, "same_commit", "0" * 64, "0" * 64),
+    )
 
 
 class CountingFactory:
@@ -622,7 +631,17 @@ class ReleaseLineageTests(unittest.TestCase):
         production_hash = run_configuration_hash(production)
         candidate_hash = run_configuration_hash(candidate)
         self.assertEqual(record["status"], "promoted")
-        self.assertEqual(record["version"], "release-summary-v2")
+        self.assertEqual(record["version"], "release-summary-v3")
+        self.assertEqual(record["git_commit"], candidate.git_commit)
+        self.assertEqual(
+            record["commits"],
+            {
+                "production": production.git_commit,
+                "candidate": candidate.git_commit,
+                "serving": candidate.git_commit,
+            },
+        )
+        self.assertIsNone(record["runtime"])
         self.assertEqual(
             record["configurations"],
             {
@@ -674,12 +693,12 @@ class ReleaseLineageTests(unittest.TestCase):
         with self.assertRaises(ConnectedLifecycleError):
             require_fresh_store(lifecycle.store_path)
 
-    def test_lineage_refuses_another_commit_and_other_documents(self) -> None:
+    def test_lineage_refuses_a_serving_configuration_rebuilt_at_another_commit(self) -> None:
         record, lifecycle = self._release("healthy")
         candidate = lifecycle.traffic.candidate
         with self.assertRaises(ReleaseLineageError) as caught:
             require_release_lineage(record, replace(candidate, git_commit="f" * 40))
-        self.assertIn("cross-commit rollout is not supported", str(caught.exception))
+        self.assertIn("never rebuilt at another commit", str(caught.exception))
         for document in (
             {**record, "version": "release-summary-v0"},
             {**record, "status": "unknown"},
@@ -755,6 +774,8 @@ class ThreeTierDevCommandTests(unittest.TestCase):
                 with patch.object(
                     demo, "live_inputs", return_value=(None, traffic)
                 ), patch.object(
+                    demo, "release_inputs", return_value=release_context(traffic)
+                ), patch.object(demo, "apply_budgets", return_value=None), patch.object(
                     demo, "run_live", return_value={"status": status}
                 ) as run, patch.object(
                     demo, "release_summary", return_value={"status": status}
@@ -777,22 +798,36 @@ class ThreeTierDevCommandTests(unittest.TestCase):
             with self.subTest(case=name):
                 with patch.object(
                     demo, "live_inputs", return_value=(None, traffic)
-                ), patch.object(demo, "run_live", **effect):
+                ), patch.object(
+                    demo, "release_inputs", return_value=release_context(traffic)
+                ), patch.object(demo, "apply_budgets", return_value=None), patch.object(
+                    demo, "run_live", **effect
+                ):
                     exit_code, output = self._main(_live_argv(self.root))
                 self.assertEqual(exit_code, 4)
                 self.assertEqual(output, "")
                 self.assertFalse((self.root / "release_summary.json").exists())
 
     def test_a_promotion_without_a_release_summary_is_not_a_success(self) -> None:
+        traffic = self._traffic()
         with patch.object(
-            demo, "live_inputs", return_value=(None, self._traffic())
-        ), patch.object(demo, "run_live", return_value={"status": "promoted"}):
+            demo, "live_inputs", return_value=(None, traffic)
+        ), patch.object(
+            demo, "release_inputs", return_value=release_context(traffic)
+        ), patch.object(demo, "apply_budgets", return_value=None), patch.object(
+            demo, "run_live", return_value={"status": "promoted"}
+        ):
             exit_code, output = self._main(_live_argv(self.root))
         self.assertEqual(exit_code, 4)
         self.assertEqual(output, "")
 
     def test_a_broken_lineage_exits_2_before_any_model_call(self) -> None:
-        traffic = self._traffic()
+        previous_root = self.root / "previous"
+        previous_root.mkdir()
+        demo.run_synthetic("healthy", previous_root)
+        previous_store = str(previous_root / "lifecycle.sqlite")
+        lifecycle = demo.build_synthetic("healthy", self.root)
+        traffic = lifecycle.traffic
         previous = self.root / "previous.json"
         previous.write_text(
             json.dumps(
@@ -807,14 +842,24 @@ class ThreeTierDevCommandTests(unittest.TestCase):
         )
         existing = self.root / "existing.json"
         existing.write_text("{}")
+        state = demo.RepositoryState(head=traffic.candidate.git_commit, dirty_paths=())
         for name, overrides in {
-            "mismatched production": {"--previous-release": str(previous)},
-            "missing previous release": {"--previous-release": str(self.root / "none.json")},
+            "summary the store does not confirm": {
+                "--previous-release": str(previous),
+                "--previous-store": previous_store,
+            },
+            "previous release without its store": {"--previous-release": str(previous)},
+            "missing previous release": {
+                "--previous-release": str(self.root / "none.json"),
+                "--previous-store": previous_store,
+            },
             "existing release summary": {"--release-summary": str(existing)},
         }.items():
             with self.subTest(case=name):
                 with patch.object(
-                    demo, "live_inputs", return_value=(None, traffic)
+                    demo, "live_inputs", return_value=(lifecycle.gate, traffic)
+                ), patch.object(
+                    demo, "read_repository_state", return_value=state
                 ), patch.object(demo, "run_live") as run:
                     exit_code, output = self._main(_live_argv(self.root, **overrides))
                 self.assertEqual(exit_code, 2)
@@ -861,6 +906,47 @@ class ThreeTierDevCommandTests(unittest.TestCase):
                 self.assertEqual(summary["status"], status)
                 self.assertTrue(summary["verified"])
                 self.assertEqual(summary["provenance"], "synthetic_fixture")
+
+    def test_synthetic_checks_catch_each_missed_fact(self) -> None:
+        lifecycle_root = self.root / "checks"
+        lifecycle_root.mkdir()
+        summary = demo.run_synthetic("production_regression", lifecycle_root)
+        traffic_root = self.root / "traffic"
+        traffic_root.mkdir()
+        traffic = demo.build_synthetic("production_regression", traffic_root).traffic
+        self.assertTrue(all(summary["checks"].values()))
+        evidence = summary["evidence"]
+        deployment = summary["deployment"]
+        candidate_hash = run_configuration_hash(traffic.candidate)
+        broken = {
+            "deployment_state": {**summary, "deployment": {**deployment, "state": "PROMOTED"}},
+            "serving_configuration": {
+                **summary,
+                "deployment": {**deployment, "serving_configuration_hash": candidate_hash},
+            },
+            "stored_decisions": {
+                **summary,
+                "evidence": {
+                    **evidence,
+                    "deployment_decisions": evidence["deployment_decisions"][:-1],
+                },
+            },
+            "gate_artifact_persisted": {
+                **summary,
+                "evidence": {**evidence, "validation_artifact": {"artifact_id": "0" * 64}},
+            },
+            "episodes_persisted": {
+                **summary,
+                "evidence": {
+                    **evidence,
+                    "episodes_by_configuration_hash": {"0" * 64: 1},
+                },
+            },
+        }
+        for name, document in broken.items():
+            with self.subTest(check=name):
+                checks = demo.synthetic_checks("production_regression", document, traffic)
+                self.assertFalse(checks[name])
 
     def test_a_synthetic_scenario_that_misses_its_outcome_exits_1(self) -> None:
         with patch.object(demo, "run_synthetic", return_value={"status": "promoted"}):

@@ -201,3 +201,18 @@ The experiment config is `configs/models/qwen3_14b_awq_spotify_capability_v2_int
 Z.AI GLM-5.3 is a provisional hosted reference for developing and calibrating the three tiers on `train` and `dev`. It does not replace D7: Qwen3-4B on vLLM stays the production model under study. Sonnet's 14/20 is a different configuration and is not a GLM baseline. On a hosted configuration the Tier 1 gate uses the plan-quality paired bootstrap and MMD; teacher-forced KL is self-hosted only and a hosted gate requiring it fails in preflight. Tier 2 stops on paired binary evaluator success. `horizon_reached_without_harm` promotion is an exposure policy. Every threshold stays DRAFT in `EVAL_PROTOCOL.md`. Hosted lifecycle pairs are GLM against GLM; mixed-provider pairs are refused because the execution seeds differ. Contract and runbook: `docs/HOSTED_LIFECYCLE.md`.
 
 **Open:** whether the 192-token execute cap leaves visible workflow JSON under forced reasoning; the GLM dev task set and its plan specs; whether hosted nondeterminism leaves enough power at an affordable episode count; pricing inputs; `test_normal` task-metadata labels for slices.
+
+## D24 — Cross-commit releases
+
+**Status:** PROPOSED; implemented and CPU-tested, not run live.
+
+A release runs at one clean commit. Its candidate is built there. Its production is release N's serving configuration, carried byte-for-byte with the commit it was built at, never rehashed. The carry is accepted when four checks pass:
+
+- Release N's own store re-derives its summary.
+- The running service serves that configuration with no canary open.
+- The production commit is an ancestor of the release commit.
+- Either the two commits' execution fingerprints match (git object ids of `requirements.txt`, `environments/`, `config.py`, `records.py`, `runtime/`, `tasks/`), or `configs/release/runtime_compatibility.json` at the release commit declares the old fingerprint compatible.
+
+An incompatible runtime change ships as a candidate through the gate and the canary. Paid execution waits for a `release-live` reviewer. Budgets are a static episode bound and hard model-call caps. Contract and setup: `docs/RELEASE_PIPELINE.md`.
+
+**Open:** D12 (whether to register the runner, and the fork-PR exposure on a public repository); the first release's spec, budgets, and baselines; whether execution paths outside the fingerprint (the service, lifecycle, or statistics code) ever need to join it.
