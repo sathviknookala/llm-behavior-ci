@@ -30,10 +30,12 @@ _RELEVANT_FILES = frozenset({"requirements.txt"})
 EXECUTION_PATHS = (
     "requirements.txt",
     "environments",
-    "src/llm_behavior_ci/config.py",
-    "src/llm_behavior_ci/records.py",
-    "src/llm_behavior_ci/runtime",
-    "src/llm_behavior_ci/tasks",
+    "src/llm_behavior_ci",
+    "scripts/service",
+    "scripts/ci",
+    "scripts/demo/run_three_tier_dev.py",
+    "scripts/synthetic/run_connected_lifecycle.py",
+    "configs/tasks",
 )
 _ABSENT = "absent"
 
@@ -192,6 +194,30 @@ def require_commit_id(value: object, label: str) -> str:
     return value
 
 
+def require_full_history(
+    root: Path | None = None,
+    *,
+    runner: Callable[..., object] = subprocess.run,
+) -> None:
+    """Refuse a shallow clone, whose missing history cannot prove ancestry or fingerprints."""
+
+    repo = root if root is not None else repository_root()
+    completed = _run_git(
+        runner,
+        ["git", "rev-parse", "--is-shallow-repository"],
+        repo,
+        "git rev-parse --is-shallow-repository failed",
+    )
+    answer = _stdout(completed, "git rev-parse --is-shallow-repository failed").strip()
+    if answer == "true":
+        raise ProvenanceError(
+            "the repository is a shallow clone; a cross-commit release needs full "
+            "history (actions/checkout fetch-depth: 0)"
+        )
+    if answer != "false":
+        raise ProvenanceError("git rev-parse --is-shallow-repository failed")
+
+
 def is_ancestor(
     ancestor: str,
     descendant: str,
@@ -231,9 +257,14 @@ def execution_fingerprint(
 ) -> str:
     """SHA-256 over the git object ids of the paths that execute an episode at ``commit``.
 
-    Two commits with one fingerprint run a configuration through
-    byte-identical runtime, configuration, task, record, and dependency
-    code. A path absent at ``commit`` contributes ``absent``.
+    ``EXECUTION_PATHS`` is deliberately wide: the whole package (the
+    service, lifecycle, monitors, statistics, storage, and runtime all
+    import one another), the serving, release, and lifecycle scripts and
+    the synthetic fixtures they load, the committed task metadata, and the
+    dependency pins. Two commits with one fingerprint serve, monitor, and
+    roll back a configuration through byte-identical code. Documentation,
+    tests, model templates, and faults are outside it. A path absent at
+    ``commit`` contributes ``absent``.
     """
 
     require_commit_id(commit, "commit")

@@ -271,7 +271,7 @@ def _build_dependencies(args: argparse.Namespace) -> ServiceDependencies:
     if max_model_calls is not None:
         try:
             model_call_budget = ModelCallBudget(
-                limit=int(max_model_calls), spent=store.count_model_steps()
+                limit=int(max_model_calls), store_path=Path(args.store), scope="service"
             )
         except ValueError as error:
             store.close()

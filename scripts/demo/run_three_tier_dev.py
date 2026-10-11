@@ -29,7 +29,8 @@ unless the store confirms the record and the production configuration is
 the one release N left serving, unchanged and at its own commit. A
 production at an older commit is accepted only with that lineage and a
 safe runtime transition (``lifecycle.release``). --max-model-calls caps the
-gate's model calls and --max-episodes the episodes the run can start.
+gate's model calls, reserved durably in the store's ``gate`` scope, and
+--max-episodes the episodes the run can start.
 
 ``release --release-dir DIR`` runs ``live`` from a provisioned release
 (``scripts/ci/release_ctl.py provision``): every path, arrival count,
@@ -559,7 +560,12 @@ def release_inputs(
 
 
 def apply_budgets(args: argparse.Namespace, gate: GateInputs, traffic: DevTraffic) -> GateInputs:
-    """Refuse a run that can start more episodes than --max-episodes, and cap gate model calls."""
+    """Refuse a run that can start more episodes than --max-episodes, and cap gate model calls.
+
+    The gate's reservations live in the ``gate`` scope of ``--store``, so a
+    rerun against the same store resumes the spent count instead of
+    resetting it.
+    """
 
     max_episodes = getattr(args, "max_episodes", None)
     if max_episodes is not None:
@@ -575,12 +581,8 @@ def apply_budgets(args: argparse.Namespace, gate: GateInputs, traffic: DevTraffi
     max_model_calls = getattr(args, "max_model_calls", None)
     if max_model_calls is None:
         return gate
-    return replace(
-        gate,
-        runtime_factory=BudgetedRuntimeFactory(
-            gate.runtime_factory, ModelCallBudget(limit=int(max_model_calls))
-        ),
-    )
+    budget = ModelCallBudget(limit=int(max_model_calls), store_path=Path(args.store), scope="gate")
+    return replace(gate, runtime_factory=BudgetedRuntimeFactory(gate.runtime_factory, budget))
 
 
 def write_release_summary(path: Path, document: dict[str, object]) -> None:

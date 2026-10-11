@@ -26,6 +26,8 @@ point() {
   ln -sfn "$1" "$LIFECYCLE_RELEASE_ROOT/.active.next" && mv -Tf "$LIFECYCLE_RELEASE_ROOT/.active.next" "$active"
 }
 
+"$LIFECYCLE_PYTHON" scripts/ci/release_ctl.py verify --release-dir "$release" \
+  || fail "release $RELEASE_ID does not verify at HEAD; the service was not touched"
 point "$RELEASE_ID" || fail "could not point the service at $RELEASE_ID" 4
 if "$SYSTEMCTL" --user restart "$LIFECYCLE_SERVICE_UNIT" \
   && "$LIFECYCLE_PYTHON" scripts/ci/release_ctl.py wait-registered --release-dir "$release"; then

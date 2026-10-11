@@ -12,13 +12,21 @@ service over: D verifies at HEAD, still continues ``LATEST``, its previous
 summary is unchanged, and the running service serves D's production with
 no canary open (or, for a first release, nothing answers on D's port).
 
+``verify --release-dir D`` checks D at HEAD from the trusted checkout:
+every pinned file, every configuration, and the archived code tree
+(``code_tree_digest``). ``activate_release.sh`` runs it before pointing
+the service at D, because ``serve``'s own check runs from the tree it
+checks.
+
 ``wait-registered --release-dir D`` polls ``GET /deployment`` until the
 service registers D's production and candidate with no canary state.
 
 ``serve --release-dir D`` is the persistent service's entry point. It runs
 from ``D/code`` (the release commit's ``git archive``), refuses a manifest
-or code tree that is not that release's, and starts ``serve.py`` with
-arguments read only from the manifest.
+or code tree that is not that release's (any added, removed, or changed
+file under ``D/code``), and starts ``serve.py`` with arguments read only
+from the manifest. No bytecode is written, so running never changes the
+tree it verifies.
 
 Output is hashes and outcomes only. Exit 0 on success, 2 for an invalid or
 unsafe release, 4 when the service cannot be reached or does not register.
@@ -35,6 +43,8 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 _REPO = Path(__file__).resolve().parents[2]
 if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
@@ -42,7 +52,6 @@ if str(_REPO / "src") not in sys.path:
 from llm_behavior_ci.config import ConfigError  # noqa: E402
 from llm_behavior_ci.lifecycle.connected import ConnectedLifecycleError  # noqa: E402
 from llm_behavior_ci.lifecycle.release import (  # noqa: E402
-    CODE_COMMIT_FILE,
     CODE_DIR,
     ReleaseError,
     load_release_spec,
@@ -163,6 +172,20 @@ def check_deployed(args: argparse.Namespace, fetch: Callable[[str], dict[str, ob
     return 0
 
 
+def verify(args: argparse.Namespace) -> int:
+    release_dir = Path(args.release_dir)
+    manifest = verify_release_manifest(release_dir, head=read_repository_state().head)
+    code = manifest["code"]
+    assert isinstance(code, dict)
+    print(
+        json.dumps(
+            {"release_id": release_dir.name, "verified": True, "code_sha256": code["sha256"]},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def wait_registered(
     args: argparse.Namespace,
     fetch: Callable[[str], dict[str, object]],
@@ -214,11 +237,6 @@ def serve(args: argparse.Namespace) -> int:
     code = release_dir / CODE_DIR
     if _REPO != code.resolve():
         raise ReleaseError("the release service must run from the release's own code")
-    commit_file = code / CODE_COMMIT_FILE
-    if not commit_file.is_file() or commit_file.read_text(encoding="utf-8").strip() != manifest[
-        "release_commit"
-    ]:
-        raise ReleaseError("release code is not the release commit")
     import llm_behavior_ci
 
     if code.resolve() not in Path(llm_behavior_ci.__file__).resolve().parents:
@@ -241,7 +259,7 @@ def main(
     provision_parser.add_argument("--release-id", required=True)
     provision_parser.add_argument("--spec", required=True)
     provision_parser.add_argument("--reuse-existing", action="store_true")
-    for name in ("check-deployed", "serve"):
+    for name in ("check-deployed", "verify", "serve"):
         commands.add_parser(name).add_argument("--release-dir", required=True)
     wait = commands.add_parser("wait-registered")
     wait.add_argument("--release-dir", required=True)
@@ -255,6 +273,8 @@ def main(
             return provision(args, fetch)
         if args.command == "check-deployed":
             return check_deployed(args, fetch)
+        if args.command == "verify":
+            return verify(args)
         if args.command == "wait-registered":
             return wait_registered(args, fetch)
         return serve(args)

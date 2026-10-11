@@ -37,6 +37,7 @@ from llm_behavior_ci.lifecycle.release import (
     STORE_FILE,
     SUMMARY_FILE,
     ReleaseError,
+    code_tree_digest,
     load_release_spec,
     provision_release,
     read_latest,
@@ -52,15 +53,16 @@ from llm_behavior_ci.lifecycle.release import (
     write_latest,
 )
 from llm_behavior_ci.runtime.budget import BudgetedRuntimeFactory, ModelCallBudget
-from llm_behavior_ci.runtime.episode import RuntimeDependencies
+from llm_behavior_ci.runtime.episode import RuntimeDependencies, RuntimeUnavailable
 from llm_behavior_ci.runtime.factory import StaticRuntimeFactory
 from llm_behavior_ci.runtime.provenance import (
+    ProvenanceError,
     RepositoryState,
     execution_fingerprint,
     is_ancestor,
 )
 from llm_behavior_ci.service import create_app
-from llm_behavior_ci.storage import DeploymentDecisionRecord, EpisodeStore
+from llm_behavior_ci.storage import DeploymentDecisionRecord, EpisodeStore, ModelCallLedger
 from llm_behavior_ci.tasks.selection import TaskSet
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -262,12 +264,13 @@ def _configuration(path: Path) -> RunConfiguration:
 
 
 def release_dependencies(
-    release_dir: Path, *, scenario: str, model_calls: int | None = None
+    release_dir: Path, *, scenario: str, model_calls: int | None = None, world=None
 ):
     """The service ``serve.py`` builds from the release manifest, on injected worlds.
 
-    ``model_calls`` replaces the manifest's service budget limit, keeping
-    the calls already persisted in the store as spent.
+    ``model_calls`` replaces the manifest's service budget limit; the calls
+    already reserved in the store stay spent. ``world`` replaces the
+    scenario's runtime factory.
     """
 
     manifest = verify_release_manifest(release_dir)
@@ -278,12 +281,13 @@ def release_dependencies(
         built = replace(
             built,
             model_call_budget=ModelCallBudget(
-                limit=model_calls, spent=built.model_call_budget.spent
+                limit=model_calls, store_path=release_dir / STORE_FILE, scope="service"
             ),
         )
     clock = synthetic._clock()
     candidate_hash = manifest["configurations"]["candidate"]["hash"]
-    world = demo._world(clock, candidate_hash=candidate_hash, scenario=scenario)
+    if world is None:
+        world = demo._world(clock, candidate_hash=candidate_hash, scenario=scenario)
     factory = (
         world
         if built.model_call_budget is None
@@ -375,6 +379,55 @@ class GitFactsTests(unittest.TestCase):
         self.assertTrue(is_ancestor(a, c, self.repo))
         self.assertFalse(is_ancestor(c, a, self.repo))
 
+    def test_serving_and_lifecycle_changes_change_the_fingerprint(self) -> None:
+        behavior = {
+            "service": "src/llm_behavior_ci/service.py",
+            "canary": "src/llm_behavior_ci/lifecycle/canary.py",
+            "monitor": "src/llm_behavior_ci/lifecycle/monitoring.py",
+            "detector": "src/llm_behavior_ci/stats/cusum.py",
+            "storage": "src/llm_behavior_ci/storage.py",
+            "protocol": "src/llm_behavior_ci/experiments/protocol.py",
+            "serve": "scripts/service/serve.py",
+            "release_ctl": "scripts/ci/release_ctl.py",
+            "activation": "scripts/ci/activate_release.sh",
+            "lifecycle_command": "scripts/demo/run_three_tier_dev.py",
+            "lifecycle_fixtures": "scripts/synthetic/run_connected_lifecycle.py",
+            "task_metadata": "configs/tasks/train_example.json",
+            "dependencies": "environments/service-requirements.txt",
+        }
+        for label, path in behavior.items():
+            with self.subTest(changed=label):
+                before = _git(self.repo, "rev-parse", "HEAD")
+                after = self.repository.commit(label, {path: f"{label} changed\n"})
+                self.assertNotEqual(
+                    execution_fingerprint(before, self.repo),
+                    execution_fingerprint(after, self.repo),
+                )
+                with self.assertRaisesRegex(ReleaseError, "execution code changed"):
+                    require_runtime_transition(before, after, self.repo)
+
+    def test_documentation_and_test_changes_keep_the_fingerprint(self) -> None:
+        inert = {
+            "readme": "README.md",
+            "docs": "docs/RELEASE_PIPELINE.md",
+            "tests": "tests/unit/test_example.py",
+            "model_template": "configs/models/unused.json",
+            "fault": "configs/faults/unused.json",
+            "workflow": ".github/workflows/release-lifecycle.yml",
+        }
+        for label, path in inert.items():
+            with self.subTest(changed=label):
+                before = _git(self.repo, "rev-parse", "HEAD")
+                after = self.repository.commit(label, {path: f"{label} changed\n"})
+                self.assertEqual(
+                    execution_fingerprint(before, self.repo),
+                    execution_fingerprint(after, self.repo),
+                )
+                self.assertEqual(
+                    require_runtime_transition(before, after, self.repo).basis,
+                    "identical_execution",
+                )
+
     def test_runtime_transitions(self) -> None:
         a = self.repository.commits["A"]
         b = self.repository.commit("B", {"README.md": "docs only\n"})
@@ -412,6 +465,37 @@ class GitFactsTests(unittest.TestCase):
         for bad in ("short", "A" * 40, 7):
             with self.assertRaises(ReleaseError):
                 require_runtime_transition(bad, d, self.repo)
+
+    def test_a_shallow_checkout_refuses_a_cross_commit_release_and_full_history_allows_it(
+        self,
+    ) -> None:
+        a = self.repository.commits["A"]
+        b = self.repository.commit("B", {"README.md": "docs only\n"})
+        checkouts = Path(self._tmpdir.name) / "checkouts"
+        checkouts.mkdir()
+        source = self.repo.as_uri()
+        shallow = checkouts / "shallow"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", source, str(shallow)],
+            check=True,
+            capture_output=True,
+        )
+        self.assertEqual(_git(shallow, "rev-parse", "HEAD"), b)
+        with self.assertRaisesRegex(ReleaseError, "shallow clone"):
+            require_runtime_transition(a, b, shallow)
+        self.assertEqual(require_runtime_transition(b, b, shallow).basis, "same_commit")
+        with self.assertRaises(ProvenanceError):
+            execution_fingerprint(a, shallow)
+        full = checkouts / "full"
+        subprocess.run(
+            ["git", "clone", "-q", "--no-local", source, str(full)],
+            check=True,
+            capture_output=True,
+        )
+        _git(full, "checkout", "-q", "--detach", b)
+        self.assertEqual(require_runtime_transition(a, b, full).basis, "identical_execution")
+        _git(shallow, "fetch", "-q", "--unshallow")
+        self.assertEqual(require_runtime_transition(a, b, shallow).basis, "identical_execution")
 
     def test_a_malformed_compatibility_file_is_refused(self) -> None:
         a = self.repository.commits["A"]
@@ -681,6 +765,107 @@ class ProvisioningTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseError, "changed after provisioning"):
             verify_release_manifest(self.releases / "r1")
 
+    def _writable_code(self, release: Path) -> Path:
+        code = release / "code"
+        for path in (code, *code.rglob("*")):
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode | 0o200)
+        return code
+
+    def test_the_archived_code_tree_is_pinned_without_git(self) -> None:
+        manifest = self.repository.provision("r1", "A")
+        release = self.releases / "r1"
+        code = release / "code"
+        self.assertFalse((code / ".git").exists())
+        self.assertEqual(manifest["code"]["version"], "release-code-v1")
+        self.assertEqual(manifest["code"], code_tree_digest(code))
+        self.assertGreater(manifest["code"]["entries"], 5)
+        self.assertEqual(json.loads((release / MANIFEST_FILE).read_text())["version"], "release-manifest-v2")
+        (release / "lifecycle_summary.attempt.json").write_text("{}")
+        (release / "lifecycle_stderr.attempt.txt").write_text("")
+        (release / SUMMARY_FILE).write_text("{}")
+        store = EpisodeStore(release / STORE_FILE)
+        store.close()
+        ModelCallBudget(limit=3, store_path=release / STORE_FILE, scope="service").call(
+            "generation", lambda: None
+        )
+        self.assertEqual(verify_release_manifest(release)["release_id"], "r1")
+
+    def test_any_change_to_the_archived_code_is_refused(self) -> None:
+        tampers = {
+            "modified source": lambda code: (code / "src/llm_behavior_ci/config.py").write_text(
+                "CONFIG = 2\n"
+            ),
+            "added module": lambda code: (code / "src/llm_behavior_ci/sitecustomize.py").write_text(
+                "import os\n"
+            ),
+            "added bytecode": lambda code: (
+                (code / "src/llm_behavior_ci/__pycache__").mkdir(),
+                (code / "src/llm_behavior_ci/__pycache__/config.cpython-312.pyc").write_bytes(b"x"),
+            ),
+            "deleted file": lambda code: (code / "src/llm_behavior_ci/records.py").unlink(),
+            "added symlink": lambda code: (code / "src/llm_behavior_ci/linked.py").symlink_to(
+                "/etc/hostname"
+            ),
+            "file replaced by symlink": lambda code: (
+                (code / "src/llm_behavior_ci/config.py").unlink(),
+                (code / "src/llm_behavior_ci/config.py").symlink_to("records.py"),
+            ),
+            "executable bit": lambda code: (code / "README.md").chmod(0o755),
+            "renamed file": lambda code: (code / "README.md").rename(code / "README.txt"),
+            "added empty directory": lambda code: (code / "extra").mkdir(),
+        }
+        for index, (label, tamper) in enumerate(tampers.items()):
+            with self.subTest(tamper=label):
+                release_id = f"t{index}"
+                self.repository.provision(release_id, "A")
+                release = self.releases / release_id
+                code = self._writable_code(release)
+                commit = (code / "RELEASE_COMMIT").read_text()
+                tamper(code)
+                self.assertEqual((code / "RELEASE_COMMIT").read_text(), commit)
+                with self.assertRaisesRegex(ReleaseError, "release code changed after provisioning"):
+                    verify_release_manifest(release)
+
+    def test_a_retargeted_symlink_and_a_replaced_code_directory_are_refused(self) -> None:
+        self.repository.commit("links", {"docs/target.md": "one\n", "docs/other.md": "two\n"})
+        (self.repository.repo / "docs" / "link.md").symlink_to("target.md")
+        a = self.repository.commit("link", {})
+        self.repository.provision("r1", "link")
+        release = self.releases / "r1"
+        self.assertEqual(os.readlink(release / "code" / "docs" / "link.md"), "target.md")
+        self.assertEqual(verify_release_manifest(release)["release_commit"], a)
+        code = self._writable_code(release)
+        (code / "docs" / "link.md").unlink()
+        (code / "docs" / "link.md").symlink_to("other.md")
+        with self.assertRaisesRegex(ReleaseError, "release code changed"):
+            verify_release_manifest(release)
+        self.repository.provision("r2", "link")
+        second = self.releases / "r2"
+        moved = self.releases / "r2-code"
+        (second / "code").rename(moved)
+        (second / "code").symlink_to(moved)
+        with self.assertRaisesRegex(ReleaseError, "real directory"):
+            verify_release_manifest(second)
+
+    def test_a_manifest_that_does_not_pin_its_code_is_refused(self) -> None:
+        self.repository.provision("r1", "A")
+        release = self.releases / "r1"
+        path = release / MANIFEST_FILE
+        document = json.loads(path.read_text())
+        path.chmod(0o644)
+        for label, change in {
+            "missing": lambda d: d.pop("code"),
+            "old version": lambda d: d.update(version="release-manifest-v1"),
+            "wrong digest": lambda d: d["code"].update(sha256="0" * 64),
+        }.items():
+            with self.subTest(case=label):
+                edited = json.loads(json.dumps(document))
+                change(edited)
+                path.write_text(json.dumps(edited))
+                with self.assertRaises(ReleaseError):
+                    verify_release_manifest(release)
+
     def test_consecutive_releases_carry_production_across_commits(self) -> None:
         self.repository.provision("r1", "A")
         record1, deployment1 = run_release(self.releases / "r1", scenario="none")
@@ -695,6 +880,27 @@ class ProvisioningTests(unittest.TestCase):
             self.repository.provision(
                 "r2", "B", candidate={"template": "configs/models/candidate_v3.json", "fault": None}
             )
+        shallow = Path(self._tmpdir.name) / "shallow"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth", "1", self.repository.repo.as_uri(), str(shallow)],
+            check=True,
+            capture_output=True,
+        )
+        with self.assertRaisesRegex(ReleaseError, "shallow clone"):
+            provision_release(
+                load_release_spec(
+                    self.repository.write_spec(
+                        candidate={"template": "configs/models/candidate_v3.json", "fault": None}
+                    )
+                ),
+                release_root=self.releases,
+                release_id="r2",
+                state=RepositoryState(head=b, dirty_paths=()),
+                deployment=deployment1,
+                now=_NOW,
+                root=shallow,
+            )
+        self.assertFalse((self.releases / "r2").exists())
         manifest2 = self.repository.provision(
             "r2",
             "B",
@@ -887,6 +1093,57 @@ class ProvisioningTests(unittest.TestCase):
         self.assertGreater(persisted, spent)
         self.assertEqual(dependencies.model_call_budget.spent, persisted)
 
+    def test_a_failed_provider_call_stays_spent_across_service_restarts(self) -> None:
+        self.repository.provision("r1", "A")
+        release = self.releases / "r1"
+        record, _ = run_release(release, scenario="none")
+        self.assertEqual(record["status"], "promoted")
+        spent = release_dependencies(release, scenario="none").model_call_budget.spent
+        attempts = []
+
+        class FailingProvider:
+            def begin(self, context, config) -> None:
+                del context, config
+
+            def next_turn(self, *, tool_output):
+                del tool_output
+                attempts.append(1)
+                raise RuntimeUnavailable("provider returned 503")
+
+        def failing_world(configuration):
+            return RuntimeDependencies(
+                session_factory=lambda task_id: synthetic.FakeSession(task_id),
+                agent=FailingProvider(),
+                clock=synthetic._clock(),
+            )
+
+        turn_limit = release_traffic(release).candidate.agent.execute_turn_limit
+        limit = spent + turn_limit
+        failing = release_dependencies(
+            release, scenario="none", model_calls=limit, world=failing_world
+        )
+        with TestClient(create_app(failing)) as client:
+            served = client.post("/episodes", json={"task_id": "dev-steady-0", "mode": "execute"})
+        self.assertEqual(served.status_code, 200)
+        self.assertEqual(len(attempts), 1)
+        store = EpisodeStore(release / STORE_FILE)
+        try:
+            steps = store.count_model_steps()
+        finally:
+            store.close()
+        self.assertEqual(steps, spent)
+        restarted = release_dependencies(release, scenario="none", model_calls=limit)
+        self.assertEqual(restarted.model_call_budget.spent, spent + 1)
+        self.assertEqual(
+            ModelCallLedger(release / STORE_FILE).states("service").get("failed"), 1
+        )
+        with TestClient(create_app(restarted)) as client:
+            refused = client.post(
+                "/episodes", json={"task_id": "dev-steady-1", "mode": "execute"}
+            )
+        self.assertEqual(refused.status_code, 503)
+        self.assertIn("budget", refused.json()["detail"])
+
 
 class ReleaseSpecTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -991,7 +1248,10 @@ class ReleaseCommandTests(unittest.TestCase):
         self.assertEqual(captured["service_url"], "http://127.0.0.1:8765")
         self.assertEqual(captured["store_path"], self.release / STORE_FILE)
         self.assertIsInstance(captured["gate"].runtime_factory, BudgetedRuntimeFactory)
-        self.assertEqual(captured["gate"].runtime_factory.budget.limit, 100)
+        gate_budget = captured["gate"].runtime_factory.budget
+        self.assertEqual(gate_budget.limit, 100)
+        self.assertEqual(gate_budget.scope, "gate")
+        self.assertEqual(gate_budget.store_path, self.release / STORE_FILE)
         self.assertEqual(len(captured["traffic"].canary_task_ids), len(demo.CANARY_TASK_IDS))
         self.assertEqual(read_latest(self.repository.releases), "r1")
 
@@ -1022,6 +1282,45 @@ class ReleaseCommandTests(unittest.TestCase):
             code = release_ctl.main(["serve", "--release-dir", str(self.release)])
         self.assertEqual(code, 2)
         self.assertIn("release's own code", stderr.getvalue())
+
+    def test_tampered_release_code_fails_reuse_check_deployed_verify_and_serve(self) -> None:
+        state = self.state
+        self.assertEqual(self._ctl(["verify", "--release-dir", str(self.release)], state)[0], 0)
+        target = self.release / "code" / "src" / "llm_behavior_ci" / "config.py"
+        for path in (self.release / "code", target.parent, target):
+            path.chmod(path.stat().st_mode | 0o200)
+        target.write_text("CONFIG = 'tampered'\n")
+        spec = self.repository.write_spec()
+        for argv in (
+            [
+                "provision",
+                "--release-root", str(self.repository.releases),
+                "--release-id", "r1",
+                "--spec", str(spec),
+                "--reuse-existing",
+            ],
+            ["check-deployed", "--release-dir", str(self.release)],
+            ["verify", "--release-dir", str(self.release)],
+            ["serve", "--release-dir", str(self.release)],
+        ):
+            with self.subTest(command=argv[0]):
+                code, _, stderr = self._ctl(argv, state)
+                self.assertEqual(code, 2)
+                self.assertIn("release code changed after provisioning", stderr)
+        code, _, _ = self._release()
+        self.assertEqual(code, 2)
+        self.assertIsNone(read_latest(self.repository.releases))
+
+    def _ctl(self, argv, state):
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        def unreachable(url: str):
+            raise release_ctl.ServiceUnreachable(f"no service answers at {url}")
+
+        with patch.object(release_ctl, "read_repository_state", return_value=state):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = release_ctl.main(argv, fetch=unreachable)
+        return code, stdout.getvalue(), stderr.getvalue()
 
     def test_release_ctl_reports_an_unreachable_service(self) -> None:
         def unreachable(url: str):

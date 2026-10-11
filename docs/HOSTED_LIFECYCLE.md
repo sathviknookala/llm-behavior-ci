@@ -315,6 +315,10 @@ It holds no task id, trace, or store path. `--previous-release` accepts v1, v2, 
 
 A production built at an older commit is accepted only through that lineage. `release --release-dir` runs the same checks from a provisioned release directory.
 
+**Safe runtime transition.** The production commit must be an ancestor of the release commit, in a checkout with full history (a shallow clone is refused). The execution fingerprints at the two commits must match, or the release commit must declare the older one compatible in `configs/release/runtime_compatibility.json`. The fingerprint covers the whole `src/llm_behavior_ci` package, `scripts/service/`, `scripts/ci/`, the lifecycle command and the synthetic fixtures it loads, `configs/tasks/`, `requirements.txt`, and `environments/`. Documentation, tests, model templates, and faults are outside it.
+
+**Durable model-call budgets.** `--max-model-calls` (the gate, scope `gate`) and `serve.py --max-model-calls` (the service, scope `service`) each record a reservation in the release store before every generation and every teacher-forced scoring call. No model is called unless that reservation committed. A call that fails, times out, or is cut off by a crash stays charged. A restarted service, or a rerun against the same store, continues from the reserved count. The service scope also counts model steps already in the store, so an older store without reservations does not refund its calls.
+
 ### 8c. Test-only Tier 2 canary on real agents (documented, not run)
 
 `scripts/demo/run_tier2_canary_test.py` runs the real canary, with real hosted agents and AppWorld dev worlds, without running Tier 1. It is an integration test of the downstream software, not a release. Its admission evidence is a PASS artifact labelled `synthetic_fixture`, which the harness builds itself; no gate produced it. Every summary says `test_only_admission: true` and `gate_executed: false`. A Tier 1 result from another run, such as a BLOCK, is not read, changed, or reinterpreted.

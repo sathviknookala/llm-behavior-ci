@@ -116,6 +116,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ]
         self.assertEqual(order, sorted(order))
 
+    def test_the_release_jobs_check_out_the_pinned_commit_with_full_history(self) -> None:
+        for name in ("provision", "live"):
+            with self.subTest(job=name):
+                job = _block(self.lines, f"{name}:", 2)
+                start = next(
+                    index
+                    for index, line in enumerate(job)
+                    if line.strip() == "- uses: actions/checkout@v4"
+                )
+                options = [line.strip() for line in _block(job[start:], "with:", 8)]
+                self.assertIn("ref: ${{ github.sha }}", options)
+                self.assertIn("fetch-depth: 0", options)
+                self.assertIn("persist-credentials: false", options)
+                self.assertEqual(sum(line.strip().startswith("- uses: actions/checkout") for line in job), 1)
+
     def test_only_the_release_jobs_reach_the_trusted_runner(self) -> None:
         for job in ("cpu", "synthetic"):
             self.assertNotIn("self-hosted", self._job(job))
@@ -164,7 +179,59 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("EnvironmentFile=%h/.config/llm-behavior-ci/release.env", unit)
         self.assertIn('"$LIFECYCLE_RELEASE_ROOT/active/code/scripts/ci/release_ctl.py" serve', unit)
         self.assertIn("Restart=on-failure", unit)
+        self.assertIn("Environment=PYTHONDONTWRITEBYTECODE=1", unit)
         self.assertNotIn("API_KEY", unit)
+
+
+def _triggers(text: str) -> list[str]:
+    lines = text.splitlines()
+    return _keys(_block(lines, "on:", 0), 2)
+
+
+def _check_names(text: str) -> list[str]:
+    lines = text.splitlines()
+    jobs = _block(lines, "jobs:", 0)
+    names = []
+    for job_id in _keys(jobs, 2):
+        body = _block(jobs, f"{job_id}:", 2)
+        declared = [line.strip()[len("name:") :].strip() for line in body if line.startswith("    name:")]
+        names.append(declared[0] if declared else job_id)
+    return names
+
+
+class BranchProtectionDocumentationTests(unittest.TestCase):
+    """The checks the operator is told to require must report on every pull request."""
+
+    def setUp(self) -> None:
+        text = (_ROOT / "docs" / "RELEASE_PIPELINE.md").read_text(encoding="utf-8")
+        match = re.search(r"Required status checks: ((?:`[^`]+`(?:, )?)+)\.", text)
+        self.assertIsNotNone(match)
+        self.required = re.findall(r"`([^`]+)`", match.group(1))
+        self.workflows = {
+            path.name: path.read_text(encoding="utf-8") for path in sorted(_WORKFLOWS.glob("*.yml"))
+        }
+
+    def test_every_required_check_is_a_job_that_runs_on_pull_requests(self) -> None:
+        self.assertEqual(self.required, ["offline-tests"])
+        for check in self.required:
+            with self.subTest(check=check):
+                owners = [
+                    name for name, text in self.workflows.items() if check in _check_names(text)
+                ]
+                self.assertEqual(owners, ["offline-tests.yml"])
+                text = self.workflows[owners[0]]
+                self.assertIn("pull_request", _triggers(text))
+                self.assertNotIn("self-hosted", text)
+
+    def test_no_release_lifecycle_check_can_be_required(self) -> None:
+        release = self.workflows["release-lifecycle.yml"]
+        self.assertEqual(_triggers(release), ["push", "workflow_dispatch"])
+        for check in _check_names(release):
+            self.assertNotIn(check, self.required)
+        self.assertEqual(
+            _check_names(release),
+            ["CPU verification", "Synthetic lifecycle", "Provision release", "Deploy release (paid)"],
+        )
 
 
 class ResolveReleaseIdTests(unittest.TestCase):
@@ -312,10 +379,13 @@ class ActivateReleaseTests(unittest.TestCase):
         self.python = _executable(
             self.root / "python",
             'echo "python $* -> $(readlink "$LIFECYCLE_RELEASE_ROOT/active")" >> "$LOG"\n'
+            'if [[ "$2" == verify ]]; then exit "$VERIFY_CODE"; fi\n'
             'exit "$REGISTER_CODE"\n',
         )
 
-    def _activate(self, release_id: str, register_code: int) -> subprocess.CompletedProcess[str]:
+    def _activate(
+        self, release_id: str, register_code: int, verify_code: int = 0
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(_ACTIVATE)],
             cwd=_ROOT,
@@ -326,6 +396,7 @@ class ActivateReleaseTests(unittest.TestCase):
                 "SYSTEMCTL": str(self.systemctl),
                 "RELEASE_ID": release_id,
                 "REGISTER_CODE": str(register_code),
+                "VERIFY_CODE": str(verify_code),
                 "LOG": str(self.log),
             },
             capture_output=True,
@@ -338,6 +409,10 @@ class ActivateReleaseTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(os.readlink(self.releases / "active"), "r1")
         log = self.log.read_text()
+        self.assertLess(
+            log.index(f"release_ctl.py verify --release-dir {self.releases}/r1"),
+            log.index("systemctl --user restart"),
+        )
         self.assertIn("systemctl --user restart llm-behavior-ci-release.service -> r1", log)
         self.assertIn(f"wait-registered --release-dir {self.releases}/r1 -> r1", log)
 
@@ -347,6 +422,14 @@ class ActivateReleaseTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 4)
         self.assertEqual(os.readlink(self.releases / "active"), "r1")
         self.assertTrue(self.log.read_text().rstrip().endswith("-> r1"))
+
+    def test_a_release_that_does_not_verify_is_never_activated(self) -> None:
+        self._activate("r1", 0)
+        completed = self._activate("r2", 0, verify_code=2)
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(os.readlink(self.releases / "active"), "r1")
+        self.assertEqual(self.log.read_text().count("systemctl"), 1)
+        self.assertIn("does not verify", completed.stderr)
 
     def test_a_first_release_that_does_not_register_leaves_nothing_active(self) -> None:
         completed = self._activate("r1", 4)

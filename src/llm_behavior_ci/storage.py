@@ -3,6 +3,10 @@
 Steps are committed as they arrive under one writer lock. An open episode
 is not an EpisodeResult. Interrupted open episodes reload with the steps
 already appended. Alert and deployment-decision rows are local only.
+
+``ModelCallLedger`` keeps durable model-call reservations in the same
+SQLite file. A reservation is written before a model is called and is a
+charge whatever happens next.
 """
 
 from __future__ import annotations
@@ -21,6 +25,17 @@ from llm_behavior_ci.records import EpisodeResult, ModelStep, PairedResult, Tool
 
 _T = TypeVar("_T")
 _DUMP = {"sort_keys": True, "separators": (",", ":"), "ensure_ascii": False}
+_MODEL_CALLS_TABLE = """
+CREATE TABLE IF NOT EXISTS model_calls (
+  call_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL,
+  reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+MODEL_CALL_KINDS = ("generation", "teacher_force")
+MODEL_CALL_OUTCOMES = ("completed", "failed")
 
 
 class StorageError(ValueError):
@@ -421,6 +436,7 @@ class EpisodeStore:
                 )
                 """
             )
+            connection.execute(_MODEL_CALLS_TABLE)
             connection.commit()
         except sqlite3.Error as error:
             raise StorageError("open failed") from error
@@ -959,3 +975,143 @@ class EpisodeStore:
                 connection.close()
             except sqlite3.Error as error:
                 raise StorageError("close failed") from error
+
+
+class ModelCallLedger:
+    """Durable model-call reservations in an episode store's SQLite file.
+
+    Every operation opens its own connection, so any thread or process may
+    share one ledger. ``reserve`` holds SQLite's write lock
+    (``BEGIN IMMEDIATE``) while it counts the scope's reservations and
+    inserts the next one, so two callers can never both take the last
+    unit. The ledger leaves the journal mode to ``EpisodeStore``, which
+    creates every store before a budget reads it. A reservation stays
+    charged whether it is later settled
+    ``completed``, settled ``failed``, or never settled because the
+    process died during the call.
+
+    ``include_model_steps`` also counts the model steps persisted in the
+    store and charges the larger of the two counts. Every step written
+    through a budget has its own reservation, so this never double
+    counts; it keeps a store written before reservations existed from
+    refunding its calls.
+    """
+
+    def __init__(self, path: Path, *, timeout_seconds: float = 30.0) -> None:
+        self.path = Path(path)
+        self.timeout_seconds = float(timeout_seconds)
+
+    def _connect(self) -> sqlite3.Connection:
+        if not self.path.parent.is_dir():
+            raise StorageError("parent directory does not exist")
+        try:
+            connection = sqlite3.connect(
+                self.path, timeout=self.timeout_seconds, isolation_level=None
+            )
+        except sqlite3.Error as error:
+            raise StorageError("model-call ledger open failed") from error
+        try:
+            connection.execute(_MODEL_CALLS_TABLE)
+        except sqlite3.Error as error:
+            connection.close()
+            raise StorageError("model-call ledger open failed") from error
+        return connection
+
+    @staticmethod
+    def _spent(
+        connection: sqlite3.Connection, scope: str, include_model_steps: bool
+    ) -> int:
+        reserved = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM model_calls WHERE scope = ?", (scope,)
+            ).fetchone()[0]
+        )
+        if not include_model_steps:
+            return reserved
+        has_steps = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'"
+        ).fetchone()
+        if has_steps is None:
+            return reserved
+        steps = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM steps WHERE kind = 'model'"
+            ).fetchone()[0]
+        )
+        return max(reserved, steps)
+
+    def spent(self, scope: str, *, include_model_steps: bool = False) -> int:
+        connection = self._connect()
+        try:
+            return self._spent(connection, scope, include_model_steps)
+        except sqlite3.Error as error:
+            raise StorageError("model-call ledger read failed") from error
+        finally:
+            connection.close()
+
+    def reserve(
+        self,
+        scope: str,
+        kind: str,
+        *,
+        limit: int,
+        include_model_steps: bool = False,
+    ) -> int | None:
+        """Insert one reservation and return its id, or ``None`` when ``limit`` is spent."""
+
+        if kind not in MODEL_CALL_KINDS:
+            raise StorageError("unknown model-call kind")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if self._spent(connection, scope, include_model_steps) >= limit:
+                    connection.execute("ROLLBACK")
+                    return None
+                cursor = connection.execute(
+                    "INSERT INTO model_calls (scope, kind, state) VALUES (?, ?, 'reserved')",
+                    (scope, kind),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            return int(cursor.lastrowid)
+        except sqlite3.Error as error:
+            raise StorageError("model-call reservation failed") from error
+        finally:
+            connection.close()
+
+    def settle(self, call_id: int, outcome: str) -> None:
+        """Record how a reserved call ended. The charge stands either way."""
+
+        if outcome not in MODEL_CALL_OUTCOMES:
+            raise StorageError("unknown model-call outcome")
+        connection = self._connect()
+        try:
+            updated = connection.execute(
+                "UPDATE model_calls SET state = ? WHERE call_id = ? AND state = 'reserved'",
+                (outcome, call_id),
+            ).rowcount
+        except sqlite3.Error as error:
+            raise StorageError("model-call settlement failed") from error
+        finally:
+            connection.close()
+        if updated != 1:
+            raise StorageError("model-call settlement failed")
+
+    def states(self, scope: str) -> dict[str, int]:
+        """Reservation counts by state for ``scope``."""
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT state, COUNT(*) FROM model_calls WHERE scope = ? GROUP BY state",
+                (scope,),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise StorageError("model-call ledger read failed") from error
+        finally:
+            connection.close()
+        return {str(state): int(count) for state, count in rows}

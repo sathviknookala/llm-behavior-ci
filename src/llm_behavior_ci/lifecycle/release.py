@@ -12,8 +12,9 @@ name what serves. A post-promotion rollback recorded after the summary was
 written is accepted, and the known-good configuration then continues.
 
 ``require_runtime_transition`` decides whether code at the release commit
-may execute a configuration built at an earlier commit. The production
-commit must be an ancestor of the release commit, and either the two
+may execute a configuration built at an earlier commit. The checkout must
+have full history (a shallow clone is refused), the production commit
+must be an ancestor of the release commit, and either the two
 commits run episodes through byte-identical execution code
 (``runtime.provenance.execution_fingerprint``) or the release commit's
 ``configs/release/runtime_compatibility.json`` declares the production
@@ -29,8 +30,12 @@ canary open.
 immutable release directory: configurations, task manifests, gate settings,
 plan evidence, task-selection allowance, canary and monitor settings, frozen
 reference, service settings, budgets, a fresh store, a ``git archive`` of
-the release commit for the persistent service, and a ``release-manifest-v1``
-that pins every file by SHA-256. It never overwrites a release.
+the release commit for the persistent service, and a ``release-manifest-v2``
+that pins every file by SHA-256 and the archived code tree by
+``code_tree_digest``. It never overwrites a release.
+
+``verify_release_manifest`` re-checks all of it, code tree included, without
+git, so the persistent service can verify the tree it runs from.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 from collections.abc import Callable, Mapping, Sequence
@@ -90,12 +96,14 @@ from llm_behavior_ci.runtime.provenance import (
     relevant_dirty_paths,
     repository_root,
     require_commit_id,
+    require_full_history,
 )
 from llm_behavior_ci.storage import EpisodeStore
 
 RELEASE_SPEC_VERSION = "release-spec-v1"
 RELEASE_MANIFEST_RECORD = "release_manifest"
-RELEASE_MANIFEST_VERSION = "release-manifest-v1"
+RELEASE_MANIFEST_VERSION = "release-manifest-v2"
+CODE_DIGEST_VERSION = "release-code-v1"
 RUNTIME_COMPATIBILITY_VERSION = "runtime-compatibility-v1"
 RUNTIME_COMPATIBILITY_PATH = "configs/release/runtime_compatibility.json"
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
@@ -304,6 +312,7 @@ def require_runtime_transition(
                 production_execution_fingerprint=release_fingerprint,
                 release_execution_fingerprint=release_fingerprint,
             )
+        require_full_history(root, runner=runner)
         if not is_ancestor(production_commit, release_commit, root, runner=runner):
             raise ReleaseError(
                 f"production commit {production_commit} is not an ancestor of release "
@@ -761,6 +770,62 @@ def _archive_commit(root: Path, commit: str, destination: Path) -> None:
     (destination / CODE_COMMIT_FILE).write_text(commit + "\n", encoding="utf-8")
 
 
+def code_tree_digest(code: Path) -> dict[str, object]:
+    """A deterministic digest of an archived code tree, computed without git.
+
+    Every directory, regular file, and symlink under ``code`` is one entry,
+    sorted by relative path: a file by its SHA-256 and executable bit, a
+    symlink by its target text (never followed), a directory by its name.
+    An added, removed, renamed, or modified entry, a retargeted symlink, or
+    a changed executable bit changes the digest. ``code`` must be a real
+    directory, and any other kind of file in it is refused.
+    """
+
+    code = Path(code)
+    if code.is_symlink() or not code.is_dir():
+        raise ReleaseError("release code must be a real directory")
+    entries: list[list[str]] = []
+
+    def unreadable(error: OSError) -> None:
+        raise ReleaseError(f"release code is unreadable: {error.filename}") from error
+
+    for current, directories, files in os.walk(code, onerror=unreadable, followlinks=False):
+        base = Path(current)
+        for name in (*directories, *files):
+            path = base / name
+            relative = path.relative_to(code).as_posix()
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode):
+                entries.append([relative, "symlink", os.readlink(path)])
+            elif stat.S_ISDIR(mode):
+                entries.append([relative, "directory", ""])
+            elif stat.S_ISREG(mode):
+                executable = "x" if mode & 0o111 else "-"
+                entries.append([relative, "file", f"{executable}{file_sha256(path)}"])
+            else:
+                raise ReleaseError(f"release code holds an unsupported file: {relative}")
+    entries.sort()
+    return {
+        "version": CODE_DIGEST_VERSION,
+        "sha256": _sha256_bytes(json.dumps(entries, separators=(",", ":")).encode("utf-8")),
+        "entries": len(entries),
+    }
+
+
+def require_release_code(release_dir: Path, manifest: Mapping[str, object]) -> None:
+    """Refuse an archived code tree that differs from the one provisioned."""
+
+    pinned = manifest.get("code")
+    if not isinstance(pinned, Mapping) or pinned.get("version") != CODE_DIGEST_VERSION:
+        raise ReleaseError("release manifest does not pin its code tree")
+    code = Path(release_dir) / CODE_DIR
+    if code_tree_digest(code) != dict(pinned):
+        raise ReleaseError("release code changed after provisioning")
+    commit_file = code / CODE_COMMIT_FILE
+    if commit_file.read_text(encoding="utf-8").strip() != manifest.get("release_commit"):
+        raise ReleaseError("release code is not the release commit")
+
+
 def _read_only(path: Path) -> None:
     for item in sorted(path.rglob("*"), reverse=True):
         if item.is_symlink():
@@ -920,6 +985,7 @@ def provision_release(
             (staging / name).write_bytes(payload)
         EpisodeStore(staging / STORE_FILE).close()
         archive(repo, commit, staging / CODE_DIR)
+        code_digest = code_tree_digest(staging / CODE_DIR)
         manifest: dict[str, object] = {
             "record": RELEASE_MANIFEST_RECORD,
             "version": RELEASE_MANIFEST_VERSION,
@@ -959,6 +1025,7 @@ def provision_release(
             "service": dict(spec.service),
             "gate_endpoints": dict(spec.gate_endpoints),
             "files": {name: _sha256_bytes(payload) for name, payload in sorted(documents.items())},
+            "code": code_digest,
         }
         (staging / MANIFEST_FILE).write_bytes(_canonical(manifest))
         _read_only(staging / CODE_DIR)
@@ -1010,9 +1077,12 @@ def _require_frozen(document: Mapping[str, object]) -> None:
 
 
 def verify_release_manifest(release_dir: Path, *, head: str | None = None) -> dict[str, object]:
-    """Load ``release.json`` and refuse a changed file, configuration, or commit.
+    """Load ``release.json`` and refuse a changed file, configuration, code tree, or commit.
 
     With ``head``, the manifest must have been provisioned at that commit.
+    The code tree is checked against its ``code_tree_digest`` and its
+    ``RELEASE_COMMIT``; the store and later lifecycle outputs sit outside
+    it and stay writable.
     """
 
     release_dir = Path(release_dir)
@@ -1021,7 +1091,7 @@ def verify_release_manifest(release_dir: Path, *, head: str | None = None) -> di
         manifest.get("record") != RELEASE_MANIFEST_RECORD
         or manifest.get("version") != RELEASE_MANIFEST_VERSION
     ):
-        raise ReleaseError("not a release-manifest-v1 document")
+        raise ReleaseError(f"not a {RELEASE_MANIFEST_VERSION} document")
     if manifest.get("release_id") != release_dir.name:
         raise ReleaseError("release manifest names another release")
     if head is not None and manifest.get("release_commit") != head:
@@ -1047,6 +1117,7 @@ def verify_release_manifest(release_dir: Path, *, head: str | None = None) -> di
             or configuration.git_commit != entry.get("git_commit")
         ):
             raise ReleaseError(f"release {role} configuration does not match its manifest")
+    require_release_code(release_dir, manifest)
     return dict(manifest)
 
 

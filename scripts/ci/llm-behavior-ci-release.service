@@ -7,6 +7,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/llm-behavior-ci/release.env
+Environment=PYTHONDONTWRITEBYTECODE=1
 WorkingDirectory=%h
 ExecStart=/usr/bin/env bash -c 'exec "$LIFECYCLE_PYTHON" "$LIFECYCLE_RELEASE_ROOT/active/code/scripts/ci/release_ctl.py" serve --release-dir "$LIFECYCLE_RELEASE_ROOT/active"'
 Restart=on-failure
