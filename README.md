@@ -2,6 +2,12 @@
 
 A Python/FastAPI deployment system for tool-using agents, integrating versioned execution, behavioral regression gates, canary routing, durable deployment state, production monitoring, and automated rollback.
 
+**Python 3.12 · FastAPI · SQLite · GitHub Actions**
+
+**Agent execution:** AppWorld · smolagents · vLLM · hosted LLM APIs\
+**Infrastructure:** Uvicorn · Git · Bash · systemd\
+**Evaluation:** custom statistical tests and sequential detectors · SciPy and River reference checks
+
 Changes to an agent's model, prompt, tool interface, or runtime can alter application behavior while its HTTP API remains unchanged. `llm-behavior-ci` connects behavioral evaluation to release control: evaluate a candidate, verify its admission evidence, compare it with production in isolated application environments, and restore the previous configuration when the configured rollback policy fires.
 
 ## Engineering highlights
@@ -14,26 +20,45 @@ Changes to an agent's model, prompt, tool interface, or runtime can alter applic
 
 ## System architecture
 
-The system has two cooperating paths: release orchestration prepares and evaluates configurations; the serving path executes requests and feeds deployment decisions back into routing.
+The system has two cooperating paths. The release-control path prepares a candidate and decides whether it may be admitted. The serving path routes requests by deployment state, executes agents, and feeds canary and monitoring decisions back into routing. SQLite is the system of record shared by both.
 
 ```mermaid
 flowchart TD
-    CI["GitHub Actions / release CLI"] --> R["Versioned release package"]
-    R --> G["Offline regression gate"]
-    G -->|"Persist admission evidence"| DB[("SQLite")]
-    R --> S["FastAPI gateway / Uvicorn"]
-    C["Client / lifecycle driver"] --> S
-    S --> D["Deployment controller"]
-    D -->|"Selected configuration"| A["Agent runtime"]
-    A --> M["vLLM / hosted model API"]
-    A --> W["Isolated AppWorld sessions"]
-    W --> E["Evaluator outcomes"]
-    E --> T["Canary tests / production monitors"]
-    T -->|"Promote / rollback"| D
-    D <--> DB
-    A -->|"Execution records"| DB
-    T -->|"Evidence / alerts"| DB
+    subgraph RC["Release control"]
+        CI["GitHub Actions / release CLI"] --> PKG["Versioned release package<br/>pinned configs · archived code · SHA-256 manifest"]
+        PKG --> GATE["Tier 1: offline regression gate<br/>plan-only comparison on fixed tasks"]
+        GATE --> ART{"Validation artifact"}
+        ART -->|"BLOCK"| HALT["Not admitted<br/>production keeps serving"]
+        ART -->|"PASS"| ADMIT["Candidate admission<br/>POST /candidates verifies evidence<br/>and configuration binding"]
+    end
+
+    subgraph SP["Serving path: FastAPI gateway"]
+        REQ["Client requests<br/>POST /episodes"] --> ROUTER["Deployment router<br/>selects configuration by state"]
+        ROUTER -->|"canary share"| PAIR["Tier 2: paired execution<br/>candidate + production reference"]
+        PAIR --> WORLD["Isolated AppWorld sessions<br/>evaluator outcomes"]
+        WORLD --> SEQ{"Sequential canary test"}
+        SEQ -->|"ROLLBACK"| KEEP["Candidate refused<br/>previous production keeps serving"]
+        SEQ -->|"PROMOTE"| PROD["Production serving<br/>promoted candidate"]
+        ROUTER -->|"production traffic"| PROD
+        PROD --> MON["Tier 3: production monitors"]
+        MON --> POLICY{"Eligible alert and<br/>rollback_on_alert?"}
+        POLICY -->|"no / record_only"| PROD
+        POLICY -->|"ROLLBACK"| RESTORE["Restore previous production"]
+    end
+
+    ADMIT -->|"admitted candidate"| ROUTER
+    RESTORE -->|"route subsequent traffic"| ROUTER
+
+    DB[("SQLite system of record<br/>episodes and steps · validation artifacts<br/>deployment decisions · alerts · budget ledger")]
+    ART -.->|"admission evidence"| DB
+    WORLD -.->|"execution records"| DB
+    SEQ -.->|"canary decision"| DB
+    MON -.->|"alerts"| DB
+    RESTORE -.->|"rollback decision"| DB
+    DB -.->|"restart reconciliation"| ROUTER
 ```
+
+Solid edges are control flow; dotted edges are persistence. A BLOCK artifact ends the release before admission. Admission re-verifies a PASS artifact's provenance and configuration hashes. The canary either keeps the previous production or promotes the candidate. After promotion, an alert triggers rollback only when it is eligible and the service runs the `rollback_on_alert` policy; under the default `record_only` policy it is persisted and the promoted configuration keeps serving. At startup the router rebuilds serving state from the persisted deployment decisions.
 
 AppWorld supplies application state, tool APIs, and objective task evaluation. The repository implements the runtime adapters, execution lifecycle, routing, evidence contracts, persistence, and deployment policy around those interfaces.
 
@@ -102,22 +127,27 @@ The [connected lifecycle command](scripts/demo/run_three_tier_dev.py) drives the
 
 ## Implementation and validation
 
-The evidence below distinguishes real-model integration from synthetic lifecycle verification. CI references are pinned to the reviewed implementation at [`6d9a65d`](https://github.com/sathviknookala/llm-behavior-ci/commit/6d9a65de0021e285314305ef696d27bca766131f).
+Each tier was exercised with real agent execution: GLM-5.3 through Z.AI's API, against AppWorld tasks and AppWorld's evaluator. In every real-model run the candidate differs from production in one sampling parameter, top-p 0.95 → 0.94. The tiers ran as separate demonstrations, not as one uninterrupted release. Post-promotion recovery was then validated end to end with injected runtimes, and GitHub Actions verifies the whole lifecycle on every push.
 
-| Evidence | Verified result |
-| --- | --- |
-| **Real-model execution** | The committed [hosted-agent pilot](results/spotify_capability_20_sonnet_5_5.json) completed 20 AppWorld episodes with 14 evaluator successes, 253 executed tool actions, and zero runtime failures. |
-| **Synthetic release lifecycle** | Four scenarios verify a blocked candidate, successful promotion, canary rollback, and post-promotion rollback, including serving identity and persisted evidence. |
-| **Recovery integration tests** | [Tests](tests/integration/test_production_rollback.py) cover duplicate alerts, in-flight completion during rollback, restart recovery, interrupted alert-to-rollback persistence, and invalid lineage. |
-| **Concurrent budget enforcement** | [Tests](tests/unit/test_model_call_budget.py) cover 16 threads and four processes racing for remaining reservations, provider failure, interrupted execution, process death, and restart accounting. |
-| **Release integrity tests** | [Tests](tests/integration/test_release_pipeline.py) cover cross-commit continuity, incompatible runtime changes, shallow history, stale evidence, and archived-code tampering. |
-| **GitHub CI** | [Pull-request verification](https://github.com/sathviknookala/llm-behavior-ci/actions/runs/38097191572), [main-branch verification](https://github.com/sathviknookala/llm-behavior-ci/actions/runs/38097305067), and the [release workflow's CPU and four synthetic jobs](https://github.com/sathviknookala/llm-behavior-ci/actions/runs/38097305070) passed. |
+| Demonstration | Evidence type | What ran | Verified result |
+| --- | --- | --- | --- |
+| **Tier 1: offline regression gate** | Real model, at [`6542a9c`](https://github.com/sathviknookala/llm-behavior-ci/commit/6542a9cc85614264d7b52086fc697213f94d69de) | Model-generated plans for production and candidate on 30 fixed train tasks, compared with paired plan-quality bootstrap and MMD | MMD p = 0.04 against α = 0.05. The gate persisted a **BLOCK** artifact (`mmd_rejected`), and the lifecycle stopped before candidate admission. |
+| **Tier 2: canary** | Real model, test-only admission, at [`31a4eda`](https://github.com/sathviknookala/llm-behavior-ci/commit/31a4eda474a7bc25e08fb826ad1e5260914fd655) | 12 paired canary arrivals through `POST /episodes`: 24 AppWorld agent executions, with each arm in its own isolated world | Production succeeded on 5/12 and the candidate on 3/12, with evaluator outcomes for all 12 pairs. The controller reached **PROMOTED** by the configured `horizon_reached_without_harm` rule. All 12 pairs and the admit and promote decisions were persisted. |
+| **Tier 3: production monitoring** | Real model, same service and store as Tier 2 | 7 production-mode episodes on the promoted configuration through the serving API | 7 monitor updates. One aggregate `task_success` CUSUM alert was persisted, with statistic 2.9165 against boundary 2.5745. |
+| **Post-promotion rollback** | Synthetic end-to-end and [integration tests](tests/integration/test_production_rollback.py) | `production_regression` scenario with injected runtimes through the real service, controller, monitor, and store | A qualifying alert under `rollback_on_alert` restores the previous production. Later traffic is routed and monitored on the restored configuration. The rollback decision is persisted, and repeated alerts or requests do not repeat it. Restart restores the rollback, and also completes one left unwritten by an interruption. The release command exits `5`. |
+| **GitHub Actions CI** | Hosted automation at [`6d9a65d`](https://github.com/sathviknookala/llm-behavior-ci/commit/6d9a65de0021e285314305ef696d27bca766131f) | [Pull-request verification](https://github.com/sathviknookala/llm-behavior-ci/actions/runs/38097191572), [main-branch verification](https://github.com/sathviknookala/llm-behavior-ci/actions/runs/38097305067), and the [release workflow](https://github.com/sathviknookala/llm-behavior-ci/actions/runs/38097305070) | All CPU suites passed, and all four synthetic lifecycle scenarios passed: `blocked`, `healthy`, `regression`, and `production_regression`. |
 
-Synthetic runs use injected runtimes and explicitly labeled fixture evidence to exercise the real lifecycle and service code. Release admission requires evidence from a gate run. The live pilot establishes model/tool/evaluator integration; the synthetic scenarios establish deployment and recovery behavior.
+Together these show each control point acting on real outcomes. A model-backed regression test produced a deployment-blocking decision. The service ran paired canary traffic, scored it with the application's own evaluator, moved its deployment state, and persisted the decision. Real production outcomes flowed through the serving API, episode storage, the monitor, and alert persistence. The deployment system also restores and keeps the correct serving configuration across rollbacks and restarts.
+
+The Tier 2 candidate was admitted through the isolated test admission path, using an explicitly labeled fixture artifact that release admission refuses. Its promotion records that 12 pairs ended without crossing the harm boundary; it is not evidence of better model quality. The Tier 3 episodes ran before post-promotion rollback was implemented, so their alert was persisted and not acted on. The synthetic scenarios run the real lifecycle and service code with injected model and world implementations. Run records stay in local episode stores because AppWorld's license keeps episode-derived content out of git, so only aggregates are reported here.
+
+Supporting test suites cover the remaining infrastructure. [Budget tests](tests/unit/test_model_call_budget.py) race 16 threads and four processes for the remaining model-call reservations. They also cover provider failure, interrupted execution, process death, and restart accounting. [Release tests](tests/integration/test_release_pipeline.py) cover cross-commit continuity, incompatible runtime changes, shallow history, stale evidence, and archived-code tampering.
+
+Runtime integration was established separately by a committed [hosted-agent capability pilot](results/spotify_capability_20_sonnet_5_5.json). Claude Sonnet completed 20 AppWorld episodes with 14 evaluator successes, 253 executed tool actions, and zero runtime failures.
 
 ## Technology and repository structure
 
-**Backend:** Python 3.12, FastAPI, Uvicorn, SQLite. **Agent execution:** AppWorld, smolagents interfaces, vLLM/PyTorch and hosted model APIs. **Evaluation:** NumPy, SciPy, River, and repository implementations of bootstrap, divergence, sequential testing, and change detection. **Delivery:** GitHub Actions, Git, Bash, systemd, and SHA-256 release manifests.
+**Backend:** Python 3.12, FastAPI, Uvicorn, SQLite. **Agent execution:** AppWorld, smolagents interfaces, vLLM/PyTorch and hosted model APIs. **Evaluation:** repository implementations of bootstrap, divergence, sequential testing, and change detection, with SciPy and River as reference checks. **Delivery:** GitHub Actions, Git, Bash, systemd, and SHA-256 release manifests.
 
 | Path | Responsibility |
 | --- | --- |
